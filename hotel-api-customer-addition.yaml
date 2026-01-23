@@ -1,0 +1,820 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Midea Repair Service API - Addition to Hotel API Stack with Bedrock Knowledge Base'
+
+Parameters:
+  ExistingApiGatewayId:
+    Type: String
+    Description: 'ID of the existing API Gateway from hotel-api-stack'
+  
+  ExistingApiStageName:
+    Type: String
+    Description: 'Stage name of the existing API Gateway'
+    Default: 'dev'
+  
+  KnowledgeBaseId:
+    Type: String
+    Description: 'ID of the pre-created Bedrock Knowledge Base for FAQ search'
+
+Resources:
+  # CloudWatch Log Group for new Lambda Functions
+  RepairLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-repair-api'
+      RetentionInDays: 7
+    DeletionPolicy: Delete
+
+  # DynamoDB Table for Repair Tickets
+  RepairTicketsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: ticketNumber
+          AttributeType: S
+        - AttributeName: phone
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ticketNumber
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: PhoneIndex
+          KeySchema:
+            - AttributeName: phone
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+    DeletionPolicy: Delete
+
+  # Lambda Execution Role for Repair APIs
+  RepairLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${RepairLambdaLogGroup.Arn}:*'
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt RepairTicketsTable.Arn
+                  - !Sub '${RepairTicketsTable.Arn}/index/*'
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:Retrieve
+                  - bedrock:RetrieveAndGenerate
+                Resource: '*'
+        - PolicyName: XRayAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+    DeletionPolicy: Delete
+
+  # Lambda Function: Request Repair
+  RequestRepairFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt RepairLambdaExecutionRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref RepairLambdaLogGroup
+        LogFormat: JSON
+      Environment:
+        Variables:
+          REPAIR_TICKETS_TABLE_NAME: !Ref RepairTicketsTable
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, PutCommand } = require('@aws-sdk/lib-dynamodb');
+          const { randomInt } = require('crypto');
+
+          const client = new DynamoDBClient({});
+          const docClient = DynamoDBDocumentClient.from(client);
+
+          // Generate a random 10-digit ticket number
+          function generateTicketNumber() {
+              const min = 1000000000;
+              const max = 9999999999;
+              return randomInt(min, max + 1).toString();
+          }
+
+          exports.handler = async (event) => {
+              const requestId = event.requestContext?.requestId || 'unknown';
+              console.log(JSON.stringify({
+                  level: 'INFO',
+                  message: 'Request repair request received',
+                  requestId,
+                  event: event
+              }));
+
+              try {
+                  const body = JSON.parse(event.body || '{}');
+                  const {
+                      product_model,
+                      serial_number,
+                      purchase_date,
+                      issue_description,
+                      full_name,
+                      phone,
+                      service_address,
+                      preferred_time,
+                      warranty_status
+                  } = body;
+
+                  // Validate required fields
+                  const requiredFields = {
+                      product_model,
+                      serial_number,
+                      purchase_date,
+                      issue_description,
+                      full_name,
+                      phone,
+                      service_address,
+                      preferred_time,
+                      warranty_status
+                  };
+
+                  const missingFields = Object.entries(requiredFields)
+                      .filter(([key, value]) => !value)
+                      .map(([key]) => key);
+
+                  if (missingFields.length > 0) {
+                      console.log(JSON.stringify({
+                          level: 'WARN',
+                          message: 'Missing required fields',
+                          requestId,
+                          missingFields
+                      }));
+                      return {
+                          statusCode: 400,
+                          headers: {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                          },
+                          body: JSON.stringify({
+                              error: `Missing required fields: ${missingFields.join(', ')}`,
+                          }),
+                      };
+                  }
+
+                  const ticketNumber = generateTicketNumber();
+                  const repairTicket = {
+                      ticketNumber,
+                      product_model,
+                      serial_number,
+                      purchase_date,
+                      issue_description,
+                      full_name,
+                      phone,
+                      service_address,
+                      preferred_time,
+                      warranty_status,
+                      status: 'pending',
+                      createdAt: new Date().toISOString(),
+                      updatedAt: new Date().toISOString()
+                  };
+
+                  const params = {
+                      TableName: process.env.REPAIR_TICKETS_TABLE_NAME,
+                      Item: repairTicket,
+                  };
+
+                  await docClient.send(new PutCommand(params));
+
+                  const response = {
+                      statusCode: 201,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                      },
+                      body: JSON.stringify({
+                          message: 'Repair ticket created successfully',
+                          ticketNumber,
+                          ticket: repairTicket
+                      }),
+                  };
+
+                  console.log(JSON.stringify({
+                      level: 'INFO',
+                      message: 'Repair ticket created successfully',
+                      requestId,
+                      ticketNumber,
+                      response: response
+                  }));
+
+                  return response;
+              } catch (error) {
+                  console.log(JSON.stringify({
+                      level: 'ERROR',
+                      message: 'Error creating repair ticket',
+                      requestId,
+                      error: error.message,
+                      stack: error.stack
+                  }));
+                  return {
+                      statusCode: 500,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                      },
+                      body: JSON.stringify({
+                          error: 'Internal server error',
+                          message: error.message,
+                      }),
+                  };
+              }
+          };
+
+  # Lambda Function: Track Repair
+  TrackRepairFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt RepairLambdaExecutionRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref RepairLambdaLogGroup
+        LogFormat: JSON
+      Environment:
+        Variables:
+          REPAIR_TICKETS_TABLE_NAME: !Ref RepairTicketsTable
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, GetCommand, QueryCommand } = require('@aws-sdk/lib-dynamodb');
+
+          const client = new DynamoDBClient({});
+          const docClient = DynamoDBDocumentClient.from(client);
+
+          exports.handler = async (event) => {
+              const requestId = event.requestContext?.requestId || 'unknown';
+              console.log(JSON.stringify({
+                  level: 'INFO',
+                  message: 'Track repair request received',
+                  requestId,
+                  event: event
+              }));
+
+              try {
+                  const body = JSON.parse(event.body || '{}');
+                  const {
+                      repair_notice_or_work_order_number,
+                      full_name,
+                      phone,
+                      need_to_reschedule_or_missed_visit,
+                      waiting_for_spare_part
+                  } = body;
+
+                  // Validate required fields
+                  if (!repair_notice_or_work_order_number || !full_name || !phone || 
+                      need_to_reschedule_or_missed_visit === undefined || 
+                      waiting_for_spare_part === undefined) {
+                      const missingFields = [];
+                      if (!repair_notice_or_work_order_number) missingFields.push('repair_notice_or_work_order_number');
+                      if (!full_name) missingFields.push('full_name');
+                      if (!phone) missingFields.push('phone');
+                      if (need_to_reschedule_or_missed_visit === undefined) missingFields.push('need_to_reschedule_or_missed_visit');
+                      if (waiting_for_spare_part === undefined) missingFields.push('waiting_for_spare_part');
+
+                      console.log(JSON.stringify({
+                          level: 'WARN',
+                          message: 'Missing required fields',
+                          requestId,
+                          missingFields
+                      }));
+                      return {
+                          statusCode: 400,
+                          headers: {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                          },
+                          body: JSON.stringify({
+                              error: `Missing required fields: ${missingFields.join(', ')}`,
+                          }),
+                      };
+                  }
+
+                  console.log(JSON.stringify({
+                      level: 'INFO',
+                      message: 'Fetching repair ticket',
+                      requestId,
+                      ticketNumber: repair_notice_or_work_order_number
+                  }));
+
+                  // Get ticket by ticket number
+                  const getParams = {
+                      TableName: process.env.REPAIR_TICKETS_TABLE_NAME,
+                      Key: { ticketNumber: repair_notice_or_work_order_number },
+                  };
+
+                  const result = await docClient.send(new GetCommand(getParams));
+
+                  if (!result.Item) {
+                      console.log(JSON.stringify({
+                          level: 'WARN',
+                          message: 'Repair ticket not found',
+                          requestId,
+                          ticketNumber: repair_notice_or_work_order_number
+                      }));
+                      return {
+                          statusCode: 404,
+                          headers: {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                          },
+                          body: JSON.stringify({
+                              error: 'Repair ticket not found',
+                          }),
+                      };
+                  }
+
+                  // Verify customer information
+                  if (result.Item.full_name !== full_name || result.Item.phone !== phone) {
+                      console.log(JSON.stringify({
+                          level: 'WARN',
+                          message: 'Customer information mismatch',
+                          requestId,
+                          ticketNumber: repair_notice_or_work_order_number
+                      }));
+                      return {
+                          statusCode: 403,
+                          headers: {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                          },
+                          body: JSON.stringify({
+                              error: 'Customer information does not match',
+                          }),
+                      };
+                  }
+
+                  // Prepare response with ticket status and additional context
+                  const responseData = {
+                      ticketNumber: result.Item.ticketNumber,
+                      status: result.Item.status,
+                      product_model: result.Item.product_model,
+                      issue_description: result.Item.issue_description,
+                      service_address: result.Item.service_address,
+                      preferred_time: result.Item.preferred_time,
+                      warranty_status: result.Item.warranty_status,
+                      createdAt: result.Item.createdAt,
+                      updatedAt: result.Item.updatedAt,
+                      need_to_reschedule_or_missed_visit,
+                      waiting_for_spare_part
+                  };
+
+                  const response = {
+                      statusCode: 200,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                      },
+                      body: JSON.stringify({
+                          message: 'Repair ticket found',
+                          ticket: responseData
+                      }),
+                  };
+
+                  console.log(JSON.stringify({
+                      level: 'INFO',
+                      message: 'Repair ticket retrieved successfully',
+                      requestId,
+                      ticketNumber: repair_notice_or_work_order_number,
+                      response: response
+                  }));
+
+                  return response;
+              } catch (error) {
+                  console.log(JSON.stringify({
+                      level: 'ERROR',
+                      message: 'Error tracking repair ticket',
+                      requestId,
+                      error: error.message,
+                      stack: error.stack
+                  }));
+                  return {
+                      statusCode: 500,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                      },
+                      body: JSON.stringify({
+                          error: 'Internal server error',
+                          message: error.message,
+                      }),
+                  };
+              }
+          };
+
+  # Lambda Function: FAQ Search
+  FaqSearchFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt RepairLambdaExecutionRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref RepairLambdaLogGroup
+        LogFormat: JSON
+      Timeout: 30
+      Environment:
+        Variables:
+          KNOWLEDGE_BASE_ID: !Ref KnowledgeBaseId
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import traceback
+
+          bedrock_agent = boto3.client('bedrock-agent-runtime')
+
+          def handler(event, context):
+              request_id = event.get('requestContext', {}).get('requestId', 'unknown')
+              print(json.dumps({
+                  'level': 'INFO',
+                  'message': 'FAQ search request received',
+                  'requestId': request_id,
+                  'event': event
+              }))
+
+              try:
+                  # Handle both API Gateway and direct invocation
+                  if 'body' in event and event['body']:
+                      body = json.loads(event['body'])
+                  else:
+                      body = event
+
+                  query = body.get('query')
+
+                  if not query:
+                      print(json.dumps({
+                          'level': 'WARN',
+                          'message': 'Missing query parameter',
+                          'requestId': request_id
+                      }))
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                          },
+                          'body': json.dumps({'error': 'query parameter is required'})
+                      }
+
+                  knowledge_base_id = os.environ['KNOWLEDGE_BASE_ID']
+
+                  print(json.dumps({
+                      'level': 'INFO',
+                      'message': 'Querying Bedrock Knowledge Base',
+                      'requestId': request_id,
+                      'knowledgeBaseId': knowledge_base_id,
+                      'query': query
+                  }))
+
+                  # Retrieve information from knowledge base
+                  response = bedrock_agent.retrieve(
+                      knowledgeBaseId=knowledge_base_id,
+                      retrievalQuery={
+                          'text': query
+                      },
+                      retrievalConfiguration={
+                          'vectorSearchConfiguration': {
+                              'numberOfResults': 5
+                          }
+                      }
+                  )
+
+                  # Extract results
+                  results = []
+                  for retrieval_result in response.get('retrievalResults', []):
+                      results.append({
+                          'content': retrieval_result.get('content', {}).get('text', ''),
+                          'score': retrieval_result.get('score', 0),
+                          'location': retrieval_result.get('location', {})
+                      })
+
+                  result = {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                      },
+                      'body': json.dumps({
+                          'query': query,
+                          'results': results,
+                          'count': len(results)
+                      })
+                  }
+
+                  print(json.dumps({
+                      'level': 'INFO',
+                      'message': 'FAQ search completed successfully',
+                      'requestId': request_id,
+                      'resultCount': len(results),
+                      'response': result
+                  }))
+
+                  return result
+
+              except Exception as e:
+                  print(json.dumps({
+                      'level': 'ERROR',
+                      'message': 'Error searching FAQ',
+                      'requestId': request_id,
+                      'error': str(e),
+                      'stack': traceback.format_exc()
+                  }))
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                      },
+                      'body': json.dumps({
+                          'error': 'Internal server error',
+                          'message': str(e)
+                      })
+                  }
+
+  # Lambda Permissions for API Gateway
+  RequestRepairPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RequestRepairFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingApiGatewayId}/*/*'
+
+  TrackRepairPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TrackRepairFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingApiGatewayId}/*/*'
+
+  FaqSearchPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FaqSearchFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ExistingApiGatewayId}/*/*'
+
+  # API Gateway Resources and Methods
+  RepairResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ExistingApiGatewayId
+      ParentId: !GetAtt ApiGatewayRootResource.RootResourceId
+      PathPart: 'repair'
+
+  RequestRepairResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ExistingApiGatewayId
+      ParentId: !Ref RepairResource
+      PathPart: 'request'
+
+  TrackRepairResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ExistingApiGatewayId
+      ParentId: !Ref RepairResource
+      PathPart: 'track'
+
+  FaqResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ExistingApiGatewayId
+      ParentId: !GetAtt ApiGatewayRootResource.RootResourceId
+      PathPart: 'faq'
+
+  FaqSearchResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ExistingApiGatewayId
+      ParentId: !Ref FaqResource
+      PathPart: 'search'
+
+  # Custom Resource to Get API Gateway Root Resource ID
+  ApiGatewayRootResourceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt ApiGatewayRootResourceRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              response_data = {}
+              try:
+                  print(f"Received event: {json.dumps(event, default=str)}")
+
+                  if event['RequestType'] == 'Delete':
+                      print("Delete request - sending success response")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  api_id = event['ResourceProperties']['ApiGatewayId']
+                  print(f"Getting root resource for API Gateway: {api_id}")
+
+                  client = boto3.client('apigateway')
+                  response = client.get_resources(restApiId=api_id, limit=500)
+
+                  # Find the root resource (path = '/')
+                  root_resource = next((r for r in response['items'] if r['path'] == '/'), None)
+
+                  if not root_resource:
+                      raise Exception("Root resource not found")
+
+                  root_resource_id = root_resource['id']
+                  response_data = {'RootResourceId': root_resource_id}
+
+                  print(f"Successfully retrieved root resource ID: {root_resource_id}")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+              except Exception as e:
+                  error_message = f"Error getting root resource: {str(e)}"
+                  print(error_message)
+                  try:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {
+                          'Error': error_message
+                      })
+                  except Exception as send_error:
+                      print(f"Failed to send error response: {str(send_error)}")
+    DeletionPolicy: Delete
+
+  ApiGatewayRootResourceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ApiGatewayAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - apigateway:GET
+                Resource: !Sub 'arn:aws:apigateway:${AWS::Region}::/restapis/${ExistingApiGatewayId}/*'
+    DeletionPolicy: Delete
+
+  ApiGatewayRootResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ApiGatewayRootResourceFunction.Arn
+      ApiGatewayId: !Ref ExistingApiGatewayId
+
+  # API Gateway Methods
+  RequestRepairMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ExistingApiGatewayId
+      ResourceId: !Ref RequestRepairResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RequestRepairFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 201
+        - StatusCode: 400
+        - StatusCode: 401
+        - StatusCode: 500
+
+  TrackRepairMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ExistingApiGatewayId
+      ResourceId: !Ref TrackRepairResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TrackRepairFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+        - StatusCode: 400
+        - StatusCode: 401
+        - StatusCode: 403
+        - StatusCode: 404
+        - StatusCode: 500
+
+  FaqSearchMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ExistingApiGatewayId
+      ResourceId: !Ref FaqSearchResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FaqSearchFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+        - StatusCode: 400
+        - StatusCode: 401
+        - StatusCode: 500
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - RequestRepairMethod
+      - TrackRepairMethod
+      - FaqSearchMethod
+    Properties:
+      RestApiId: !Ref ExistingApiGatewayId
+      StageName: !Ref ExistingApiStageName
+      Description: !Sub 'Deployment for repair APIs - ${AWS::StackName}'
+
+Outputs:
+  RepairTicketsTableName:
+    Description: Name of the DynamoDB Repair Tickets table
+    Value: !Ref RepairTicketsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-RepairTicketsTable'
+
+  RequestRepairFunctionArn:
+    Description: ARN of the Request Repair Lambda function
+    Value: !GetAtt RequestRepairFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RequestRepairFunction'
+
+  TrackRepairFunctionArn:
+    Description: ARN of the Track Repair Lambda function
+    Value: !GetAtt TrackRepairFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TrackRepairFunction'
+
+  FaqSearchFunctionArn:
+    Description: ARN of the FAQ Search Lambda function
+    Value: !GetAtt FaqSearchFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FaqSearchFunction'
+
+  ApiEndpoints:
+    Description: API endpoints for repair services
+    Value: !Sub |
+      Request Repair: https://${ExistingApiGatewayId}.execute-api.${AWS::Region}.amazonaws.com/${ExistingApiStageName}/repair/request
+      Track Repair: https://${ExistingApiGatewayId}.execute-api.${AWS::Region}.amazonaws.com/${ExistingApiStageName}/repair/track
+      FAQ Search: https://${ExistingApiGatewayId}.execute-api.${AWS::Region}.amazonaws.com/${ExistingApiStageName}/faq/search
+

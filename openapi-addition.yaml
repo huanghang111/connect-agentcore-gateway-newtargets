@@ -1,0 +1,435 @@
+openapi: 3.0.1
+info:
+  title: Midea Repair Service API
+  description: REST API for repair service requests, tracking, and FAQ search
+  version: 1.0.0
+  contact:
+    name: Midea Service Team
+  license:
+    name: MIT
+
+servers:
+  - url: ${API_GATEWAY_URL}
+    description: AWS API Gateway endpoint
+
+paths:
+  /repair/request:
+    post:
+      operationId: requestRepair
+      summary: Request a repair service
+      description: |
+        Create a new repair ticket for a product. This API records customer information,
+        generates a repair ticket, and returns a unique 10-digit ticket number.
+      tags:
+        - Repair Service
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - product_model
+                - serial_number
+                - purchase_date
+                - issue_description
+                - full_name
+                - phone
+                - service_address
+                - preferred_time
+                - warranty_status
+              properties:
+                product_model:
+                  type: string
+                  description: The model name or number of the product needing repair
+                  example: 'AC-2000X'
+                serial_number:
+                  type: string
+                  description: The unique serial number of the product
+                  example: 'SN123456789'
+                purchase_date:
+                  type: string
+                  format: date
+                  description: When the product was purchased (YYYY-MM-DD format)
+                  example: '2023-06-15'
+                issue_description:
+                  type: string
+                  description: A detailed description of the problem or malfunction
+                  example: 'Air conditioner not cooling properly, making unusual noise'
+                full_name:
+                  type: string
+                  description: Customer's complete name
+                  example: 'John Smith'
+                phone:
+                  type: string
+                  description: Customer's contact phone number
+                  example: '+1-555-123-4567'
+                service_address:
+                  type: string
+                  description: The address where repair service should be performed or product picked up
+                  example: '123 Main St, Apt 4B, New York, NY 10001'
+                preferred_time:
+                  type: string
+                  description: Customer's preferred date and time for service
+                  example: '2024-02-15 14:00'
+                warranty_status:
+                  type: string
+                  description: Whether the product is still under warranty
+                  enum: ['yes', 'no', 'unknown']
+                  example: 'yes'
+      responses:
+        '201':
+          description: Repair ticket created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: 'Repair ticket created successfully'
+                  ticketNumber:
+                    type: string
+                    description: Unique 10-digit repair ticket number
+                    example: '1234567890'
+                  ticket:
+                    $ref: '#/components/schemas/RepairTicket'
+        '400':
+          description: Bad request - missing or invalid parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized - API key required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /repair/track:
+    post:
+      operationId: trackRepair
+      summary: Track repair ticket status
+      description: |
+        Check the status of an existing repair ticket. Requires the ticket number
+        and customer verification information. Returns current status and details.
+      tags:
+        - Repair Service
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - repair_notice_or_work_order_number
+                - full_name
+                - phone
+                - need_to_reschedule_or_missed_visit
+                - waiting_for_spare_part
+              properties:
+                repair_notice_or_work_order_number:
+                  type: string
+                  description: The repair notice or work order number (REQUIRED)
+                  example: '1234567890'
+                full_name:
+                  type: string
+                  description: Customer's complete name (REQUIRED)
+                  example: 'John Smith'
+                phone:
+                  type: string
+                  description: Customer's contact phone number (REQUIRED)
+                  example: '+1-555-123-4567'
+                need_to_reschedule_or_missed_visit:
+                  type: string
+                  description: Whether customer needs to reschedule or missed a visit (REQUIRED - must answer yes or no)
+                  enum: ['yes', 'no']
+                  example: 'no'
+                waiting_for_spare_part:
+                  type: string
+                  description: Whether customer is waiting for a spare part (REQUIRED - must answer yes or no)
+                  enum: ['yes', 'no']
+                  example: 'no'
+      responses:
+        '200':
+          description: Repair ticket found and status returned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: 'Repair ticket found'
+                  ticket:
+                    type: object
+                    properties:
+                      ticketNumber:
+                        type: string
+                        example: '1234567890'
+                      status:
+                        type: string
+                        description: Current status of the repair ticket
+                        enum: ['pending', 'scheduled', 'in_progress', 'completed', 'cancelled']
+                        example: 'pending'
+                      product_model:
+                        type: string
+                        example: 'AC-2000X'
+                      issue_description:
+                        type: string
+                        example: 'Air conditioner not cooling properly'
+                      service_address:
+                        type: string
+                        example: '123 Main St, Apt 4B, New York, NY 10001'
+                      preferred_time:
+                        type: string
+                        example: '2024-02-15 14:00'
+                      warranty_status:
+                        type: string
+                        example: 'yes'
+                      createdAt:
+                        type: string
+                        format: date-time
+                        example: '2024-01-20T10:30:00Z'
+                      updatedAt:
+                        type: string
+                        format: date-time
+                        example: '2024-01-20T10:30:00Z'
+                      need_to_reschedule_or_missed_visit:
+                        type: string
+                        example: 'no'
+                      waiting_for_spare_part:
+                        type: string
+                        example: 'no'
+        '400':
+          description: Bad request - missing required parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized - API key required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Forbidden - customer information does not match
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Repair ticket not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /faq/search:
+    post:
+      operationId: faqSearch
+      summary: Search FAQ knowledge base
+      description: |
+        Retrieve information from the external knowledge base using natural language queries.
+        This API uses Amazon Bedrock to search through repair service FAQs and documentation.
+      tags:
+        - FAQ & Knowledge Base
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - query
+              properties:
+                query:
+                  type: string
+                  description: Natural language question or search query
+                  example: 'How do I reset my air conditioner?'
+      responses:
+        '200':
+          description: Search results from knowledge base
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  query:
+                    type: string
+                    description: The original search query
+                    example: 'How do I reset my air conditioner?'
+                  results:
+                    type: array
+                    description: List of relevant results from the knowledge base
+                    items:
+                      type: object
+                      properties:
+                        content:
+                          type: string
+                          description: The text content of the result
+                          example: 'To reset your air conditioner, locate the reset button on the control panel...'
+                        score:
+                          type: number
+                          format: float
+                          description: Relevance score (0-1, higher is more relevant)
+                          example: 0.85
+                        location:
+                          type: object
+                          description: Source location information
+                          properties:
+                            type:
+                              type: string
+                              example: 'S3'
+                            s3Location:
+                              type: object
+                              properties:
+                                uri:
+                                  type: string
+                                  example: 's3://bucket-name/faq-document.pdf'
+                  count:
+                    type: integer
+                    description: Number of results returned
+                    example: 5
+              example:
+                query: 'How do I reset my air conditioner?'
+                results:
+                  - content: 'To reset your air conditioner, locate the reset button on the control panel and press it for 3 seconds.'
+                    score: 0.85
+                    location:
+                      type: 'S3'
+                      s3Location:
+                        uri: 's3://kb-bucket/ac-manual.pdf'
+                count: 1
+        '400':
+          description: Bad request - missing query parameter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized - API key required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: API key for authentication
+
+  schemas:
+    RepairTicket:
+      type: object
+      properties:
+        ticketNumber:
+          type: string
+          description: Unique 10-digit repair ticket number
+          example: '1234567890'
+        product_model:
+          type: string
+          description: Product model name or number
+          example: 'AC-2000X'
+        serial_number:
+          type: string
+          description: Product serial number
+          example: 'SN123456789'
+        purchase_date:
+          type: string
+          format: date
+          description: Product purchase date
+          example: '2023-06-15'
+        issue_description:
+          type: string
+          description: Description of the issue
+          example: 'Air conditioner not cooling properly'
+        full_name:
+          type: string
+          description: Customer name
+          example: 'John Smith'
+        phone:
+          type: string
+          description: Customer phone number
+          example: '+1-555-123-4567'
+        service_address:
+          type: string
+          description: Service address
+          example: '123 Main St, Apt 4B, New York, NY 10001'
+        preferred_time:
+          type: string
+          description: Preferred service time
+          example: '2024-02-15 14:00'
+        warranty_status:
+          type: string
+          description: Warranty status
+          enum: ['yes', 'no', 'unknown']
+          example: 'yes'
+        status:
+          type: string
+          description: Current ticket status
+          enum: ['pending', 'scheduled', 'in_progress', 'completed', 'cancelled']
+          example: 'pending'
+        createdAt:
+          type: string
+          format: date-time
+          description: Ticket creation timestamp
+          example: '2024-01-20T10:30:00Z'
+        updatedAt:
+          type: string
+          format: date-time
+          description: Last update timestamp
+          example: '2024-01-20T10:30:00Z'
+
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: Error message
+          example: 'Missing required parameter'
+        message:
+          type: string
+          description: Detailed error message
+          example: 'The query parameter is required'
+
+security:
+  - ApiKeyAuth: []
+
+tags:
+  - name: Repair Service
+    description: Operations for requesting and tracking repair services
+  - name: FAQ & Knowledge Base
+    description: Operations for searching FAQ and knowledge base content
+
