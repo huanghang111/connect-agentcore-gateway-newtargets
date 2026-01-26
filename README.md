@@ -1,160 +1,146 @@
-# Midea Repair Service API
+# Connect Service API - Complete Stack
 
-CloudFormation stack that adds repair service APIs to your existing hotel API Gateway.
+Complete CloudFormation stack combining Hotel Reservation and Midea Repair Service APIs.
 
 ## What This Creates
 
-- **3 New APIs**: Request repair, track repair, FAQ search
-- **DynamoDB Table**: Stores repair tickets
-- **Lambda Functions**: Backend for each API
+**Hotel APIs:**
+- Search hotels by city
+- Create, modify, cancel reservations
+- Get customer reservations
+
+**Repair Service APIs:**
+- Request repair service (generates 10-digit ticket number)
+- Track repair ticket status
+- FAQ search using Bedrock Knowledge Base
+- FAQ simple search (predefined database, no Bedrock required)
+
+**Infrastructure:**
+- 3 DynamoDB tables (Hotels, Reservations, RepairTickets)
+- 9 Lambda functions
+- API Gateway with API Key authentication
+- CloudWatch logging and X-Ray tracing
 
 ## Prerequisites
 
-1. Existing `hotel-api-stack` deployed in us-east-1
-2. AWS CLI configured
-3. **Bedrock Knowledge Base** created manually (see below)
+1. **Bedrock Knowledge Base** - Create manually before deployment (optional, only needed for /faq/search endpoint)
+2. **Hotel seed data** - JSON file with hotel data (S3 or HTTPS URL)
+3. **OpenAPI spec** - YAML file with API specification (S3 or HTTPS URL)
+4. AWS CLI configured with appropriate permissions
 
-## Step 1: Create Bedrock Knowledge Base
+**Note:** The `/faq/simple` endpoint works without Bedrock Knowledge Base and uses a predefined FAQ database.
 
-Before deploying the CloudFormation stack, create a Bedrock Knowledge Base manually:
+## Quick Start
 
-### 1.1 Create S3 Bucket for Documents
-
-```bash
-aws s3 mb s3://midea-repair-faq-docs-585306731051 --region us-east-1
-```
-
-### 1.2 Upload FAQ Documents
+### 1. Create Bedrock Knowledge Base
 
 ```bash
-aws s3 cp your-faq.pdf s3://midea-repair-faq-docs-585306731051/
-aws s3 cp your-manual.txt s3://midea-repair-faq-docs-585306731051/
+# Create S3 bucket for FAQ documents
+aws s3 mb s3://midea-repair-faq-docs-<account-id> --region us-east-1
+
+# Upload FAQ documents
+aws s3 cp your-faq.pdf s3://midea-repair-faq-docs-<account-id>/
+aws s3 cp your-manual.txt s3://midea-repair-faq-docs-<account-id>/
 ```
 
-### 1.3 Create Knowledge Base via AWS Console
+Then create Knowledge Base via AWS Console:
+- Go to Amazon Bedrock → Knowledge bases → Create
+- Name: `midea-repair-faq-kb`
+- Embeddings model: Titan Embeddings G1 - Text
+- Data source: S3 bucket created above
+- Vector store: Quick create new vector store
+- Click Sync after creation
 
-1. Go to **Amazon Bedrock** console → **Knowledge bases**
-2. Click **Create knowledge base**
-3. Configure:
-   - **Name**: `midea-repair-faq-kb`
-   - **IAM role**: Create new service role
-   - **Embeddings model**: Titan Embeddings G1 - Text
-4. **Data source**:
-   - **S3 URI**: `s3://midea-repair-faq-docs-585306731051/`
-5. **Vector store**: Choose **Quick create a new vector store**
-6. Click **Create**
-7. Wait for creation to complete
-8. Click **Sync** to ingest documents
-
-### 1.4 Get Knowledge Base ID
-
+Get Knowledge Base ID:
 ```bash
 aws bedrock-agent list-knowledge-bases --region us-east-1 \
   --query 'knowledgeBaseSummaries[?name==`midea-repair-faq-kb`].knowledgeBaseId' \
   --output text
 ```
-Response = XKZGTAUSXB
 
-Save this ID - you'll need it for deployment.
-
-## Step 2: Deploy CloudFormation Stack
-
-### 2.1 Get API Gateway ID
-
-```bash
-aws cloudformation describe-stack-resources \
-  --stack-name hotel-api-stack \
-  --region us-east-1 \
-  --logical-resource-id HotelApi \
-  --query 'StackResources[0].PhysicalResourceId' \
-  --output text
-```
-Response = lhmf5px1uh
-
-### 2.2 Deploy the Stack
+### 2. Deploy Stack
 
 ```bash
 aws cloudformation create-stack \
-  --stack-name midea-repair-api-stack \
-  --template-body file://hotel-api-customer-addition.yaml \
+  --stack-name connect-service-api \
+  --template-body file://connect-api-customer.yaml \
   --parameters \
-    ParameterKey=ExistingApiGatewayId,ParameterValue=YOUR_API_GATEWAY_ID \
-    ParameterKey=KnowledgeBaseId,ParameterValue=YOUR_KNOWLEDGEBASE_ID \
+    ParameterKey=SeedDataUrl,ParameterValue=<YOUR_HOTEL_DATA_URL> \
+    ParameterKey=OpenApiSpecUrl,ParameterValue=<YOUR_OPENAPI_SPEC_URL> \
+    ParameterKey=KnowledgeBaseId,ParameterValue=<YOUR_KB_ID> \
   --capabilities CAPABILITY_IAM \
   --region us-east-1
 ```
 
-### 2.3 Wait for Completion
-
+Wait for completion:
 ```bash
 aws cloudformation wait stack-create-complete \
-  --stack-name midea-repair-api-stack \
+  --stack-name connect-service-api \
   --region us-east-1
 ```
 
-### 2.4 Deploy API Gateway Changes
-
-After the stack is created, you need to manually deploy the API Gateway to activate the new endpoints:
+### 3. Get API Details
 
 ```bash
-aws apigateway create-deployment \
-  --rest-api-id YOUR_API_GATEWAY_ID \
-  --stage-name dev \
-  --region us-east-1
-```
+# Get API URL
+aws cloudformation describe-stacks \
+  --stack-name connect-service-api \
+  --query 'Stacks[0].Outputs[?OutputKey==`ApiUrl`].OutputValue' \
+  --output text
 
-Or use this one-liner:
-
-```bash
-API_ID=$(aws cloudformation describe-stack-resources \
-  --stack-name hotel-api-stack \
-  --region us-east-1 \
-  --logical-resource-id HotelApi \
-  --query 'StackResources[0].PhysicalResourceId' \
-  --output text)
-
-aws apigateway create-deployment \
-  --rest-api-id $API_ID \
-  --stage-name dev \
-  --region us-east-1
-
-echo "API Gateway deployed successfully!"
-```
-
-## API Usage
-
-### Get API Key
-
-```bash
-API_KEY=$(aws cloudformation describe-stacks \
-  --stack-name hotel-api-stack \
-  --region us-east-1 \
+# Get API Key
+aws cloudformation describe-stacks \
+  --stack-name connect-service-api \
   --query 'Stacks[0].Outputs[?OutputKey==`ApiKey`].OutputValue' \
-  --output text)
+  --output text
 ```
 
-### Get API Gateway ID
+## API Usage Examples
 
+Set environment variables:
 ```bash
-API_ID=$(aws cloudformation describe-stack-resources \
-  --stack-name hotel-api-stack \
-  --region us-east-1 \
-  --logical-resource-id HotelApi \
-  --query 'StackResources[0].PhysicalResourceId' \
-  --output text)
+export API_URL=<your-api-url>
+export API_KEY=<your-api-key>
 ```
 
-### 1. Request Repair
+### Hotel APIs
 
+**Search Hotels:**
 ```bash
-curl -X POST https://$API_ID.execute-api.us-east-1.amazonaws.com/dev/repair/request \
+curl -X POST $API_URL/hotels/search \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"city": "Seattle"}'
+```
+
+**Create Reservation:**
+```bash
+curl -X POST $API_URL/reservations \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "hotelId": "hotel-123",
+    "customerId": "customer-456",
+    "checkInDate": "2024-03-15",
+    "checkOutDate": "2024-03-18",
+    "roomType": "Standard King",
+    "guestName": "John Doe",
+    "guestEmail": "john@example.com"
+  }'
+```
+
+### Repair Service APIs
+
+**Request Repair:**
+```bash
+curl -X POST $API_URL/repair/request \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "product_model": "AC-2000X",
     "serial_number": "SN123456789",
     "purchase_date": "2023-06-15",
-    "issue_description": "Air conditioner not cooling properly",
+    "issue_description": "Not cooling properly",
     "full_name": "John Smith",
     "phone": "+1-555-123-4567",
     "service_address": "123 Main St, New York, NY 10001",
@@ -163,19 +149,9 @@ curl -X POST https://$API_ID.execute-api.us-east-1.amazonaws.com/dev/repair/requ
   }'
 ```
 
-**Response:**
-```json
-{
-  "message": "Repair ticket created successfully",
-  "ticketNumber": "1234567890",
-  "ticket": { ... }
-}
-```
-
-### 2. Track Repair
-
+**Track Repair:**
 ```bash
-curl -X POST https://$API_ID.execute-api.us-east-1.amazonaws.com/dev/repair/track \
+curl -X POST $API_URL/repair/track \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -187,130 +163,80 @@ curl -X POST https://$API_ID.execute-api.us-east-1.amazonaws.com/dev/repair/trac
   }'
 ```
 
-**Response:**
-```json
-{
-  "message": "Repair ticket found",
-  "ticket": {
-    "ticketNumber": "1234567890",
-    "status": "pending",
-    ...
-  }
-}
-```
-
-### 3. FAQ Search
-
+**FAQ Search (Bedrock):**
 ```bash
-curl -X POST https://$API_ID.execute-api.us-east-1.amazonaws.com/dev/faq/search \
+curl -X POST $API_URL/faq/search \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{
-    "query": "How do I reset my air conditioner?"
-  }'
+  -d '{"query": "How do I reset my air conditioner?"}'
 ```
 
-**Response:**
-```json
-{
-  "query": "How do I reset my air conditioner?",
-  "results": [
-    {
-      "content": "To reset your air conditioner...",
-      "score": 0.85
-    }
-  ],
-  "count": 1
-}
-```
-
-## API Reference
-
-### POST /repair/request
-Creates a repair ticket and returns a 10-digit ticket number.
-
-**Required Fields:**
-- `product_model`, `serial_number`, `purchase_date`, `issue_description`
-- `full_name`, `phone`, `service_address`, `preferred_time`, `warranty_status`
-
-### POST /repair/track
-Tracks repair ticket status. Requires customer verification.
-
-**Required Fields:**
-- `repair_notice_or_work_order_number`, `full_name`, `phone`
-- `need_to_reschedule_or_missed_visit`, `waiting_for_spare_part`
-
-### POST /faq/search
-Searches the knowledge base using natural language.
-
-**Required Fields:**
-- `query`
-
-## Troubleshooting
-
-### API Returns 403 Forbidden (After Stack Creation)
-If you get 403 errors immediately after creating the stack, you need to deploy the API Gateway:
-
+**FAQ Simple (No Bedrock):**
 ```bash
-API_ID=$(aws cloudformation describe-stack-resources \
-  --stack-name hotel-api-stack \
-  --region us-east-1 \
-  --logical-resource-id HotelApi \
-  --query 'StackResources[0].PhysicalResourceId' \
-  --output text)
-
-aws apigateway create-deployment \
-  --rest-api-id $API_ID \
-  --stage-name dev \
-  --region us-east-1
+curl -X POST $API_URL/faq/simple \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "How do I reset my air conditioner?"}'
 ```
 
-### Stack Creation Fails
-- Verify API Gateway ID is correct
-- Check Knowledge Base ID is valid
-- Ensure you have CAPABILITY_IAM permissions
+## Stack Outputs
 
-### FAQ Search Returns No Results
-- Verify Knowledge Base has been synced
-- Check documents are uploaded to S3
-- Wait a few minutes after sync completes
-
-### API Returns 403 Forbidden
-- Verify using correct API Key from hotel-api-stack
-- Check API Key header: `X-API-Key`
+- `ApiUrl` - Base URL for all API endpoints
+- `ApiKey` - API key for authentication
+- `HotelTableName` - DynamoDB table for hotels
+- `ReservationsTableName` - DynamoDB table for reservations
+- `RepairTicketsTableName` - DynamoDB table for repair tickets
+- `OpenApiSpecS3Location` - S3 location of OpenAPI spec
+- `ApiEndpoints` - List of all available endpoints
 
 ## Cleanup
 
 ```bash
 # Delete CloudFormation stack
 aws cloudformation delete-stack \
-  --stack-name midea-repair-api-stack \
+  --stack-name connect-service-api \
   --region us-east-1
 
-# Delete Knowledge Base (via console or CLI)
+# Delete Knowledge Base (manual via console or CLI)
 aws bedrock-agent delete-knowledge-base \
-  --knowledge-base-id YOUR_KB_ID \
+  --knowledge-base-id <YOUR_KB_ID> \
   --region us-east-1
 
 # Delete S3 bucket
-aws s3 rb s3://midea-repair-faq-docs-585306731051 --force --region us-east-1
+aws s3 rb s3://midea-repair-faq-docs-<account-id> --force --region us-east-1
 ```
 
 ## Architecture
 
 ```
-Existing API Gateway (hotel-api-stack)
-    │
-    ├─► /repair/request  → RequestRepairFunction → DynamoDB
-    ├─► /repair/track    → TrackRepairFunction   → DynamoDB
-    └─► /faq/search      → FaqSearchFunction     → Bedrock KB (pre-created)
+API Gateway (with API Key auth)
+├── Hotel APIs
+│   ├── /hotels/search → SearchHotelsFunction → HotelsTable
+│   ├── /reservations → CreateReservationFunction → ReservationsTable
+│   ├── /reservations/cancel → CancelReservationFunction → ReservationsTable
+│   ├── /reservations/customer → GetCustomerReservationsFunction → ReservationsTable
+│   └── /reservations/modify → ModifyReservationFunction → ReservationsTable
+└── Repair APIs
+    ├── /repair/request → RequestRepairFunction → RepairTicketsTable
+    ├── /repair/track → TrackRepairFunction → RepairTicketsTable
+    ├── /faq/search → FaqSearchFunction → Bedrock Knowledge Base
+    └── /faq/simple → FaqSimpleFunction → Predefined FAQ Database (no external dependency)
 ```
 
 ## Cost Estimate
 
 - Lambda: ~$0.20/month (1M requests)
-- DynamoDB: ~$1.25/month (100K operations)
+- DynamoDB: ~$2/month (100K operations across 3 tables)
+- API Gateway: ~$3.50/month (1M requests)
 - Bedrock KB: ~$0.10 per 1K tokens
 - CloudWatch: ~$0.50/month (1GB logs)
 
-**Total: ~$2/month** (excluding Bedrock Knowledge Base infrastructure costs)
+**Total: ~$6-7/month** (excluding Bedrock Knowledge Base infrastructure costs)
+
+## Files
+
+- `connect-api-customer.yaml` - Complete CloudFormation template
+- `connect-api-openapi.yaml` - Complete OpenAPI specification
+- `hotel-api-customer-addition.yaml` - Legacy addition file (reference only)
+- `hotel-api-openapi-addition.yaml` - Legacy addition file (reference only)
+- `openapi-addition.yaml` - Legacy addition file (reference only)

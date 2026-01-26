@@ -1,0 +1,1018 @@
+openapi: 3.0.1
+info:
+  title: Connect Service API
+  description: Combined Hotel Reservation and Midea Repair Service REST API
+  version: 1.0.0
+  contact:
+    name: AWS Workshop Team
+  license:
+    name: MIT
+
+servers:
+  - url: ${API_GATEWAY_URL}
+    description: AWS API Gateway endpoint
+
+paths:
+  # ========================================
+  # HOTEL RESERVATION APIS
+  # ========================================
+  
+  /hotels/search:
+    post:
+      operationId: searchHotels
+      summary: Search hotels by city
+      description:
+        Search for hotels in a specific city. Returns a list of available hotels
+        with details like name, address, and amenities.
+      tags:
+        - Hotel Search
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - city
+              properties:
+                city:
+                  type: string
+                  description: The city name to search for hotels
+                  example: Seattle
+                state:
+                  type: string
+                  description: Optional state filter
+                  example: WA
+                country:
+                  type: string
+                  description: Optional country filter
+                  example: USA
+      responses:
+        '200':
+          description: List of hotels found in the specified city
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  hotels:
+                    type: array
+                    items:
+                      type: object
+                      required:
+                        - hotelId
+                        - name
+                        - address
+                        - city
+                      properties:
+                        hotelId:
+                          type: string
+                          description: Unique identifier for the hotel
+                          example: hotel-123
+                        name:
+                          type: string
+                          description: Hotel name
+                          example: Grand Plaza Hotel
+                        address:
+                          type: string
+                          description: Hotel address
+                          example: '123 Main St, Seattle, WA 98101'
+                        city:
+                          type: string
+                          description: City where hotel is located
+                          example: Seattle
+                        rating:
+                          type: number
+                          format: float
+                          minimum: 1
+                          maximum: 5
+                          description: Hotel rating (1-5 stars)
+                          example: 4.5
+                        amenities:
+                          type: array
+                          items:
+                            type: string
+                          description: List of hotel amenities
+                          example: ['WiFi', 'Pool', 'Gym', 'Restaurant']
+                  count:
+                    type: integer
+                    description: Number of hotels found
+                  city:
+                    type: string
+                    description: City that was searched
+        '400':
+          description: Bad request - missing or invalid city parameter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized - API key required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No hotels found in the specified city
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /reservations:
+    post:
+      operationId: createBooking
+      summary: Create new reservation
+      description:
+        Create a new hotel reservation. This will book a room for the specified
+        dates and return a confirmation number.
+      tags:
+        - Booking Management
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - hotelId
+                - customerId
+                - checkInDate
+                - checkOutDate
+                - roomType
+                - guestName
+                - guestEmail
+              properties:
+                hotelId:
+                  type: string
+                  description: Hotel ID where the reservation should be made
+                  example: hotel-chicago-001
+                customerId:
+                  type: string
+                  description: Customer ID making the reservation
+                  example: 84c06ff4ad2440899cbd91eac98f2ca9
+                checkInDate:
+                  type: string
+                  format: date
+                  description: Check-in date in YYYY-MM-DD format
+                  example: '2024-03-15'
+                checkOutDate:
+                  type: string
+                  format: date
+                  description: Check-out date in YYYY-MM-DD format
+                  example: '2024-03-18'
+                roomType:
+                  type: string
+                  description: Type of room to book
+                  example: Standard King
+                guestName:
+                  type: string
+                  description: Name of the primary guest
+                  example: John Doe
+                guestEmail:
+                  type: string
+                  format: email
+                  description: Email address of the primary guest
+                  example: john.doe@example.com
+                numberOfGuests:
+                  type: integer
+                  description: Number of guests
+                  example: 2
+                specialRequests:
+                  type: string
+                  description: Any special requests or notes
+                  example: Late check-in requested
+      responses:
+        '201':
+          description: Reservation created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    description: Whether the booking was successful
+                    example: true
+                  reservationId:
+                    type: string
+                    description: Unique reservation identifier
+                    example: RES-ABC123
+                  confirmationNumber:
+                    type: string
+                    description: Customer-facing confirmation number
+                    example: ABC123XY
+                  status:
+                    type: string
+                    description: Reservation status
+                    example: CONFIRMED
+                  message:
+                    type: string
+                    description: Success or error message
+                    example: Reservation created successfully
+        '400':
+          description: Bad request - invalid or missing parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized - API key required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Conflict - room not available for specified dates
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /reservations/cancel:
+    post:
+      operationId: cancelReservation
+      summary: Cancel a reservation
+      description:
+        Cancel an existing reservation. This will update the reservation status
+        to cancelled and process any applicable refunds.
+      tags:
+        - Booking Management
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - reservationId
+              properties:
+                reservationId:
+                  type: string
+                  description: Unique reservation identifier to cancel
+                  example: RES-ABC123
+      responses:
+        '200':
+          description: Reservation cancelled successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: Reservation cancelled successfully
+                  reservation:
+                    type: object
+                    properties:
+                      reservationId:
+                        type: string
+                        example: RES-ABC123
+                      status:
+                        type: string
+                        example: CANCELLED
+                      cancelledAt:
+                        type: string
+                        format: date-time
+                        example: '2024-01-20T15:30:00Z'
+        '400':
+          description: Bad request - missing reservationId parameter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized - API key required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Reservation not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /reservations/customer:
+    post:
+      operationId: getCustomerReservations
+      summary: Get all reservations for a customer
+      description:
+        Retrieve all reservations for a specific customer. Use this to check
+        existing bookings before making changes or to provide customer service.
+      tags:
+        - Customer Service
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - customerId
+              properties:
+                customerId:
+                  type: string
+                  description: The customer ID to look up reservations for
+                  example: 84c06ff4ad2440899cbd91eac98f2ca9
+      responses:
+        '200':
+          description: List of customer reservations
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reservations:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Reservation'
+                  count:
+                    type: integer
+                    description: Number of reservations found
+                  customerId:
+                    type: string
+                    description: Customer ID that was searched
+        '400':
+          description: Bad request - missing customerId parameter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized - API key required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No reservations found for the customer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /reservations/modify:
+    post:
+      operationId: modifyReservation
+      summary: Modify an existing reservation
+      description:
+        Update details of an existing reservation such as check-in/check-out
+        dates or room type. Requires both reservationId and customerId for
+        security verification.
+      tags:
+        - Booking Management
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - reservationId
+                - customerId
+              properties:
+                reservationId:
+                  type: string
+                  description: Unique reservation identifier to modify
+                  example: RES-ABC123
+                customerId:
+                  type: string
+                  description: Customer ID for verification
+                  example: 84c06ff4ad2440899cbd91eac98f2ca9
+                checkInDate:
+                  type: string
+                  format: date
+                  description: New check-in date (optional)
+                  example: '2024-03-16'
+                checkOutDate:
+                  type: string
+                  format: date
+                  description: New check-out date (optional)
+                  example: '2024-03-19'
+                roomType:
+                  type: string
+                  description: New room type (optional)
+                  example: Deluxe Suite
+      responses:
+        '200':
+          description: Reservation modified successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: Reservation modified successfully
+                  reservation:
+                    $ref: '#/components/schemas/Reservation'
+        '400':
+          description: Bad request - missing required parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized - API key required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Reservation not found or customer ID mismatch
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ========================================
+  # REPAIR SERVICE APIS
+  # ========================================
+
+  /repair/request:
+    post:
+      operationId: requestRepair
+      summary: Request a repair service
+      description: |
+        Create a new repair ticket for a product. This API records customer information,
+        generates a repair ticket, and returns a unique 10-digit ticket number.
+      tags:
+        - Repair Service
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - product_model
+                - serial_number
+                - purchase_date
+                - issue_description
+                - full_name
+                - phone
+                - service_address
+                - preferred_time
+                - warranty_status
+              properties:
+                product_model:
+                  type: string
+                  description: The model name or number of the product needing repair
+                  example: 'AC-2000X'
+                serial_number:
+                  type: string
+                  description: The unique serial number of the product
+                  example: 'SN123456789'
+                purchase_date:
+                  type: string
+                  format: date
+                  description: When the product was purchased (YYYY-MM-DD format)
+                  example: '2023-06-15'
+                issue_description:
+                  type: string
+                  description: A detailed description of the problem or malfunction
+                  example: 'Air conditioner not cooling properly, making unusual noise'
+                full_name:
+                  type: string
+                  description: Customer's complete name
+                  example: 'John Smith'
+                phone:
+                  type: string
+                  description: Customer's contact phone number
+                  example: '+1-555-123-4567'
+                service_address:
+                  type: string
+                  description: The address where repair service should be performed or product picked up
+                  example: '123 Main St, Apt 4B, New York, NY 10001'
+                preferred_time:
+                  type: string
+                  description: Customer's preferred date and time for service
+                  example: '2024-02-15 14:00'
+                warranty_status:
+                  type: string
+                  description: Whether the product is still under warranty
+                  enum: ['yes', 'no', 'unknown']
+                  example: 'yes'
+      responses:
+        '201':
+          description: Repair ticket created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: 'Repair ticket created successfully'
+                  ticketNumber:
+                    type: string
+                    description: Unique 10-digit repair ticket number
+                    example: '1234567890'
+                  ticket:
+                    $ref: '#/components/schemas/RepairTicket'
+        '400':
+          description: Bad request - missing or invalid parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized - API key required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /repair/track:
+    post:
+      operationId: trackRepair
+      summary: Track repair ticket status
+      description: |
+        Check the status of an existing repair ticket. Requires the ticket number
+        and customer verification information. Returns current status and details.
+      tags:
+        - Repair Service
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - repair_notice_or_work_order_number
+                - full_name
+                - phone
+                - need_to_reschedule_or_missed_visit
+                - waiting_for_spare_part
+              properties:
+                repair_notice_or_work_order_number:
+                  type: string
+                  description: The repair notice or work order number (REQUIRED)
+                  example: '1234567890'
+                full_name:
+                  type: string
+                  description: Customer's complete name (REQUIRED)
+                  example: 'John Smith'
+                phone:
+                  type: string
+                  description: Customer's contact phone number (REQUIRED)
+                  example: '+1-555-123-4567'
+                need_to_reschedule_or_missed_visit:
+                  type: string
+                  description: Whether customer needs to reschedule or missed a visit (REQUIRED - must answer yes or no)
+                  enum: ['yes', 'no']
+                  example: 'no'
+                waiting_for_spare_part:
+                  type: string
+                  description: Whether customer is waiting for a spare part (REQUIRED - must answer yes or no)
+                  enum: ['yes', 'no']
+                  example: 'no'
+      responses:
+        '200':
+          description: Repair ticket found and status returned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: 'Repair ticket found'
+                  ticket:
+                    type: object
+                    properties:
+                      ticketNumber:
+                        type: string
+                        example: '1234567890'
+                      status:
+                        type: string
+                        description: Current status of the repair ticket
+                        enum: ['pending', 'scheduled', 'in_progress', 'completed', 'cancelled']
+                        example: 'pending'
+                      product_model:
+                        type: string
+                        example: 'AC-2000X'
+                      issue_description:
+                        type: string
+                        example: 'Air conditioner not cooling properly'
+                      service_address:
+                        type: string
+                        example: '123 Main St, Apt 4B, New York, NY 10001'
+                      preferred_time:
+                        type: string
+                        example: '2024-02-15 14:00'
+                      warranty_status:
+                        type: string
+                        example: 'yes'
+                      createdAt:
+                        type: string
+                        format: date-time
+                        example: '2024-01-20T10:30:00Z'
+                      updatedAt:
+                        type: string
+                        format: date-time
+                        example: '2024-01-20T10:30:00Z'
+                      need_to_reschedule_or_missed_visit:
+                        type: string
+                        example: 'no'
+                      waiting_for_spare_part:
+                        type: string
+                        example: 'no'
+        '400':
+          description: Bad request - missing required parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized - API key required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Forbidden - customer information does not match
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Repair ticket not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /faq/search:
+    post:
+      operationId: faqSearch
+      summary: Search FAQ knowledge base
+      description: |
+        Retrieve information from the external knowledge base using natural language queries.
+        This API uses Amazon Bedrock to search through repair service FAQs and documentation.
+      tags:
+        - FAQ & Knowledge Base
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - query
+              properties:
+                query:
+                  type: string
+                  description: Natural language question or search query
+                  example: 'How do I reset my air conditioner?'
+      responses:
+        '200':
+          description: Search results from knowledge base
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  query:
+                    type: string
+                    description: The original search query
+                    example: 'How do I reset my air conditioner?'
+                  results:
+                    type: array
+                    description: List of relevant results from the knowledge base
+                    items:
+                      type: object
+                      properties:
+                        content:
+                          type: string
+                          description: The text content of the result
+                          example: 'To reset your air conditioner, locate the reset button on the control panel...'
+                        score:
+                          type: number
+                          format: float
+                          description: Relevance score (0-1, higher is more relevant)
+                          example: 0.85
+                        location:
+                          type: object
+                          description: Source location information
+                          properties:
+                            type:
+                              type: string
+                              example: 'S3'
+                            s3Location:
+                              type: object
+                              properties:
+                                uri:
+                                  type: string
+                                  example: 's3://bucket-name/faq-document.pdf'
+                  count:
+                    type: integer
+                    description: Number of results returned
+                    example: 5
+        '400':
+          description: Bad request - missing query parameter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized - API key required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /faq/simple:
+    post:
+      operationId: faqSimple
+      summary: Search FAQ simple database
+      description: |
+        Search through a predefined FAQ database without using external knowledge base.
+        This API provides quick answers to common questions using keyword-based matching.
+        Does not require Bedrock Knowledge Base.
+      tags:
+        - FAQ & Knowledge Base
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - query
+              properties:
+                query:
+                  type: string
+                  description: Natural language question or search query
+                  example: 'How do I reset my air conditioner?'
+      responses:
+        '200':
+          description: Search results from simple FAQ database
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  query:
+                    type: string
+                    description: The original search query
+                    example: 'How do I reset my air conditioner?'
+                  results:
+                    type: array
+                    description: List of relevant FAQ entries
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          description: FAQ entry ID
+                          example: 'faq-001'
+                        category:
+                          type: string
+                          description: FAQ category
+                          example: 'Air Conditioner'
+                        question:
+                          type: string
+                          description: The FAQ question
+                          example: 'How do I reset my air conditioner?'
+                        answer:
+                          type: string
+                          description: The FAQ answer
+                          example: 'To reset your air conditioner: 1) Turn off the unit...'
+                        score:
+                          type: number
+                          description: Relevance score (higher is more relevant)
+                          example: 15
+                  count:
+                    type: integer
+                    description: Number of results returned
+                    example: 3
+                  source:
+                    type: string
+                    description: Source of the results
+                    example: 'simple_faq_database'
+              example:
+                query: 'How do I reset my air conditioner?'
+                results:
+                  - id: 'faq-001'
+                    category: 'Air Conditioner'
+                    question: 'How do I reset my air conditioner?'
+                    answer: 'To reset your air conditioner: 1) Turn off the unit using the remote or control panel. 2) Unplug the power cord from the outlet. 3) Wait for 3-5 minutes. 4) Plug the power cord back in. 5) Turn on the unit.'
+                    score: 15
+                count: 1
+                source: 'simple_faq_database'
+        '400':
+          description: Bad request - missing query parameter
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized - API key required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: API key for authentication
+
+  schemas:
+    Reservation:
+      type: object
+      properties:
+        reservationId:
+          type: string
+          description: Unique reservation identifier
+          example: RES-ABC123
+        hotelId:
+          type: string
+          description: Hotel identifier
+          example: hotel-123
+        customerId:
+          type: string
+          description: Customer identifier
+          example: 84c06ff4ad2440899cbd91eac98f2ca9
+        checkInDate:
+          type: string
+          format: date
+          description: Check-in date
+          example: '2024-03-15'
+        checkOutDate:
+          type: string
+          format: date
+          description: Check-out date
+          example: '2024-03-18'
+        roomType:
+          type: string
+          description: Type of room booked
+          example: Standard King
+        guestName:
+          type: string
+          description: Primary guest name
+          example: John Doe
+        guestEmail:
+          type: string
+          format: email
+          description: Guest email address
+          example: john.doe@example.com
+        numberOfGuests:
+          type: integer
+          description: Number of guests
+          example: 2
+        status:
+          type: string
+          enum: [confirmed, cancelled]
+          description: Current reservation status
+          example: confirmed
+        createdAt:
+          type: string
+          format: date-time
+          description: When the reservation was created
+          example: '2024-01-15T10:30:00Z'
+        totalAmount:
+          type: number
+          description: Total cost of the reservation
+          example: 360.00
+
+    RepairTicket:
+      type: object
+      properties:
+        ticketNumber:
+          type: string
+          description: Unique 10-digit repair ticket number
+          example: '1234567890'
+        product_model:
+          type: string
+          description: Product model name or number
+          example: 'AC-2000X'
+        serial_number:
+          type: string
+          description: Product serial number
+          example: 'SN123456789'
+        purchase_date:
+          type: string
+          format: date
+          description: Product purchase date
+          example: '2023-06-15'
+        issue_description:
+          type: string
+          description: Description of the issue
+          example: 'Air conditioner not cooling properly'
+        full_name:
+          type: string
+          description: Customer name
+          example: 'John Smith'
+        phone:
+          type: string
+          description: Customer phone number
+          example: '+1-555-123-4567'
+        service_address:
+          type: string
+          description: Service address
+          example: '123 Main St, Apt 4B, New York, NY 10001'
+        preferred_time:
+          type: string
+          description: Preferred service time
+          example: '2024-02-15 14:00'
+        warranty_status:
+          type: string
+          description: Warranty status
+          enum: ['yes', 'no', 'unknown']
+          example: 'yes'
+        status:
+          type: string
+          description: Current ticket status
+          enum: ['pending', 'scheduled', 'in_progress', 'completed', 'cancelled']
+          example: 'pending'
+        createdAt:
+          type: string
+          format: date-time
+          description: Ticket creation timestamp
+          example: '2024-01-20T10:30:00Z'
+        updatedAt:
+          type: string
+          format: date-time
+          description: Last update timestamp
+          example: '2024-01-20T10:30:00Z'
+
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: Error message
+          example: 'Missing required parameter'
+        message:
+          type: string
+          description: Detailed error message
+          example: 'The query parameter is required'
+
+security:
+  - ApiKeyAuth: []
+
+tags:
+  - name: Hotel Search
+    description: Operations for searching and discovering hotels
+  - name: Booking Management
+    description: Operations for creating, modifying, and cancelling reservations
+  - name: Customer Service
+    description: Operations for customer service and support
+  - name: Repair Service
+    description: Operations for requesting and tracking repair services
+  - name: FAQ & Knowledge Base
+    description: Operations for searching FAQ and knowledge base content

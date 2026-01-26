@@ -1,0 +1,2836 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Hotel Reservation and Midea Repair Service API - Complete Stack'
+
+Parameters:
+  SeedDataUrl:
+    Type: String
+    Description: 'URL to fetch hotel seed data from (JSON format)'
+    Default: ''
+  
+  OpenApiSpecUrl:
+    Type: String
+    Description: 'URL to fetch OpenAPI specification from (YAML format)'
+    Default: ''
+  
+  KnowledgeBaseId:
+    Type: String
+    Description: 'ID of the pre-created Bedrock Knowledge Base for FAQ search'
+
+Resources:
+  # API Gateway CloudWatch Role
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+    DeletionPolicy: Delete
+
+  # API Gateway Account
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  # CloudWatch Log Group for API Gateway
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${AWS::StackName}'
+      RetentionInDays: 7
+    DeletionPolicy: Delete
+
+  # CloudWatch Log Group for Hotel Lambda Functions
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-hotel-api'
+      RetentionInDays: 7
+    DeletionPolicy: Delete
+
+  # CloudWatch Log Group for Repair Lambda Functions
+  RepairLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-repair-api'
+      RetentionInDays: 7
+    DeletionPolicy: Delete
+
+  # DynamoDB Tables
+  HotelsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: hotelId
+          AttributeType: S
+        - AttributeName: city
+          AttributeType: S
+      KeySchema:
+        - AttributeName: hotelId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: CityIndex
+          KeySchema:
+            - AttributeName: city
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+    DeletionPolicy: Delete
+
+  ReservationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: customerId
+          AttributeType: S
+        - AttributeName: reservationId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: reservationId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: CustomerIndex
+          KeySchema:
+            - AttributeName: customerId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+    DeletionPolicy: Delete
+
+  RepairTicketsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: ticketNumber
+          AttributeType: S
+        - AttributeName: phone
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ticketNumber
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: PhoneIndex
+          KeySchema:
+            - AttributeName: phone
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+    DeletionPolicy: Delete
+
+  # Lambda Execution Role for Hotel APIs
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${LambdaLogGroup.Arn}:*'
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt HotelsTable.Arn
+                  - !Sub '${HotelsTable.Arn}/index/*'
+                  - !GetAtt ReservationsTable.Arn
+                  - !Sub '${ReservationsTable.Arn}/index/*'
+        - PolicyName: XRayAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+    DeletionPolicy: Delete
+
+  # Lambda Execution Role for Repair APIs
+  RepairLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${RepairLambdaLogGroup.Arn}:*'
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt RepairTicketsTable.Arn
+                  - !Sub '${RepairTicketsTable.Arn}/index/*'
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:Retrieve
+                  - bedrock:RetrieveAndGenerate
+                Resource: '*'
+        - PolicyName: XRayAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+    DeletionPolicy: Delete
+
+  # Custom Resource Lambda Role for API Key Retrieval
+  ApiKeyRetrievalRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ApiGatewayAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - apigateway:GET
+                Resource: !Sub 'arn:aws:apigateway:${AWS::Region}::/apikeys/*'
+    DeletionPolicy: Delete
+
+  # Custom Resource Lambda Role for Data Seeding
+  DataSeedingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBSeedingAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt HotelsTable.Arn
+        - PolicyName: S3ReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: '*'
+    DeletionPolicy: Delete
+
+  # Custom Resource Lambda Function for Data Seeding
+  DataSeedingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt DataSeedingRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, PutCommand, BatchWriteCommand } = require('@aws-sdk/lib-dynamodb');
+          const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
+
+          const dynamoClient = new DynamoDBClient({});
+          const docClient = DynamoDBDocumentClient.from(dynamoClient);
+          const s3Client = new S3Client({});
+
+          // Function to fetch data from S3 URL or HTTP(S) URL
+          async function fetchHotelData(url) {
+              console.log(`Fetching data from: ${url}`);
+              
+              // Check if it's an S3 URL (https://bucket.s3.region.amazonaws.com/key or s3://bucket/key)
+              const s3HttpsMatch = url.match(/https:\/\/([^.]+)\.s3\.([^.]+)\.amazonaws\.com\/(.+)/);
+              const s3UriMatch = url.match(/s3:\/\/([^\/]+)\/(.+)/);
+              
+              if (s3HttpsMatch) {
+                  // S3 HTTPS URL format
+                  const bucket = s3HttpsMatch[1];
+                  const key = s3HttpsMatch[3];
+                  console.log(`Detected S3 HTTPS URL - Bucket: ${bucket}, Key: ${key}`);
+                  
+                  const command = new GetObjectCommand({ Bucket: bucket, Key: key });
+                  const response = await s3Client.send(command);
+                  const bodyContents = await response.Body.transformToString();
+                  return JSON.parse(bodyContents);
+              } else if (s3UriMatch) {
+                  // S3 URI format
+                  const bucket = s3UriMatch[1];
+                  const key = s3UriMatch[2];
+                  console.log(`Detected S3 URI - Bucket: ${bucket}, Key: ${key}`);
+                  
+                  const command = new GetObjectCommand({ Bucket: bucket, Key: key });
+                  const response = await s3Client.send(command);
+                  const bodyContents = await response.Body.transformToString();
+                  return JSON.parse(bodyContents);
+              } else {
+                  // Regular HTTP(S) URL - use plain HTTP client
+                  console.log(`Using HTTP(S) client for URL: ${url}`);
+                  const https = require('https');
+                  const http = require('http');
+
+                  return new Promise((resolve, reject) => {
+                      const client = url.startsWith('https:') ? https : http;
+
+                      client.get(url, (response) => {
+                          let data = '';
+
+                          response.on('data', (chunk) => {
+                              data += chunk;
+                          });
+
+                          response.on('end', () => {
+                              try {
+                                  const hotels = JSON.parse(data);
+                                  resolve(hotels);
+                              } catch (error) {
+                                  reject(new Error(`Failed to parse JSON: ${error.message}`));
+                              }
+                          });
+                      }).on('error', (error) => {
+                          reject(error);
+                      });
+                  });
+              }
+          }
+
+          exports.handler = async (event, context) => {
+              console.log('Event:', JSON.stringify(event, null, 2));
+
+              const response = {
+                  Status: 'SUCCESS',
+                  Reason: 'See the details in CloudWatch Log Stream: ' + context.logStreamName,
+                  PhysicalResourceId: context.logStreamName,
+                  StackId: event.StackId,
+                  RequestId: event.RequestId,
+                  LogicalResourceId: event.LogicalResourceId,
+                  Data: {}
+              };
+
+              try {
+                  const tableName = event.ResourceProperties.TableName;
+                  const seedDataUrl = event.ResourceProperties.SeedDataUrl;
+
+                  if (event.RequestType === 'Delete') {
+                      console.log('Delete request - no action needed for seeding');
+                      await sendResponse(event, context, response);
+                      return;
+                  }
+
+                  let hotels = [];
+
+                  // Try to fetch from provided URL
+                  if (seedDataUrl) {
+                      console.log(`Fetching hotel data from: ${seedDataUrl}`);
+                      hotels = await fetchHotelData(seedDataUrl);
+                      console.log(`Successfully loaded ${hotels.length} hotels from URL`);
+                  } else {
+                      // Fail if no seed data URL is provided
+                      throw new Error('SeedDataUrl parameter is required for data seeding');
+                  }
+
+                  console.log(`Seeding ${hotels.length} hotels to table: ${tableName}`);
+
+                  // Use batch write for efficiency
+                  const batchSize = 25; // DynamoDB batch write limit
+                  for (let i = 0; i < hotels.length; i += batchSize) {
+                      const batch = hotels.slice(i, i + batchSize);
+
+                      const putRequests = batch.map(hotel => ({
+                          PutRequest: {
+                              Item: hotel
+                          }
+                      }));
+
+                      const params = {
+                          RequestItems: {
+                              [tableName]: putRequests
+                          }
+                      };
+
+                      await docClient.send(new BatchWriteCommand(params));
+                      console.log(`Seeded batch ${Math.floor(i/batchSize) + 1}`);
+                  }
+
+                  response.Data = {
+                      Message: `Successfully seeded ${hotels.length} hotels`,
+                      HotelCount: hotels.length
+                  };
+
+                  console.log('Hotel seeding completed successfully!');
+
+              } catch (error) {
+                  console.error('Error seeding data:', error);
+                  response.Status = 'FAILED';
+                  response.Reason = error.message;
+              }
+
+              await sendResponse(event, context, response);
+          };
+
+          async function sendResponse(event, context, response) {
+              const responseBody = JSON.stringify(response);
+              console.log('Response body:', responseBody);
+
+              const https = require('https');
+              const url = require('url');
+
+              const parsedUrl = url.parse(event.ResponseURL);
+              const options = {
+                  hostname: parsedUrl.hostname,
+                  port: 443,
+                  path: parsedUrl.path,
+                  method: 'PUT',
+                  headers: {
+                      'content-type': '',
+                      'content-length': responseBody.length
+                  }
+              };
+
+              return new Promise((resolve, reject) => {
+                  const request = https.request(options, (response) => {
+                      console.log('Status code:', response.statusCode);
+                      console.log('Status message:', response.statusMessage);
+                      resolve();
+                  });
+
+                  request.on('error', (error) => {
+                      console.log('send(..) failed executing https.request(..):', error);
+                      reject(error);
+                  });
+
+                  request.write(responseBody);
+                  request.end();
+              });
+          }
+    DeletionPolicy: Delete
+
+  # Custom Resource to Seed Hotel Data
+  HotelDataSeeding:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt DataSeedingFunction.Arn
+      TableName: !Ref HotelsTable
+      SeedDataUrl: !Ref SeedDataUrl
+    DependsOn: HotelsTable
+
+  # Custom Resource Lambda Function to Get API Key Value
+  ApiKeyRetrievalFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt ApiKeyRetrievalRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              response_data = {}
+              try:
+                  print(f"Received event: {json.dumps(event, default=str)}")
+
+                  if event['RequestType'] == 'Delete':
+                      print("Delete request - sending success response")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  api_key_id = event['ResourceProperties']['ApiKeyId']
+                  print(f"Getting API key value for: {api_key_id}")
+
+                  client = boto3.client('apigateway')
+                  response = client.get_api_key(apiKey=api_key_id, includeValue=True)
+
+                  api_key_value = response['value']
+                  response_data = {'ApiKeyValue': api_key_value}
+
+                  print(f"Successfully retrieved API key value")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+              except Exception as e:
+                  error_message = f"Error in API Key retrieval: {str(e)}"
+                  print(error_message)
+
+                  # Always send a response to prevent CloudFormation from hanging
+                  try:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {
+                          'Error': error_message
+                      })
+                  except Exception as send_error:
+                      print(f"Failed to send error response: {str(send_error)}")
+                      # Last resort - try to send minimal response
+                      try:
+                          cfnresponse.send(event, context, cfnresponse.FAILED, {})
+                      except:
+                          print("Complete failure to send any response to CloudFormation")
+    DeletionPolicy: Delete
+
+  # Custom Resource to Get API Key Value
+  ApiKeyValueRetrieval:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ApiKeyRetrievalFunction.Arn
+      ApiKeyId: !Ref HotelApiKey
+    DependsOn: HotelApiKey
+
+  # S3 Bucket for OpenAPI Specification
+  OpenApiBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+    DeletionPolicy: Delete
+
+  # Custom Resource Lambda Role for S3 Upload
+  S3UploadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${OpenApiBucket.Arn}'
+                  - !Sub '${OpenApiBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                Resource: !Ref 'AWS::StackId'
+    DeletionPolicy: Delete
+
+  # Custom Resource Lambda Function to Upload OpenAPI Spec
+  S3UploadFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt S3UploadRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import urllib.request
+          import urllib.error
+          import re
+
+          def fetch_openapi_spec(url):
+              """Fetch OpenAPI spec from URL (supports S3 URIs, S3 HTTPS URLs, and regular HTTP/HTTPS)"""
+              print(f"Fetching OpenAPI spec from: {url}")
+
+              # Check if it's an S3 URI (s3://bucket/key)
+              s3_uri_match = re.match(r's3://([^/]+)/(.+)', url)
+              if s3_uri_match:
+                  bucket = s3_uri_match.group(1)
+                  key = s3_uri_match.group(2)
+                  print(f"Detected S3 URI - Bucket: {bucket}, Key: {key}")
+                  
+                  s3_client = boto3.client('s3')
+                  response = s3_client.get_object(Bucket=bucket, Key=key)
+                  content = response['Body'].read().decode('utf-8')
+                  print(f"Successfully fetched OpenAPI spec from S3 ({len(content)} bytes)")
+                  return content
+
+              # Check if it's an S3 HTTPS URL (https://bucket.s3.region.amazonaws.com/key)
+              s3_https_match = re.match(r'https://([^.]+)\.s3\.([^.]+)\.amazonaws\.com/(.+)', url)
+              if s3_https_match:
+                  bucket = s3_https_match.group(1)
+                  key = s3_https_match.group(3)
+                  print(f"Detected S3 HTTPS URL - Bucket: {bucket}, Key: {key}")
+                  
+                  s3_client = boto3.client('s3')
+                  response = s3_client.get_object(Bucket=bucket, Key=key)
+                  content = response['Body'].read().decode('utf-8')
+                  print(f"Successfully fetched OpenAPI spec from S3 ({len(content)} bytes)")
+                  return content
+
+              # Regular HTTP(S) URL
+              print(f"Using HTTP(S) client for URL: {url}")
+              try:
+                  request = urllib.request.Request(url)
+                  print(f"Request headers: {request.headers}")
+
+                  with urllib.request.urlopen(request) as response:
+                      print(f"Response status: {response.status}")
+                      print(f"Response headers: {dict(response.headers)}")
+                      content = response.read().decode('utf-8')
+                      print(f"Successfully fetched OpenAPI spec ({len(content)} bytes)")
+                      return content
+
+              except urllib.error.HTTPError as e:
+                  print(f"HTTP Error {e.code}: {e.reason}")
+                  print(f"Response headers: {dict(e.headers)}")
+                  print(f"Response body: {e.read().decode('utf-8', errors='ignore')}")
+                  raise
+              except urllib.error.URLError as e:
+                  print(f"URL Error: {e.reason}")
+                  raise
+              except Exception as e:
+                  print(f"Unexpected error: {type(e).__name__}: {str(e)}")
+                  raise
+
+          def handler(event, context):
+              response_data = {}
+              try:
+                  print(f"Received event: {json.dumps(event, default=str)}")
+
+                  bucket_name = event['ResourceProperties']['BucketName']
+                  openapi_spec_url = event['ResourceProperties'].get('OpenApiSpecUrl', '')
+                  api_gateway_url = event['ResourceProperties']['ApiGatewayUrl']
+
+                  print(f"Processing request for bucket: {bucket_name}")
+
+                  s3 = boto3.client('s3')
+
+                  # Only delete S3 object if the entire stack is being deleted (not during resource replacement)
+                  if event['RequestType'] == 'Delete':
+                      print("Delete request received - checking if this is a stack deletion or resource replacement")
+
+                      # Check if this is a stack deletion by examining the stack status
+                      try:
+                          cloudformation = boto3.client('cloudformation')
+                          stack_name = event['StackId'].split('/')[-2]  # Extract stack name from ARN
+
+                          response = cloudformation.describe_stacks(StackName=stack_name)
+                          stack_status = response['Stacks'][0]['StackStatus']
+
+                          print(f"Stack status: {stack_status}")
+
+                          # Only delete S3 object if stack is being deleted (not during updates/replacements)
+                          if stack_status in ['DELETE_IN_PROGRESS']:
+                              print("Stack is being deleted - cleaning up S3 object")
+                              s3.delete_object(Bucket=bucket_name, Key='openapi.yaml')
+                              print("Successfully deleted openapi.yaml from S3")
+                          else:
+                              print("Resource replacement during stack update - preserving S3 object")
+
+                      except Exception as check_error:
+                          print(f"Could not determine stack status (preserving S3 object): {str(check_error)}")
+                          # If we can't determine the stack status, err on the side of caution and don't delete
+
+                      # Use the same physical resource ID for consistency
+                      physical_resource_id = f"openapi-upload-{bucket_name}"
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_resource_id)
+                      return
+
+                  # For Create and Update operations, upload/update the file
+                  print(f"Processing {event['RequestType']} request - uploading OpenAPI spec")
+
+                  # Fetch OpenAPI spec from URL
+                  if not openapi_spec_url:
+                      raise ValueError("OpenApiSpecUrl parameter is required")
+
+                  print(f"OpenAPI spec URL: {openapi_spec_url}")
+                  print(f"URL scheme: {openapi_spec_url.split(':')[0]}")
+                  print(f"Attempting to fetch from URL...")
+
+                  yaml_content = fetch_openapi_spec(openapi_spec_url)
+
+                  # Replace the server URL placeholder if it exists
+                  yaml_content = yaml_content.replace('${API_GATEWAY_URL}', api_gateway_url)
+
+                  print(f"Uploading YAML content to S3 bucket: {bucket_name}")
+                  print(f"Content length: {len(yaml_content)} bytes")
+                  print(f"S3 Key: openapi.yaml")
+
+                  try:
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key='openapi.yaml',
+                          Body=yaml_content,
+                          ContentType='application/x-yaml'
+                      )
+                      print(f"Successfully uploaded to S3")
+                  except Exception as s3_error:
+                      print(f"S3 put_object failed: {type(s3_error).__name__}: {str(s3_error)}")
+                      if hasattr(s3_error, 'response'):
+                          print(f"S3 Error Response: {s3_error.response}")
+                      raise
+
+                  s3_location = f's3://{bucket_name}/openapi.yaml'
+                  response_data = {
+                      'S3Location': s3_location,
+                      'BucketName': bucket_name,
+                      'ObjectKey': 'openapi.yaml'
+                  }
+
+                  print(f"Successfully uploaded OpenAPI spec to: {s3_location}")
+
+                  # Use a consistent physical resource ID to prevent unnecessary replacements
+                  physical_resource_id = f"openapi-upload-{bucket_name}"
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data, physical_resource_id)
+
+              except Exception as e:
+                  error_message = f"Error in S3 upload: {str(e)}"
+                  print(error_message)
+
+                  # Always send a response to prevent CloudFormation from hanging
+                  try:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {
+                          'Error': error_message
+                      })
+                  except Exception as send_error:
+                      print(f"Failed to send error response: {str(send_error)}")
+                      # Last resort - try to send minimal response
+                      try:
+                          cfnresponse.send(event, context, cfnresponse.FAILED, {})
+                      except:
+                          print("Complete failure to send any response to CloudFormation")
+    DeletionPolicy: Delete
+
+  # Custom Resource to Upload OpenAPI Spec
+  OpenApiUpload:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt S3UploadFunction.Arn
+      BucketName: !Ref OpenApiBucket
+      OpenApiSpecUrl: !Ref OpenApiSpecUrl
+      ApiGatewayUrl: !Sub 'https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev'
+    DependsOn: OpenApiBucket
+
+  # ========================================
+  # HOTEL API LAMBDA FUNCTIONS
+  # ========================================
+
+  SearchHotelsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+        LogFormat: JSON
+      Environment:
+        Variables:
+          HOTELS_TABLE_NAME: !Ref HotelsTable
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, ScanCommand } = require('@aws-sdk/lib-dynamodb');
+
+          const client = new DynamoDBClient({});
+          const docClient = DynamoDBDocumentClient.from(client);
+
+          exports.handler = async (event) => {
+              const requestId = event.requestContext?.requestId || 'unknown';
+              console.log(JSON.stringify({
+                  level: 'INFO',
+                  message: 'Search hotels request received',
+                  requestId,
+                  event: event
+              }));
+
+              try {
+                  const body = JSON.parse(event.body || '{}');
+                  const { city, state, country } = body;
+
+                  if (!city) {
+                      console.log(JSON.stringify({
+                          level: 'WARN',
+                          message: 'Missing required parameter: city',
+                          requestId
+                      }));
+                      return {
+                          statusCode: 400,
+                          headers: {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                          },
+                          body: JSON.stringify({
+                              error: 'Missing required parameter: city',
+                          }),
+                      };
+                  }
+
+                  const params = {
+                      TableName: process.env.HOTELS_TABLE_NAME,
+                      FilterExpression: 'contains(#city, :city)',
+                      ExpressionAttributeNames: { '#city': 'city' },
+                      ExpressionAttributeValues: { ':city': city }
+                  };
+
+                  console.log(JSON.stringify({
+                      level: 'INFO',
+                      message: 'Querying DynamoDB',
+                      requestId,
+                      city
+                  }));
+
+                  const result = await docClient.send(new ScanCommand(params));
+
+                  const response = {
+                      statusCode: 200,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                      },
+                      body: JSON.stringify({
+                          hotels: result.Items || [],
+                          count: result.Count || 0,
+                      }),
+                  };
+
+                  console.log(JSON.stringify({
+                      level: 'INFO',
+                      message: 'Hotels found',
+                      requestId,
+                      city,
+                      count: result.Count || 0,
+                      response: response
+                  }));
+
+                  return response;
+              } catch (error) {
+                  console.log(JSON.stringify({
+                      level: 'ERROR',
+                      message: 'Error searching hotels',
+                      requestId,
+                      error: error.message,
+                      stack: error.stack
+                  }));
+                  return {
+                      statusCode: 500,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                      },
+                      body: JSON.stringify({
+                          error: 'Internal server error',
+                          message: error.message,
+                      }),
+                  };
+              }
+          };
+
+  CreateReservationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+        LogFormat: JSON
+      Environment:
+        Variables:
+          RESERVATIONS_TABLE_NAME: !Ref ReservationsTable
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, PutCommand } = require('@aws-sdk/lib-dynamodb');
+          const { randomBytes } = require('crypto');
+
+          const client = new DynamoDBClient({});
+          const docClient = DynamoDBDocumentClient.from(client);
+
+          // Generate a realistic reservation ID (e.g., RES-ABC123XY)
+          function generateReservationId() {
+              const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+              let id = 'RES-';
+              const bytes = randomBytes(6);
+              for (let i = 0; i < 6; i++) {
+                  id += chars[bytes[i] % chars.length];
+              }
+              return id;
+          }
+
+          exports.handler = async (event) => {
+              const requestId = event.requestContext?.requestId || 'unknown';
+              console.log(JSON.stringify({
+                  level: 'INFO',
+                  message: 'Create reservation request received',
+                  requestId,
+                  event: event
+              }));
+
+              try {
+                  const body = JSON.parse(event.body);
+                  const {
+                      hotelId,
+                      customerId,
+                      checkInDate,
+                      checkOutDate,
+                      roomType,
+                      guestName,
+                      guestEmail,
+                      numberOfGuests,
+                      specialRequests
+                  } = body;
+
+                  console.log(JSON.stringify({
+                      level: 'INFO',
+                      message: 'Creating reservation',
+                      requestId,
+                      hotelId,
+                      customerId,
+                      checkInDate,
+                      checkOutDate,
+                      roomType,
+                      guestName
+                  }));
+
+                  if (!hotelId || !customerId || !checkInDate || !checkOutDate || !roomType || !guestName || !guestEmail) {
+                      const missingParams = [];
+                      if (!hotelId) missingParams.push('hotelId');
+                      if (!customerId) missingParams.push('customerId');
+                      if (!checkInDate) missingParams.push('checkInDate');
+                      if (!checkOutDate) missingParams.push('checkOutDate');
+                      if (!roomType) missingParams.push('roomType');
+                      if (!guestName) missingParams.push('guestName');
+                      if (!guestEmail) missingParams.push('guestEmail');
+
+                      console.log(JSON.stringify({
+                          level: 'WARN',
+                          message: 'Missing required parameters',
+                          requestId,
+                          missingParameters: missingParams,
+                          hotelId,
+                          customerId,
+                          checkInDate,
+                          checkOutDate,
+                          roomType,
+                          guestName,
+                          guestEmail
+                      }));
+                      return {
+                          statusCode: 400,
+                          headers: {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                          },
+                          body: JSON.stringify({
+                              error: `Missing required parameters: ${missingParams.join(', ')}`,
+                          }),
+                      };
+                  }
+
+                  const reservationId = generateReservationId();
+                  const reservation = {
+                      reservationId,
+                      hotelId,
+                      customerId,
+                      checkInDate,
+                      checkOutDate,
+                      roomType,
+                      guestName,
+                      guestEmail,
+                      numberOfGuests: numberOfGuests || 1,
+                      status: 'confirmed',
+                      createdAt: new Date().toISOString(),
+                      totalAmount: calculateTotalAmount(roomType, checkInDate, checkOutDate),
+                  };
+
+                  // Add optional fields if provided
+                  if (specialRequests) {
+                      reservation.specialRequests = specialRequests;
+                  }
+
+                  const params = {
+                      TableName: process.env.RESERVATIONS_TABLE_NAME,
+                      Item: reservation,
+                  };
+
+                  await docClient.send(new PutCommand(params));
+
+                  const response = {
+                      statusCode: 201,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                      },
+                      body: JSON.stringify({
+                          message: 'Reservation created successfully',
+                          reservation,
+                      }),
+                  };
+
+                  console.log(JSON.stringify({
+                      level: 'INFO',
+                      message: 'Reservation created successfully',
+                      requestId,
+                      reservationId,
+                      hotelId,
+                      response: response
+                  }));
+
+                  return response;
+              } catch (error) {
+                  console.log(JSON.stringify({
+                      level: 'ERROR',
+                      message: 'Error creating reservation',
+                      requestId,
+                      error: error.message,
+                      stack: error.stack
+                  }));
+                  return {
+                      statusCode: 500,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                      },
+                      body: JSON.stringify({
+                          error: 'Internal server error',
+                          message: error.message,
+                      }),
+                  };
+              }
+          };
+
+          function calculateTotalAmount(roomType, checkInDate, checkOutDate) {
+              const rates = {
+                  standard: 120,
+                  deluxe: 180,
+                  suite: 300,
+              };
+
+              const rate = rates[roomType] || 120;
+              const checkIn = new Date(checkInDate);
+              const checkOut = new Date(checkOutDate);
+              const nights = Math.ceil((checkOut - checkIn) / (1000 * 60 * 60 * 24));
+
+              return rate * nights;
+          }
+
+  GetCustomerReservationsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+        LogFormat: JSON
+      Environment:
+        Variables:
+          RESERVATIONS_TABLE_NAME: !Ref ReservationsTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import traceback
+          from decimal import Decimal
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['RESERVATIONS_TABLE_NAME'])
+
+          # Helper function to convert Decimal to int/float for JSON serialization
+          def decimal_default(obj):
+              if isinstance(obj, Decimal):
+                  return int(obj) if obj % 1 == 0 else float(obj)
+              raise TypeError
+
+          def handler(event, context):
+              request_id = event.get('requestContext', {}).get('requestId', 'unknown')
+              print(json.dumps({
+                  'level': 'INFO',
+                  'message': 'Get customer reservations request received',
+                  'requestId': request_id,
+                  'event': event
+              }))
+
+              try:
+                  # Handle both API Gateway and direct invocation
+                  if 'body' in event and event['body']:
+                      body = json.loads(event['body'])
+                      customer_id = body.get('customerId')
+                  else:
+                      # Direct invocation from Connect Assistant
+                      customer_id = event.get('customerId')
+
+                  print(json.dumps({
+                      'level': 'INFO',
+                      'message': 'Fetching reservations for customer',
+                      'requestId': request_id,
+                      'customerId': customer_id
+                  }))
+
+                  if not customer_id:
+                      print(json.dumps({
+                          'level': 'WARN',
+                          'message': 'Missing customerId parameter',
+                          'requestId': request_id
+                      }))
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'customerId parameter is required'})
+                      }
+
+                  response = table.query(
+                      IndexName='CustomerIndex',
+                      KeyConditionExpression='customerId = :customerId',
+                      ExpressionAttributeValues={':customerId': customer_id}
+                  )
+
+                  reservations = response['Items']
+                  result = {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'reservations': reservations,
+                          'count': len(reservations),
+                          'customerId': customer_id
+                      }, default=decimal_default)
+                  }
+
+                  print(json.dumps({
+                      'level': 'INFO',
+                      'message': 'Reservations found',
+                      'requestId': request_id,
+                      'customerId': customer_id,
+                      'count': len(reservations),
+                      'response': result
+                  }))
+
+                  return result
+              except Exception as e:
+                  print(json.dumps({
+                      'level': 'ERROR',
+                      'message': 'Error getting customer reservations',
+                      'requestId': request_id,
+                      'error': str(e),
+                      'stack': traceback.format_exc()
+                  }))
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)}, default=decimal_default)
+                  }
+
+  CancelReservationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+        LogFormat: JSON
+      Environment:
+        Variables:
+          RESERVATIONS_TABLE_NAME: !Ref ReservationsTable
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, GetCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
+
+          const client = new DynamoDBClient({});
+          const docClient = DynamoDBDocumentClient.from(client);
+
+          exports.handler = async (event) => {
+              const requestId = event.requestContext?.requestId || 'unknown';
+              console.log(JSON.stringify({
+                  level: 'INFO',
+                  message: 'Cancel reservation request received',
+                  requestId,
+                  event: event
+              }));
+
+              try {
+                  const body = JSON.parse(event.body);
+                  const { reservationId } = body;
+
+                  if (!reservationId) {
+                      console.log(JSON.stringify({
+                          level: 'WARN',
+                          message: 'Missing reservationId parameter',
+                          requestId
+                      }));
+                      return {
+                          statusCode: 400,
+                          headers: {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                          },
+                          body: JSON.stringify({
+                              error: 'Missing reservationId parameter',
+                          }),
+                      };
+                  }
+
+                  console.log(JSON.stringify({
+                      level: 'INFO',
+                      message: 'Cancelling reservation',
+                      requestId,
+                      reservationId
+                  }));
+
+                  // First check if reservation exists
+                  const getParams = {
+                      TableName: process.env.RESERVATIONS_TABLE_NAME,
+                      Key: { reservationId },
+                  };
+
+                  const getResult = await docClient.send(new GetCommand(getParams));
+
+                  if (!getResult.Item) {
+                      console.log(JSON.stringify({
+                          level: 'WARN',
+                          message: 'Reservation not found',
+                          requestId,
+                          reservationId
+                      }));
+                      return {
+                          statusCode: 404,
+                          headers: {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                          },
+                          body: JSON.stringify({
+                              error: 'Reservation not found',
+                          }),
+                      };
+                  }
+
+                  if (getResult.Item.status === 'cancelled') {
+                      console.log(JSON.stringify({
+                          level: 'WARN',
+                          message: 'Reservation already cancelled',
+                          requestId,
+                          reservationId
+                      }));
+                      return {
+                          statusCode: 400,
+                          headers: {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                          },
+                          body: JSON.stringify({
+                              error: 'Reservation is already cancelled',
+                          }),
+                      };
+                  }
+
+                  // Update reservation status to cancelled
+                  const updateParams = {
+                      TableName: process.env.RESERVATIONS_TABLE_NAME,
+                      Key: { reservationId },
+                      UpdateExpression: 'SET #status = :status, cancelledAt = :cancelledAt',
+                      ExpressionAttributeNames: { '#status': 'status' },
+                      ExpressionAttributeValues: {
+                          ':status': 'cancelled',
+                          ':cancelledAt': new Date().toISOString(),
+                      },
+                      ReturnValues: 'ALL_NEW',
+                  };
+
+                  const updateResult = await docClient.send(new UpdateCommand(updateParams));
+
+                  const response = {
+                      statusCode: 200,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                      },
+                      body: JSON.stringify({
+                          message: 'Reservation cancelled successfully',
+                          reservation: updateResult.Attributes,
+                      }),
+                  };
+
+                  console.log(JSON.stringify({
+                      level: 'INFO',
+                      message: 'Reservation cancelled successfully',
+                      requestId,
+                      reservationId,
+                      response: response
+                  }));
+
+                  return response;
+              } catch (error) {
+                  console.log(JSON.stringify({
+                      level: 'ERROR',
+                      message: 'Error cancelling reservation',
+                      requestId,
+                      error: error.message,
+                      stack: error.stack
+                  }));
+                  return {
+                      statusCode: 500,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                      },
+                      body: JSON.stringify({
+                          error: 'Internal server error',
+                          message: error.message,
+                      }),
+                  };
+              }
+          };
+
+  ModifyReservationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+        LogFormat: JSON
+      Environment:
+        Variables:
+          RESERVATIONS_TABLE_NAME: !Ref ReservationsTable
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import traceback
+          from datetime import datetime
+          from decimal import Decimal
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['RESERVATIONS_TABLE_NAME'])
+
+          # Helper function to convert Decimal to int/float for JSON serialization
+          def decimal_default(obj):
+              if isinstance(obj, Decimal):
+                  return int(obj) if obj % 1 == 0 else float(obj)
+              raise TypeError
+
+          def handler(event, context):
+              request_id = event.get('requestContext', {}).get('requestId', 'unknown')
+              print(json.dumps({
+                  'level': 'INFO',
+                  'message': 'Modify reservation request received',
+                  'requestId': request_id,
+                  'event': event
+              }))
+
+              try:
+                  # Handle both API Gateway and direct invocation
+                  if 'body' in event and event['body']:
+                      body = json.loads(event['body'])
+                  else:
+                      # Direct invocation from Connect Assistant
+                      body = event
+
+                  reservation_id = body.get('reservationId')
+                  customer_id = body.get('customerId')
+
+                  print(json.dumps({
+                      'level': 'INFO',
+                      'message': 'Modifying reservation',
+                      'requestId': request_id,
+                      'reservationId': reservation_id,
+                      'customerId': customer_id
+                  }))
+
+                  if not reservation_id or not customer_id:
+                      missing_params = []
+                      if not reservation_id:
+                          missing_params.append('reservationId')
+                      if not customer_id:
+                          missing_params.append('customerId')
+
+                      print(json.dumps({
+                          'level': 'WARN',
+                          'message': 'Missing required parameters',
+                          'requestId': request_id,
+                          'missingParameters': missing_params,
+                          'reservationId': reservation_id,
+                          'customerId': customer_id
+                      }))
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': f'Missing required parameters: {", ".join(missing_params)}'})
+                      }
+
+                  # Build update expression dynamically
+                  update_expression = 'SET modifiedAt = :modifiedAt'
+                  expression_values = {':modifiedAt': datetime.utcnow().isoformat()}
+
+                  # Add fields to update
+                  if 'checkInDate' in body:
+                      update_expression += ', checkInDate = :checkInDate'
+                      expression_values[':checkInDate'] = body['checkInDate']
+
+                  if 'checkOutDate' in body:
+                      update_expression += ', checkOutDate = :checkOutDate'
+                      expression_values[':checkOutDate'] = body['checkOutDate']
+
+                  if 'roomType' in body:
+                      update_expression += ', roomType = :roomType'
+                      expression_values[':roomType'] = body['roomType']
+
+                  response = table.update_item(
+                      Key={'reservationId': reservation_id},
+                      UpdateExpression=update_expression,
+                      ConditionExpression='customerId = :customerId',
+                      ExpressionAttributeValues={
+                          **expression_values,
+                          ':customerId': customer_id
+                      },
+                      ReturnValues='ALL_NEW'
+                  )
+
+                  result = {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'success': True,
+                          'message': 'Reservation modified successfully',
+                          'reservation': response['Attributes']
+                      }, default=decimal_default)
+                  }
+
+                  print(json.dumps({
+                      'level': 'INFO',
+                      'message': 'Reservation modified successfully',
+                      'requestId': request_id,
+                      'reservationId': reservation_id,
+                      'response': result
+                  }))
+
+                  return result
+              except Exception as e:
+                  print(json.dumps({
+                      'level': 'ERROR',
+                      'message': 'Error modifying reservation',
+                      'requestId': request_id,
+                      'error': str(e),
+                      'stack': traceback.format_exc()
+                  }))
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e), 'success': False}, default=decimal_default)
+                  }
+
+  # ========================================
+  # REPAIR API LAMBDA FUNCTIONS
+  # ========================================
+
+  RequestRepairFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt RepairLambdaExecutionRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref RepairLambdaLogGroup
+        LogFormat: JSON
+      Environment:
+        Variables:
+          REPAIR_TICKETS_TABLE_NAME: !Ref RepairTicketsTable
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, PutCommand } = require('@aws-sdk/lib-dynamodb');
+          const { randomInt } = require('crypto');
+
+          const client = new DynamoDBClient({});
+          const docClient = DynamoDBDocumentClient.from(client);
+
+          // Generate a random 10-digit ticket number
+          function generateTicketNumber() {
+              const min = 1000000000;
+              const max = 9999999999;
+              return randomInt(min, max + 1).toString();
+          }
+
+          exports.handler = async (event) => {
+              const requestId = event.requestContext?.requestId || 'unknown';
+              console.log(JSON.stringify({
+                  level: 'INFO',
+                  message: 'Request repair request received',
+                  requestId,
+                  event: event
+              }));
+
+              try {
+                  const body = JSON.parse(event.body || '{}');
+                  const {
+                      product_model,
+                      serial_number,
+                      purchase_date,
+                      issue_description,
+                      full_name,
+                      phone,
+                      service_address,
+                      preferred_time,
+                      warranty_status
+                  } = body;
+
+                  // Validate required fields
+                  const requiredFields = {
+                      product_model,
+                      serial_number,
+                      purchase_date,
+                      issue_description,
+                      full_name,
+                      phone,
+                      service_address,
+                      preferred_time,
+                      warranty_status
+                  };
+
+                  const missingFields = Object.entries(requiredFields)
+                      .filter(([key, value]) => !value)
+                      .map(([key]) => key);
+
+                  if (missingFields.length > 0) {
+                      console.log(JSON.stringify({
+                          level: 'WARN',
+                          message: 'Missing required fields',
+                          requestId,
+                          missingFields
+                      }));
+                      return {
+                          statusCode: 400,
+                          headers: {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                          },
+                          body: JSON.stringify({
+                              error: `Missing required fields: ${missingFields.join(', ')}`,
+                          }),
+                      };
+                  }
+
+                  const ticketNumber = generateTicketNumber();
+                  const repairTicket = {
+                      ticketNumber,
+                      product_model,
+                      serial_number,
+                      purchase_date,
+                      issue_description,
+                      full_name,
+                      phone,
+                      service_address,
+                      preferred_time,
+                      warranty_status,
+                      status: 'pending',
+                      createdAt: new Date().toISOString(),
+                      updatedAt: new Date().toISOString()
+                  };
+
+                  const params = {
+                      TableName: process.env.REPAIR_TICKETS_TABLE_NAME,
+                      Item: repairTicket,
+                  };
+
+                  await docClient.send(new PutCommand(params));
+
+                  const response = {
+                      statusCode: 201,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                      },
+                      body: JSON.stringify({
+                          message: 'Repair ticket created successfully',
+                          ticketNumber,
+                          ticket: repairTicket
+                      }),
+                  };
+
+                  console.log(JSON.stringify({
+                      level: 'INFO',
+                      message: 'Repair ticket created successfully',
+                      requestId,
+                      ticketNumber,
+                      response: response
+                  }));
+
+                  return response;
+              } catch (error) {
+                  console.log(JSON.stringify({
+                      level: 'ERROR',
+                      message: 'Error creating repair ticket',
+                      requestId,
+                      error: error.message,
+                      stack: error.stack
+                  }));
+                  return {
+                      statusCode: 500,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                      },
+                      body: JSON.stringify({
+                          error: 'Internal server error',
+                          message: error.message,
+                      }),
+                  };
+              }
+          };
+
+  TrackRepairFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt RepairLambdaExecutionRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref RepairLambdaLogGroup
+        LogFormat: JSON
+      Environment:
+        Variables:
+          REPAIR_TICKETS_TABLE_NAME: !Ref RepairTicketsTable
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, GetCommand, QueryCommand } = require('@aws-sdk/lib-dynamodb');
+
+          const client = new DynamoDBClient({});
+          const docClient = DynamoDBDocumentClient.from(client);
+
+          exports.handler = async (event) => {
+              const requestId = event.requestContext?.requestId || 'unknown';
+              console.log(JSON.stringify({
+                  level: 'INFO',
+                  message: 'Track repair request received',
+                  requestId,
+                  event: event
+              }));
+
+              try {
+                  const body = JSON.parse(event.body || '{}');
+                  const {
+                      repair_notice_or_work_order_number,
+                      full_name,
+                      phone,
+                      need_to_reschedule_or_missed_visit,
+                      waiting_for_spare_part
+                  } = body;
+
+                  // Validate required fields
+                  if (!repair_notice_or_work_order_number || !full_name || !phone || 
+                      need_to_reschedule_or_missed_visit === undefined || 
+                      waiting_for_spare_part === undefined) {
+                      const missingFields = [];
+                      if (!repair_notice_or_work_order_number) missingFields.push('repair_notice_or_work_order_number');
+                      if (!full_name) missingFields.push('full_name');
+                      if (!phone) missingFields.push('phone');
+                      if (need_to_reschedule_or_missed_visit === undefined) missingFields.push('need_to_reschedule_or_missed_visit');
+                      if (waiting_for_spare_part === undefined) missingFields.push('waiting_for_spare_part');
+
+                      console.log(JSON.stringify({
+                          level: 'WARN',
+                          message: 'Missing required fields',
+                          requestId,
+                          missingFields
+                      }));
+                      return {
+                          statusCode: 400,
+                          headers: {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                          },
+                          body: JSON.stringify({
+                              error: `Missing required fields: ${missingFields.join(', ')}`,
+                          }),
+                      };
+                  }
+
+                  console.log(JSON.stringify({
+                      level: 'INFO',
+                      message: 'Fetching repair ticket',
+                      requestId,
+                      ticketNumber: repair_notice_or_work_order_number
+                  }));
+
+                  // Get ticket by ticket number
+                  const getParams = {
+                      TableName: process.env.REPAIR_TICKETS_TABLE_NAME,
+                      Key: { ticketNumber: repair_notice_or_work_order_number },
+                  };
+
+                  const result = await docClient.send(new GetCommand(getParams));
+
+                  if (!result.Item) {
+                      console.log(JSON.stringify({
+                          level: 'WARN',
+                          message: 'Repair ticket not found',
+                          requestId,
+                          ticketNumber: repair_notice_or_work_order_number
+                      }));
+                      return {
+                          statusCode: 404,
+                          headers: {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                          },
+                          body: JSON.stringify({
+                              error: 'Repair ticket not found',
+                          }),
+                      };
+                  }
+
+                  // Verify customer information
+                  if (result.Item.full_name !== full_name || result.Item.phone !== phone) {
+                      console.log(JSON.stringify({
+                          level: 'WARN',
+                          message: 'Customer information mismatch',
+                          requestId,
+                          ticketNumber: repair_notice_or_work_order_number
+                      }));
+                      return {
+                          statusCode: 403,
+                          headers: {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                          },
+                          body: JSON.stringify({
+                              error: 'Customer information does not match',
+                          }),
+                      };
+                  }
+
+                  // Prepare response with ticket status and additional context
+                  const responseData = {
+                      ticketNumber: result.Item.ticketNumber,
+                      status: result.Item.status,
+                      product_model: result.Item.product_model,
+                      issue_description: result.Item.issue_description,
+                      service_address: result.Item.service_address,
+                      preferred_time: result.Item.preferred_time,
+                      warranty_status: result.Item.warranty_status,
+                      createdAt: result.Item.createdAt,
+                      updatedAt: result.Item.updatedAt,
+                      need_to_reschedule_or_missed_visit,
+                      waiting_for_spare_part
+                  };
+
+                  const response = {
+                      statusCode: 200,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                      },
+                      body: JSON.stringify({
+                          message: 'Repair ticket found',
+                          ticket: responseData
+                      }),
+                  };
+
+                  console.log(JSON.stringify({
+                      level: 'INFO',
+                      message: 'Repair ticket retrieved successfully',
+                      requestId,
+                      ticketNumber: repair_notice_or_work_order_number,
+                      response: response
+                  }));
+
+                  return response;
+              } catch (error) {
+                  console.log(JSON.stringify({
+                      level: 'ERROR',
+                      message: 'Error tracking repair ticket',
+                      requestId,
+                      error: error.message,
+                      stack: error.stack
+                  }));
+                  return {
+                      statusCode: 500,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                      },
+                      body: JSON.stringify({
+                          error: 'Internal server error',
+                          message: error.message,
+                      }),
+                  };
+              }
+          };
+
+  FaqSearchFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt RepairLambdaExecutionRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref RepairLambdaLogGroup
+        LogFormat: JSON
+      Timeout: 30
+      Environment:
+        Variables:
+          KNOWLEDGE_BASE_ID: !Ref KnowledgeBaseId
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import traceback
+
+          bedrock_agent = boto3.client('bedrock-agent-runtime')
+
+          def handler(event, context):
+              request_id = event.get('requestContext', {}).get('requestId', 'unknown')
+              print(json.dumps({
+                  'level': 'INFO',
+                  'message': 'FAQ search request received',
+                  'requestId': request_id,
+                  'event': event
+              }))
+
+              try:
+                  # Handle both API Gateway and direct invocation
+                  if 'body' in event and event['body']:
+                      body = json.loads(event['body'])
+                  else:
+                      body = event
+
+                  query = body.get('query')
+
+                  if not query:
+                      print(json.dumps({
+                          'level': 'WARN',
+                          'message': 'Missing query parameter',
+                          'requestId': request_id
+                      }))
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                          },
+                          'body': json.dumps({'error': 'query parameter is required'})
+                      }
+
+                  knowledge_base_id = os.environ['KNOWLEDGE_BASE_ID']
+
+                  print(json.dumps({
+                      'level': 'INFO',
+                      'message': 'Querying Bedrock Knowledge Base',
+                      'requestId': request_id,
+                      'knowledgeBaseId': knowledge_base_id,
+                      'query': query
+                  }))
+
+                  # Retrieve information from knowledge base
+                  response = bedrock_agent.retrieve(
+                      knowledgeBaseId=knowledge_base_id,
+                      retrievalQuery={
+                          'text': query
+                      },
+                      retrievalConfiguration={
+                          'vectorSearchConfiguration': {
+                              'numberOfResults': 5
+                          }
+                      }
+                  )
+
+                  # Extract results
+                  results = []
+                  for retrieval_result in response.get('retrievalResults', []):
+                      results.append({
+                          'content': retrieval_result.get('content', {}).get('text', ''),
+                          'score': retrieval_result.get('score', 0),
+                          'location': retrieval_result.get('location', {})
+                      })
+
+                  result = {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                      },
+                      'body': json.dumps({
+                          'query': query,
+                          'results': results,
+                          'count': len(results)
+                      })
+                  }
+
+                  print(json.dumps({
+                      'level': 'INFO',
+                      'message': 'FAQ search completed successfully',
+                      'requestId': request_id,
+                      'resultCount': len(results),
+                      'response': result
+                  }))
+
+                  return result
+
+              except Exception as e:
+                  print(json.dumps({
+                      'level': 'ERROR',
+                      'message': 'Error searching FAQ',
+                      'requestId': request_id,
+                      'error': str(e),
+                      'stack': traceback.format_exc()
+                  }))
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                      },
+                      'body': json.dumps({
+                          'error': 'Internal server error',
+                          'message': str(e)
+                      })
+                  }
+
+  FaqSimpleFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt RepairLambdaExecutionRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref RepairLambdaLogGroup
+        LogFormat: JSON
+      Timeout: 10
+      Code:
+        ZipFile: |
+          import json
+          import traceback
+
+          # Predefined FAQ database
+          FAQ_DATABASE = [
+              {
+                  'id': 'faq-001',
+                  'category': 'Air Conditioner',
+                  'question': 'How do I reset my air conditioner?',
+                  'answer': 'To reset your air conditioner: 1) Turn off the unit using the remote or control panel. 2) Unplug the power cord from the outlet. 3) Wait for 3-5 minutes. 4) Plug the power cord back in. 5) Turn on the unit. This will reset the internal electronics.',
+                  'keywords': ['reset', 'air conditioner', 'ac', 'restart', 'reboot']
+              },
+              {
+                  'id': 'faq-002',
+                  'category': 'Air Conditioner',
+                  'question': 'Why is my air conditioner not cooling?',
+                  'answer': 'Common reasons for poor cooling: 1) Dirty air filter - clean or replace it. 2) Blocked air vents - ensure nothing is blocking airflow. 3) Incorrect temperature setting - set to a lower temperature. 4) Low refrigerant - contact service for refill. 5) Outdoor unit issues - check if outdoor unit is running.',
+                  'keywords': ['not cooling', 'warm air', 'no cold', 'temperature', 'cooling problem']
+              },
+              {
+                  'id': 'faq-003',
+                  'category': 'Air Conditioner',
+                  'question': 'How often should I clean the air filter?',
+                  'answer': 'Clean the air filter every 2 weeks during heavy use (summer months). For moderate use, clean monthly. To clean: 1) Remove the filter from the unit. 2) Vacuum off loose dust. 3) Wash with warm water and mild detergent. 4) Rinse thoroughly. 5) Let it dry completely before reinstalling.',
+                  'keywords': ['clean', 'filter', 'maintenance', 'wash', 'how often']
+              },
+              {
+                  'id': 'faq-004',
+                  'category': 'Refrigerator',
+                  'question': 'Why is my refrigerator making loud noises?',
+                  'answer': 'Common causes of refrigerator noise: 1) Compressor running - normal humming sound. 2) Ice maker filling - gurgling or hissing is normal. 3) Fan hitting something - check for ice buildup or loose items. 4) Uneven floor - level the refrigerator. 5) Loose parts - tighten any loose screws or panels.',
+                  'keywords': ['noise', 'loud', 'sound', 'refrigerator', 'fridge', 'humming', 'buzzing']
+              },
+              {
+                  'id': 'faq-005',
+                  'category': 'Refrigerator',
+                  'question': 'What temperature should I set my refrigerator?',
+                  'answer': 'Recommended temperatures: Refrigerator compartment: 37-40°F (3-4°C). Freezer compartment: 0°F (-18°C). These temperatures keep food fresh and safe while maximizing energy efficiency. Use a refrigerator thermometer to verify actual temperature.',
+                  'keywords': ['temperature', 'setting', 'cold', 'freezer', 'refrigerator', 'degrees']
+              },
+              {
+                  'id': 'faq-006',
+                  'category': 'Washing Machine',
+                  'question': 'Why is my washing machine not draining?',
+                  'answer': 'Steps to fix drainage issues: 1) Check drain hose for kinks or clogs. 2) Clean the drain pump filter (usually at front bottom). 3) Ensure drain hose is not inserted too far into standpipe. 4) Check for blockage in standpipe or drain. 5) If problem persists, the drain pump may need service.',
+                  'keywords': ['not draining', 'water', 'drain', 'washing machine', 'washer', 'pump']
+              },
+              {
+                  'id': 'faq-007',
+                  'category': 'Washing Machine',
+                  'question': 'How do I clean my washing machine?',
+                  'answer': 'Monthly cleaning routine: 1) Run empty hot water cycle with 2 cups white vinegar. 2) Wipe door seal and remove any debris. 3) Clean detergent dispenser drawer. 4) Leave door open after use to prevent mold. 5) For deep cleaning, use washing machine cleaner tablet monthly.',
+                  'keywords': ['clean', 'washing machine', 'maintenance', 'smell', 'odor', 'mold']
+              },
+              {
+                  'id': 'faq-008',
+                  'category': 'General',
+                  'question': 'How do I schedule a repair service?',
+                  'answer': 'To schedule repair service: 1) Use the /repair/request API endpoint with your product details. 2) Provide product model, serial number, and issue description. 3) You will receive a 10-digit ticket number. 4) A service technician will contact you within 24-48 hours. 5) Track your repair status using /repair/track endpoint.',
+                  'keywords': ['repair', 'service', 'schedule', 'appointment', 'technician', 'fix']
+              },
+              {
+                  'id': 'faq-009',
+                  'category': 'General',
+                  'question': 'What is covered under warranty?',
+                  'answer': 'Standard warranty coverage: 1) Manufacturing defects - 1 year parts and labor. 2) Compressor - 5 years parts, 1 year labor (refrigerators/AC). 3) Not covered: Normal wear, misuse, unauthorized repairs, cosmetic damage. 4) Extended warranty available for purchase. 5) Keep purchase receipt for warranty claims.',
+                  'keywords': ['warranty', 'coverage', 'guarantee', 'protection', 'claim']
+              },
+              {
+                  'id': 'faq-010',
+                  'category': 'General',
+                  'question': 'Where can I find my product serial number?',
+                  'answer': 'Serial number locations: Air Conditioner: Inside front panel or on side of unit. Refrigerator: Inside fresh food compartment on side wall or ceiling. Washing Machine: Inside door rim or on back panel. Format: Usually starts with letters followed by numbers (e.g., SN123456789). Take a photo for future reference.',
+                  'keywords': ['serial number', 'model number', 'identification', 'locate', 'find']
+              }
+          ]
+
+          def search_faq(query):
+              """Simple keyword-based FAQ search"""
+              query_lower = query.lower()
+              results = []
+              
+              for faq in FAQ_DATABASE:
+                  score = 0
+                  
+                  # Check if query matches question
+                  if query_lower in faq['question'].lower():
+                      score += 10
+                  
+                  # Check if query matches answer
+                  if query_lower in faq['answer'].lower():
+                      score += 5
+                  
+                  # Check if query matches keywords
+                  for keyword in faq['keywords']:
+                      if keyword in query_lower or query_lower in keyword:
+                          score += 3
+                  
+                  # Check for word matches
+                  query_words = query_lower.split()
+                  for word in query_words:
+                      if len(word) > 3:  # Only check words longer than 3 characters
+                          if word in faq['question'].lower():
+                              score += 2
+                          if word in faq['answer'].lower():
+                              score += 1
+                          for keyword in faq['keywords']:
+                              if word in keyword:
+                                  score += 2
+                  
+                  if score > 0:
+                      results.append({
+                          'id': faq['id'],
+                          'category': faq['category'],
+                          'question': faq['question'],
+                          'answer': faq['answer'],
+                          'score': score
+                      })
+              
+              # Sort by score (highest first) and return top 5
+              results.sort(key=lambda x: x['score'], reverse=True)
+              return results[:5]
+
+          def handler(event, context):
+              request_id = event.get('requestContext', {}).get('requestId', 'unknown')
+              print(json.dumps({
+                  'level': 'INFO',
+                  'message': 'FAQ simple search request received',
+                  'requestId': request_id,
+                  'event': event
+              }))
+
+              try:
+                  # Handle both API Gateway and direct invocation
+                  if 'body' in event and event['body']:
+                      body = json.loads(event['body'])
+                  else:
+                      body = event
+
+                  query = body.get('query')
+
+                  if not query:
+                      print(json.dumps({
+                          'level': 'WARN',
+                          'message': 'Missing query parameter',
+                          'requestId': request_id
+                      }))
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                          },
+                          'body': json.dumps({'error': 'query parameter is required'})
+                      }
+
+                  print(json.dumps({
+                      'level': 'INFO',
+                      'message': 'Searching FAQ database',
+                      'requestId': request_id,
+                      'query': query
+                  }))
+
+                  # Search FAQ database
+                  results = search_faq(query)
+
+                  result = {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                      },
+                      'body': json.dumps({
+                          'query': query,
+                          'results': results,
+                          'count': len(results),
+                          'source': 'simple_faq_database'
+                      })
+                  }
+
+                  print(json.dumps({
+                      'level': 'INFO',
+                      'message': 'FAQ search completed successfully',
+                      'requestId': request_id,
+                      'resultCount': len(results),
+                      'response': result
+                  }))
+
+                  return result
+
+              except Exception as e:
+                  print(json.dumps({
+                      'level': 'ERROR',
+                      'message': 'Error searching FAQ',
+                      'requestId': request_id,
+                      'error': str(e),
+                      'stack': traceback.format_exc()
+                  }))
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                      },
+                      'body': json.dumps({
+                          'error': 'Internal server error',
+                          'message': str(e)
+                      })
+                  }
+
+  # ========================================
+  # LAMBDA PERMISSIONS
+  # ========================================
+
+  # Hotel API Permissions
+  SearchHotelsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SearchHotelsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HotelApi}/*/*'
+
+  CreateReservationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CreateReservationFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HotelApi}/*/*'
+
+  CancelReservationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CancelReservationFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HotelApi}/*/*'
+
+  GetCustomerReservationsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetCustomerReservationsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HotelApi}/*/*'
+
+  ModifyReservationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ModifyReservationFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HotelApi}/*/*'
+
+  # Repair API Permissions
+  RequestRepairPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RequestRepairFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HotelApi}/*/*'
+
+  TrackRepairPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TrackRepairFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HotelApi}/*/*'
+
+  FaqSearchPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FaqSearchFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HotelApi}/*/*'
+
+  FaqSimplePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FaqSimpleFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HotelApi}/*/*'
+
+  # ========================================
+  # API GATEWAY
+  # ========================================
+
+  HotelApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: Connect Service API
+      Description: Combined Hotel Reservation and Repair Service API
+      Body:
+        openapi: '3.0.1'
+        info:
+          title: 'Connect Service API'
+          description: 'Combined Hotel Reservation and Repair Service API'
+          version: '1.0.0'
+        paths:
+          /hotels/search:
+            post:
+              operationId: 'searchHotels'
+              security:
+                - api_key: []
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      type: 'object'
+                      required:
+                        - city
+                      properties:
+                        city:
+                          type: 'string'
+                        state:
+                          type: 'string'
+                        country:
+                          type: 'string'
+              responses:
+                '401':
+                  description: 'Unauthorized - API key required'
+                '404':
+                  description: '404 response'
+                '200':
+                  description: '200 response'
+                  content:
+                    application/json:
+                      schema:
+                        $ref: '#/components/schemas/ArrayOfHotel'
+              x-amazon-apigateway-integration:
+                type: 'aws_proxy'
+                httpMethod: 'POST'
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SearchHotelsFunction.Arn}/invocations'
+          /reservations:
+            post:
+              operationId: 'createReservation'
+              security:
+                - api_key: []
+              requestBody:
+                content:
+                  application/json:
+                    schema:
+                      $ref: '#/components/schemas/CreateReservationRequest'
+                required: true
+              responses:
+                '401':
+                  description: 'Unauthorized - API key required'
+                '400':
+                  description: '400 response'
+                '201':
+                  description: '201 response'
+              x-amazon-apigateway-integration:
+                type: 'aws_proxy'
+                httpMethod: 'POST'
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CreateReservationFunction.Arn}/invocations'
+          /reservations/cancel:
+            post:
+              operationId: 'cancelReservation'
+              security:
+                - api_key: []
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      type: 'object'
+                      required:
+                        - reservationId
+                      properties:
+                        reservationId:
+                          type: 'string'
+              responses:
+                '401':
+                  description: 'Unauthorized - API key required'
+                '404':
+                  description: '404 response'
+                '200':
+                  description: '200 response'
+                  content:
+                    application/json:
+                      schema:
+                        type: 'object'
+                        properties:
+                          message:
+                            type: 'string'
+                          reservation:
+                            $ref: '#/components/schemas/Reservation'
+              x-amazon-apigateway-integration:
+                type: 'aws_proxy'
+                httpMethod: 'POST'
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CancelReservationFunction.Arn}/invocations'
+          /reservations/customer:
+            post:
+              operationId: 'getCustomerReservations'
+              security:
+                - api_key: []
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      type: 'object'
+                      required:
+                        - customerId
+                      properties:
+                        customerId:
+                          type: 'string'
+              responses:
+                '401':
+                  description: 'Unauthorized - API key required'
+                '400':
+                  description: '400 response'
+                '200':
+                  description: '200 response'
+                  content:
+                    application/json:
+                      schema:
+                        type: 'object'
+                        properties:
+                          reservations:
+                            $ref: '#/components/schemas/ArrayOfReservation'
+                          count:
+                            type: 'integer'
+                          customerId:
+                            type: 'string'
+              x-amazon-apigateway-integration:
+                type: 'aws_proxy'
+                httpMethod: 'POST'
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetCustomerReservationsFunction.Arn}/invocations'
+          /reservations/modify:
+            post:
+              operationId: 'modifyReservation'
+              security:
+                - api_key: []
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      type: 'object'
+                      required:
+                        - reservationId
+                        - customerId
+                      properties:
+                        reservationId:
+                          type: 'string'
+                        customerId:
+                          type: 'string'
+                        checkInDate:
+                          type: 'string'
+                          format: 'date'
+                        checkOutDate:
+                          type: 'string'
+                          format: 'date'
+                        roomType:
+                          type: 'string'
+              responses:
+                '401':
+                  description: 'Unauthorized - API key required'
+                '400':
+                  description: '400 response'
+                '200':
+                  description: '200 response'
+                  content:
+                    application/json:
+                      schema:
+                        type: 'object'
+                        properties:
+                          success:
+                            type: 'boolean'
+                          message:
+                            type: 'string'
+                          reservation:
+                            $ref: '#/components/schemas/Reservation'
+              x-amazon-apigateway-integration:
+                type: 'aws_proxy'
+                httpMethod: 'POST'
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ModifyReservationFunction.Arn}/invocations'
+          /repair/request:
+            post:
+              operationId: 'requestRepair'
+              security:
+                - api_key: []
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      $ref: '#/components/schemas/RepairRequest'
+              responses:
+                '401':
+                  description: 'Unauthorized - API key required'
+                '400':
+                  description: '400 response'
+                '201':
+                  description: '201 response'
+              x-amazon-apigateway-integration:
+                type: 'aws_proxy'
+                httpMethod: 'POST'
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RequestRepairFunction.Arn}/invocations'
+          /repair/track:
+            post:
+              operationId: 'trackRepair'
+              security:
+                - api_key: []
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      $ref: '#/components/schemas/TrackRepairRequest'
+              responses:
+                '401':
+                  description: 'Unauthorized - API key required'
+                '400':
+                  description: '400 response'
+                '403':
+                  description: '403 response'
+                '404':
+                  description: '404 response'
+                '200':
+                  description: '200 response'
+              x-amazon-apigateway-integration:
+                type: 'aws_proxy'
+                httpMethod: 'POST'
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TrackRepairFunction.Arn}/invocations'
+          /faq/search:
+            post:
+              operationId: 'faqSearch'
+              security:
+                - api_key: []
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      type: 'object'
+                      required:
+                        - query
+                      properties:
+                        query:
+                          type: 'string'
+              responses:
+                '401':
+                  description: 'Unauthorized - API key required'
+                '400':
+                  description: '400 response'
+                '200':
+                  description: '200 response'
+              x-amazon-apigateway-integration:
+                type: 'aws_proxy'
+                httpMethod: 'POST'
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FaqSearchFunction.Arn}/invocations'
+          /faq/simple:
+            post:
+              operationId: 'faqSimple'
+              security:
+                - api_key: []
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      type: 'object'
+                      required:
+                        - query
+                      properties:
+                        query:
+                          type: 'string'
+              responses:
+                '401':
+                  description: 'Unauthorized - API key required'
+                '400':
+                  description: '400 response'
+                '200':
+                  description: '200 response'
+              x-amazon-apigateway-integration:
+                type: 'aws_proxy'
+                httpMethod: 'POST'
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FaqSimpleFunction.Arn}/invocations'
+        components:
+          schemas:
+            Hotel:
+              type: 'object'
+              properties:
+                hotelId:
+                  type: 'string'
+                name:
+                  type: 'string'
+                city:
+                  type: 'string'
+                state:
+                  type: 'string'
+                country:
+                  type: 'string'
+                address:
+                  type: 'string'
+                amenities:
+                  type: 'array'
+                  items:
+                    type: 'string'
+                description:
+                  type: 'string'
+                rating:
+                  type: 'number'
+                totalRooms:
+                  type: 'number'
+                phoneNumber:
+                  type: 'string'
+                email:
+                  type: 'string'
+            Room:
+              type: 'object'
+              properties:
+                roomType:
+                  type: 'string'
+                available:
+                  type: 'number'
+                pricePerNight:
+                  type: 'number'
+            CreateReservationRequest:
+              type: 'object'
+              properties:
+                hotelId:
+                  type: 'string'
+                customerId:
+                  type: 'string'
+                checkInDate:
+                  type: 'string'
+                  format: 'date'
+                checkOutDate:
+                  type: 'string'
+                  format: 'date'
+                roomType:
+                  type: 'string'
+                guestName:
+                  type: 'string'
+                guestEmail:
+                  type: 'string'
+                numberOfGuests:
+                  type: 'number'
+              required:
+                - hotelId
+                - customerId
+                - checkInDate
+                - checkOutDate
+                - roomType
+                - guestName
+                - guestEmail
+            Reservation:
+              type: 'object'
+              properties:
+                reservationId:
+                  type: 'string'
+                hotelId:
+                  type: 'string'
+                customerId:
+                  type: 'string'
+                checkInDate:
+                  type: 'string'
+                  format: 'date'
+                checkOutDate:
+                  type: 'string'
+                  format: 'date'
+                roomType:
+                  type: 'string'
+                guestName:
+                  type: 'string'
+                guestEmail:
+                  type: 'string'
+                numberOfGuests:
+                  type: 'number'
+                status:
+                  type: 'string'
+                  enum: ['confirmed', 'cancelled']
+                createdAt:
+                  type: 'string'
+                  format: 'date-time'
+                totalAmount:
+                  type: 'number'
+            RepairRequest:
+              type: 'object'
+              required:
+                - product_model
+                - serial_number
+                - purchase_date
+                - issue_description
+                - full_name
+                - phone
+                - service_address
+                - preferred_time
+                - warranty_status
+              properties:
+                product_model:
+                  type: 'string'
+                serial_number:
+                  type: 'string'
+                purchase_date:
+                  type: 'string'
+                  format: 'date'
+                issue_description:
+                  type: 'string'
+                full_name:
+                  type: 'string'
+                phone:
+                  type: 'string'
+                service_address:
+                  type: 'string'
+                preferred_time:
+                  type: 'string'
+                warranty_status:
+                  type: 'string'
+                  enum: ['yes', 'no', 'unknown']
+            TrackRepairRequest:
+              type: 'object'
+              required:
+                - repair_notice_or_work_order_number
+                - full_name
+                - phone
+                - need_to_reschedule_or_missed_visit
+                - waiting_for_spare_part
+              properties:
+                repair_notice_or_work_order_number:
+                  type: 'string'
+                full_name:
+                  type: 'string'
+                phone:
+                  type: 'string'
+                need_to_reschedule_or_missed_visit:
+                  type: 'string'
+                  enum: ['yes', 'no']
+                waiting_for_spare_part:
+                  type: 'string'
+                  enum: ['yes', 'no']
+            ArrayOfHotel:
+              type: 'array'
+              items:
+                $ref: '#/components/schemas/Hotel'
+            ArrayOfRoom:
+              type: 'array'
+              items:
+                $ref: '#/components/schemas/Room'
+            ArrayOfReservation:
+              type: 'array'
+              items:
+                $ref: '#/components/schemas/Reservation'
+          securitySchemes:
+            api_key:
+              type: 'apiKey'
+              name: 'X-API-Key'
+              in: 'header'
+
+  # API Key for authentication
+  HotelApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub '${AWS::StackName}-api-key'
+      Description: API Key for Hotel Reservation and Repair Service API
+      Enabled: true
+      GenerateDistinctId: true
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ApiGatewayAccount
+    Properties:
+      RestApiId: !Ref HotelApi
+
+  ApiStageDev:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref HotelApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: dev
+      TracingEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiLogGroup.Arn
+        Format:
+          '$context.requestId $context.requestTime $context.httpMethod
+          $context.resourcePath $context.status $context.responseLength'
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+          MetricsEnabled: true
+
+Outputs:
+  ApiUrl:
+    Description: URL of the Connect Service API
+    Value: !Sub 'https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiUrl'
+
+  ApiKey:
+    Description: Value of the API Key
+    Value: !GetAtt ApiKeyValueRetrieval.ApiKeyValue
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiKey'
+
+  HotelTableName:
+    Description: Name of the DynamoDB Hotels table
+    Value: !Ref HotelsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-HotelsTable'
+
+  ReservationsTableName:
+    Description: Name of the DynamoDB Reservations table
+    Value: !Ref ReservationsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ReservationsTable'
+
+  RepairTicketsTableName:
+    Description: Name of the DynamoDB Repair Tickets table
+    Value: !Ref RepairTicketsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-RepairTicketsTable'
+
+  OpenApiSpecS3Location:
+    Description: S3 location of the uploaded OpenAPI specification
+    Value: !GetAtt OpenApiUpload.S3Location
+    Export:
+      Name: !Sub '${AWS::StackName}-OpenApiSpec'
+
+  ApiEndpoints:
+    Description: Available API endpoints
+    Value: !Sub |
+      Hotel Search: https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/hotels/search
+      Create Reservation: https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/reservations
+      Cancel Reservation: https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/reservations/cancel
+      Get Customer Reservations: https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/reservations/customer
+      Modify Reservation: https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/reservations/modify
+      Request Repair: https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/repair/request
+      Track Repair: https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/repair/track
+      FAQ Search (Bedrock): https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/faq/search
+      FAQ Simple (No Bedrock): https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/faq/simple
