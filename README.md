@@ -1,242 +1,138 @@
-# Connect Service API - Complete Stack
+# Midea Repair Service API
 
-Complete CloudFormation stack combining Hotel Reservation and Midea Repair Service APIs.
+简化的维修服务API，包含工单管理和FAQ查询功能。
 
-## What This Creates
-
-**Hotel APIs:**
-- Search hotels by city
-- Create, modify, cancel reservations
-- Get customer reservations
-
-**Repair Service APIs:**
-- Request repair service (generates 10-digit ticket number)
-- Track repair ticket status
-- FAQ search using Bedrock Knowledge Base
-- FAQ simple search (predefined database, no Bedrock required)
-
-**Infrastructure:**
-- 3 DynamoDB tables (Hotels, Reservations, RepairTickets)
-- 9 Lambda functions
-- API Gateway with API Key authentication
-- CloudWatch logging and X-Ray tracing
-
-## Prerequisites
-
-1. **Bedrock Knowledge Base** - Create manually before deployment (optional, only needed for /faq/search endpoint)
-2. **Hotel seed data** - JSON file with hotel data (S3 or HTTPS URL)
-3. **OpenAPI spec** - YAML file with API specification (S3 or HTTPS URL)
-4. AWS CLI configured with appropriate permissions
-
-**Note:** The `/faq/simple` endpoint works without Bedrock Knowledge Base and uses a predefined FAQ database.
-
-## Quick Start
-
-### 1. Create Bedrock Knowledge Base
+## 快速部署
 
 ```bash
-# Create S3 bucket for FAQ documents
-aws s3 mb s3://midea-repair-faq-docs-<account-id> --region us-east-1
-
-# Upload FAQ documents
-aws s3 cp your-faq.pdf s3://midea-repair-faq-docs-<account-id>/
-aws s3 cp your-manual.txt s3://midea-repair-faq-docs-<account-id>/
+cd midea
+./deploy.sh
 ```
 
-Then create Knowledge Base via AWS Console:
-- Go to Amazon Bedrock → Knowledge bases → Create
-- Name: `midea-repair-faq-kb`
-- Embeddings model: Titan Embeddings G1 - Text
-- Data source: S3 bucket created above
-- Vector store: Quick create new vector store
-- Click Sync after creation
+部署完成后查看 `deployment-info.log` 获取API信息。
 
-Get Knowledge Base ID:
+## 测试API
+
 ```bash
-aws bedrock-agent list-knowledge-bases --region us-east-1 \
-  --query 'knowledgeBaseSummaries[?name==`midea-repair-faq-kb`].knowledgeBaseId' \
-  --output text
+# 查看部署信息
+cat deployment-info.log
+
+# 设置环境变量
+export API_URL="<your-api-url>"
+export API_KEY="<your-api-key>"
+
+# 运行测试
+./test-api.sh
 ```
 
-### 2. Deploy Stack
+## 清理资源
 
 ```bash
+./cleanup.sh
+```
+
+## API端点
+
+### 1. POST /repair/request - 创建维修工单
+```json
+{
+  "product_model": "产品型号",
+  "serial_number": "序列号",
+  "purchase_date": "2023-10-15",
+  "issue_description": "问题描述",
+  "full_name": "客户姓名",
+  "phone": "+1-555-0123",
+  "service_address": "服务地址",
+  "preferred_time": "2024-02-15 10:00",
+  "warranty_status": "yes"
+}
+```
+返回：10位工单号
+
+### 2. POST /repair/track - 查询工单状态
+```json
+{
+  "repair_notice_or_work_order_number": "工单号",
+  "full_name": "客户姓名",
+  "phone": "+1-555-0123",
+  "need_to_reschedule_or_missed_visit": "no",
+  "waiting_for_spare_part": "no"
+}
+```
+返回：工单详细信息
+
+### 3. POST /faq/simple - FAQ查询
+```json
+{
+  "query": "How do I reset my air conditioner?"
+}
+```
+返回：相关FAQ列表（内置10条常见问题）
+
+## 架构
+
+```
+API Gateway (API Key认证)
+├── /repair/request  → Lambda → DynamoDB
+├── /repair/track    → Lambda → DynamoDB
+└── /faq/simple      → Lambda (内置FAQ)
+```
+
+**资源：** 1个DynamoDB表 + 3个Lambda函数
+
+**成本：** ~$5/月 (低流量)
+
+## 文件说明
+
+- `connect-api-customer.yaml` - CloudFormation模板
+- `connect-api-openapi.yaml` - OpenAPI规范
+- `deploy.sh` - 自动部署脚本
+- `test-api.sh` - API测试脚本
+- `cleanup.sh` - 资源清理脚本
+- `deployment-info.log` - 部署信息（部署后生成）
+
+## 手动部署
+
+如果不使用自动脚本：
+
+```bash
+# 1. 上传OpenAPI规范到S3
+aws s3 cp connect-api-openapi.yaml s3://your-bucket/
+
+# 2. 创建CloudFormation stack
 aws cloudformation create-stack \
-  --stack-name connect-service-api \
+  --stack-name connect-ac-api-stack \
   --template-body file://connect-api-customer.yaml \
-  --parameters \
-    ParameterKey=SeedDataUrl,ParameterValue=<YOUR_HOTEL_DATA_URL> \
-    ParameterKey=OpenApiSpecUrl,ParameterValue=<YOUR_OPENAPI_SPEC_URL> \
-    ParameterKey=KnowledgeBaseId,ParameterValue=<YOUR_KB_ID> \
+  --parameters ParameterKey=OpenApiSpecUrl,ParameterValue=s3://your-bucket/connect-api-openapi.yaml \
   --capabilities CAPABILITY_IAM \
-  --region us-east-1
-```
+  --region us-west-2
 
-Wait for completion:
-```bash
+# 3. 等待完成
 aws cloudformation wait stack-create-complete \
-  --stack-name connect-service-api \
-  --region us-east-1
+  --stack-name connect-ac-api-stack \
+  --region us-west-2
 ```
 
-### 3. Get API Details
+## 测试用例
 
-```bash
-# Get API URL
-aws cloudformation describe-stacks \
-  --stack-name connect-service-api \
-  --query 'Stacks[0].Outputs[?OutputKey==`ApiUrl`].OutputValue' \
-  --output text
+`test-api.sh` 包含6个测试：
+1. ✓ 创建维修工单
+2. ✓ 查询工单状态
+3. ✓ FAQ查询 - 空调重置
+4. ✓ FAQ查询 - 冰箱噪音
+5. ✓ 错误处理 - 缺少参数
+6. ✓ 错误处理 - 工单不存在
 
-# Get API Key
-aws cloudformation describe-stacks \
-  --stack-name connect-service-api \
-  --query 'Stacks[0].Outputs[?OutputKey==`ApiKey`].OutputValue' \
-  --output text
-```
+## 常见问题
 
-## API Usage Examples
+**Q: 部署需要多久？**
+3-5分钟
 
-Set environment variables:
-```bash
-export API_URL=<your-api-url>
-export API_KEY=<your-api-key>
-```
+**Q: 如何查看日志？**
+AWS Console → CloudWatch → Log groups → `/aws/lambda/connect-ac-api-stack-repair-api`
 
-### Hotel APIs
+**Q: 成本会超出预算吗？**
+使用AWS Free Tier，前12个月几乎免费。之后低流量场景约$5/月。
 
-**Search Hotels:**
-```bash
-curl -X POST $API_URL/hotels/search \
-  -H "X-API-Key: $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"city": "Seattle"}'
-```
-
-**Create Reservation:**
-```bash
-curl -X POST $API_URL/reservations \
-  -H "X-API-Key: $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "hotelId": "hotel-123",
-    "customerId": "customer-456",
-    "checkInDate": "2024-03-15",
-    "checkOutDate": "2024-03-18",
-    "roomType": "Standard King",
-    "guestName": "John Doe",
-    "guestEmail": "john@example.com"
-  }'
-```
-
-### Repair Service APIs
-
-**Request Repair:**
-```bash
-curl -X POST $API_URL/repair/request \
-  -H "X-API-Key: $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "product_model": "AC-2000X",
-    "serial_number": "SN123456789",
-    "purchase_date": "2023-06-15",
-    "issue_description": "Not cooling properly",
-    "full_name": "John Smith",
-    "phone": "+1-555-123-4567",
-    "service_address": "123 Main St, New York, NY 10001",
-    "preferred_time": "2024-02-15 14:00",
-    "warranty_status": "yes"
-  }'
-```
-
-**Track Repair:**
-```bash
-curl -X POST $API_URL/repair/track \
-  -H "X-API-Key: $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "repair_notice_or_work_order_number": "1234567890",
-    "full_name": "John Smith",
-    "phone": "+1-555-123-4567",
-    "need_to_reschedule_or_missed_visit": "no",
-    "waiting_for_spare_part": "no"
-  }'
-```
-
-**FAQ Search (Bedrock):**
-```bash
-curl -X POST $API_URL/faq/search \
-  -H "X-API-Key: $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "How do I reset my air conditioner?"}'
-```
-
-**FAQ Simple (No Bedrock):**
-```bash
-curl -X POST $API_URL/faq/simple \
-  -H "X-API-Key: $API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "How do I reset my air conditioner?"}'
-```
-
-## Stack Outputs
-
-- `ApiUrl` - Base URL for all API endpoints
-- `ApiKey` - API key for authentication
-- `HotelTableName` - DynamoDB table for hotels
-- `ReservationsTableName` - DynamoDB table for reservations
-- `RepairTicketsTableName` - DynamoDB table for repair tickets
-- `OpenApiSpecS3Location` - S3 location of OpenAPI spec
-- `ApiEndpoints` - List of all available endpoints
-
-## Cleanup
-
-```bash
-# Delete CloudFormation stack
-aws cloudformation delete-stack \
-  --stack-name connect-service-api \
-  --region us-east-1
-
-# Delete Knowledge Base (manual via console or CLI)
-aws bedrock-agent delete-knowledge-base \
-  --knowledge-base-id <YOUR_KB_ID> \
-  --region us-east-1
-
-# Delete S3 bucket
-aws s3 rb s3://midea-repair-faq-docs-<account-id> --force --region us-east-1
-```
-
-## Architecture
-
-```
-API Gateway (with API Key auth)
-├── Hotel APIs
-│   ├── /hotels/search → SearchHotelsFunction → HotelsTable
-│   ├── /reservations → CreateReservationFunction → ReservationsTable
-│   ├── /reservations/cancel → CancelReservationFunction → ReservationsTable
-│   ├── /reservations/customer → GetCustomerReservationsFunction → ReservationsTable
-│   └── /reservations/modify → ModifyReservationFunction → ReservationsTable
-└── Repair APIs
-    ├── /repair/request → RequestRepairFunction → RepairTicketsTable
-    ├── /repair/track → TrackRepairFunction → RepairTicketsTable
-    ├── /faq/search → FaqSearchFunction → Bedrock Knowledge Base
-    └── /faq/simple → FaqSimpleFunction → Predefined FAQ Database (no external dependency)
-```
-
-## Cost Estimate
-
-- Lambda: ~$0.20/month (1M requests)
-- DynamoDB: ~$2/month (100K operations across 3 tables)
-- API Gateway: ~$3.50/month (1M requests)
-- Bedrock KB: ~$0.10 per 1K tokens
-- CloudWatch: ~$0.50/month (1GB logs)
-
-**Total: ~$6-7/month** (excluding Bedrock Knowledge Base infrastructure costs)
-
-## Files
-
-- `connect-api-customer.yaml` - Complete CloudFormation template
-- `connect-api-openapi.yaml` - Complete OpenAPI specification
-- `hotel-api-customer-addition.yaml` - Legacy addition file (reference only)
-- `hotel-api-openapi-addition.yaml` - Legacy addition file (reference only)
-- `openapi-addition.yaml` - Legacy addition file (reference only)
+**Q: 如何修改API？**
+修改对应的YAML文件后重新部署即可。
