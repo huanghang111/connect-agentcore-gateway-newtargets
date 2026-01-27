@@ -1,11 +1,11 @@
-# Midea Repair Service API
+# Connect Repair Service API
 
 简化的维修服务API，包含工单管理和FAQ查询功能。
 
 ## 快速部署
 
 ```bash
-cd midea
+cd connect-agentcore-gateway-newtargets
 ./deploy.sh
 ```
 
