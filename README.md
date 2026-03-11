@@ -1,6 +1,9 @@
 # Connect Repair Service API
 
 简化的维修服务API，包含工单管理和FAQ查询功能。
+方案架构图如下:
+<img width="1046" height="417" alt="image" src="https://github.com/user-attachments/assets/cd0cc9c4-ef83-4de3-a27a-5a8a131f2356" />
+
 
 ## 快速部署
 
