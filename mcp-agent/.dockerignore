@@ -1,0 +1,9 @@
+.venv
+__pycache__
+*.pyc
+deploy_runtime.py
+deploy.sh
+cleanup.sh
+deployment-info.log
+.dockerignore
+Dockerfile
