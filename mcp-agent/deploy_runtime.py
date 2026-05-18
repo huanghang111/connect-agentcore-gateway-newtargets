@@ -40,11 +40,15 @@ _load_env(Path(__file__).parent / ".env")
 
 REGION = _require("REGION")
 ACCOUNT_ID = _require("ACCOUNT_ID")
-AGENT_NAME_DASH = _require("AGENT_NAME")          # e.g. midea-repair-mcp-server
+AGENT_NAME_DASH = _require("AGENT_NAME")          # e.g. connect-repair-mcp-server
 AGENT_NAME = AGENT_NAME_DASH.replace("-", "_")     # Runtime names must use underscores
 ECR_REPO_NAME = _require("ECR_REPO_NAME")
-GATEWAY_ID = _require("GATEWAY_ID")
-GATEWAY_SERVICE_ROLE = _require("GATEWAY_SERVICE_ROLE")
+# Gateway is optional — if GATEWAY_ID is empty the script will create one.
+GATEWAY_ID = os.environ.get("GATEWAY_ID", "").strip()
+GATEWAY_SERVICE_ROLE = os.environ.get("GATEWAY_SERVICE_ROLE", "").strip()
+GATEWAY_JWT_DISCOVERY_URL = os.environ.get("GATEWAY_JWT_DISCOVERY_URL", "").strip()
+GATEWAY_JWT_ALLOWED_AUDIENCE = os.environ.get("GATEWAY_JWT_ALLOWED_AUDIENCE", "").strip()
+GATEWAY_JWT_ALLOWED_CLIENTS = os.environ.get("GATEWAY_JWT_ALLOWED_CLIENTS", "").strip()
 TARGET_NAME = _require("TARGET_NAME")
 
 REPAIR_API_URL = _require("REPAIR_API_URL")
@@ -52,6 +56,111 @@ REPAIR_API_KEY = _require("REPAIR_API_KEY")
 
 ECR_URI = f"{ACCOUNT_ID}.dkr.ecr.{REGION}.amazonaws.com/{ECR_REPO_NAME}"
 ROLE_ARN = f"arn:aws:iam::{ACCOUNT_ID}:role/{AGENT_NAME_DASH}-execution-role"
+
+# Gateway name only accepts [0-9a-zA-Z-], no underscores; max 48 chars.
+GATEWAY_NAME = f"{AGENT_NAME_DASH}-gw"[:48]
+GATEWAY_ROLE_NAME = f"{AGENT_NAME_DASH}-gateway-role"
+
+
+def _ensure_gateway_service_role(iam) -> str:
+    """Create or return the IAM role that the auto-provisioned Gateway uses."""
+    try:
+        role = iam.get_role(RoleName=GATEWAY_ROLE_NAME)
+        return role["Role"]["Arn"]
+    except iam.exceptions.NoSuchEntityException:
+        pass
+
+    trust = json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+            "Action": "sts:AssumeRole",
+        }],
+    })
+    role_arn = iam.create_role(
+        RoleName=GATEWAY_ROLE_NAME,
+        AssumeRolePolicyDocument=trust,
+        Description="Service role for Connect Repair MCP AgentCore Gateway",
+    )["Role"]["Arn"]
+    iam.put_role_policy(
+        RoleName=GATEWAY_ROLE_NAME,
+        PolicyName="gateway-default",
+        PolicyDocument=json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": [
+                    "bedrock-agentcore:InvokeAgentRuntime",
+                    "logs:CreateLogGroup",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents",
+                ],
+                "Resource": "*",
+            }],
+        }),
+    )
+    print(f"  ✓ Gateway service role created: {GATEWAY_ROLE_NAME}")
+    print("  Waiting 10s for IAM propagation...")
+    time.sleep(10)
+    return role_arn
+
+
+def _ensure_gateway(control, iam) -> tuple[str, str]:
+    """Return (gateway_id, gateway_service_role_name), creating a Gateway if needed."""
+    global GATEWAY_ID, GATEWAY_SERVICE_ROLE
+
+    if GATEWAY_ID:
+        if not GATEWAY_SERVICE_ROLE:
+            print("✗ GATEWAY_SERVICE_ROLE is required when GATEWAY_ID is set")
+            sys.exit(1)
+        print(f"  Using existing Gateway: {GATEWAY_ID}")
+        return GATEWAY_ID, GATEWAY_SERVICE_ROLE
+
+    # Reuse a previously auto-created Gateway with the same name
+    paginator = control.get_paginator("list_gateways")
+    for page in paginator.paginate():
+        for gw in page.get("items", []):
+            if gw.get("name") == GATEWAY_NAME:
+                gw_id = gw["gatewayId"]
+                print(f"  Found existing auto-created Gateway: {gw_id}")
+                role_name = (GATEWAY_SERVICE_ROLE or GATEWAY_ROLE_NAME)
+                return gw_id, role_name
+
+    if not GATEWAY_JWT_DISCOVERY_URL:
+        print("✗ GATEWAY_ID is empty and GATEWAY_JWT_DISCOVERY_URL is not set.")
+        print("  Either set GATEWAY_ID to use an existing Gateway, or provide JWT")
+        print("  authorizer config (GATEWAY_JWT_DISCOVERY_URL plus AUDIENCE/CLIENTS)")
+        print("  so the script can create one.")
+        sys.exit(1)
+
+    role_arn = _ensure_gateway_service_role(iam)
+
+    jwt_cfg: dict = {"discoveryUrl": GATEWAY_JWT_DISCOVERY_URL}
+    if GATEWAY_JWT_ALLOWED_AUDIENCE:
+        jwt_cfg["allowedAudience"] = [
+            s.strip() for s in GATEWAY_JWT_ALLOWED_AUDIENCE.split(",") if s.strip()
+        ]
+    if GATEWAY_JWT_ALLOWED_CLIENTS:
+        jwt_cfg["allowedClients"] = [
+            s.strip() for s in GATEWAY_JWT_ALLOWED_CLIENTS.split(",") if s.strip()
+        ]
+    if "allowedAudience" not in jwt_cfg and "allowedClients" not in jwt_cfg:
+        print("✗ Set GATEWAY_JWT_ALLOWED_AUDIENCE or GATEWAY_JWT_ALLOWED_CLIENTS")
+        sys.exit(1)
+
+    print(f"  Creating Gateway: {GATEWAY_NAME}")
+    resp = control.create_gateway(
+        name=GATEWAY_NAME,
+        description=f"Auto-created Gateway for {AGENT_NAME_DASH}",
+        roleArn=role_arn,
+        protocolType="MCP",
+        authorizerType="CUSTOM_JWT",
+        authorizerConfiguration={"customJWTAuthorizer": jwt_cfg},
+    )
+    gw_id = resp["gatewayId"]
+    print(f"  ✓ Gateway created: {gw_id}")
+    return gw_id, GATEWAY_ROLE_NAME
 
 
 def main():
@@ -122,6 +231,10 @@ def main():
         print("  ✗ Timeout waiting for READY")
         sys.exit(1)
 
+    # Step 6.5: Ensure Gateway exists (auto-create if user didn't provide one)
+    print("\nEnsuring AgentCore Gateway")
+    gateway_id, gateway_service_role = _ensure_gateway(control, iam)
+
     # Step 7: Ensure Gateway service role can invoke this runtime
     print("\nStep 7/8: Gateway IAM Permission")
     policy_doc = json.dumps({
@@ -134,7 +247,7 @@ def main():
         }],
     })
     iam.put_role_policy(
-        RoleName=GATEWAY_SERVICE_ROLE,
+        RoleName=gateway_service_role,
         PolicyName="InvokeAgentRuntimePolicy",
         PolicyDocument=policy_doc,
     )
@@ -150,7 +263,7 @@ def main():
     )
 
     # Check existing targets
-    targets_resp = control.list_gateway_targets(gatewayIdentifier=GATEWAY_ID)
+    targets_resp = control.list_gateway_targets(gatewayIdentifier=gateway_id)
     existing_target_id = None
     for t in targets_resp.get("items", []):
         if t["name"] == TARGET_NAME:
@@ -162,7 +275,7 @@ def main():
         print("  Synchronizing tools...")
         try:
             control.synchronize_gateway_targets(
-                gatewayIdentifier=GATEWAY_ID,
+                gatewayIdentifier=gateway_id,
                 targetIdList=[existing_target_id],
             )
             print("  ✓ Sync triggered")
@@ -170,9 +283,9 @@ def main():
             print(f"  Sync note: {e}")
     else:
         resp = control.create_gateway_target(
-            gatewayIdentifier=GATEWAY_ID,
+            gatewayIdentifier=gateway_id,
             name=TARGET_NAME,
-            description="Midea Repair MCP Server on AgentCore Runtime",
+            description="Connect Repair MCP Server on AgentCore Runtime",
             targetConfiguration={
                 "mcp": {"mcpServer": {"endpoint": mcp_endpoint}}
             },
@@ -193,7 +306,7 @@ def main():
         print("  Waiting for READY...")
         for i in range(30):
             t_resp = control.get_gateway_target(
-                gatewayIdentifier=GATEWAY_ID, targetId=target_id
+                gatewayIdentifier=gateway_id, targetId=target_id
             )
             t_status = t_resp["status"]
             if t_status == "READY":
@@ -215,9 +328,10 @@ def main():
     print(f"Agent Runtime ID:  {runtime_id}")
     print(f"Agent Runtime ARN: {runtime_arn}")
     print(f"MCP Endpoint:      {mcp_endpoint}")
-    print(f"Gateway ID:        {GATEWAY_ID}")
+    print(f"Gateway ID:        {gateway_id}")
+    print(f"Gateway Role:      {gateway_service_role}")
     print(f"Target Name:       {TARGET_NAME}")
-    print(f"\nMCP Tools: requestRepair, trackRepair, faqSearch")
+    print(f"\nMCP Tools: requestRepair, trackRepair, cancelRepair")
 
     # Save info
     with open("deployment-info.log", "w") as f:
@@ -227,7 +341,8 @@ def main():
         f.write(f"Agent Runtime ARN: {runtime_arn}\n")
         f.write(f"ECR Image: {ECR_URI}:latest\n")
         f.write(f"MCP Endpoint: {mcp_endpoint}\n")
-        f.write(f"Gateway ID: {GATEWAY_ID}\n")
+        f.write(f"Gateway ID: {gateway_id}\n")
+        f.write(f"Gateway Service Role: {gateway_service_role}\n")
         f.write(f"Target Name: {TARGET_NAME}\n")
         f.write(f"CodeBuild: {AGENT_NAME_DASH}-build\n")
 
