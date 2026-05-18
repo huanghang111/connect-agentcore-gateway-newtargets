@@ -23,9 +23,14 @@ set +a
 : "${ACCOUNT_ID:?ACCOUNT_ID is required in .env}"
 : "${AGENT_NAME:?AGENT_NAME is required in .env}"
 : "${ECR_REPO_NAME:?ECR_REPO_NAME is required in .env}"
-: "${GATEWAY_ID:?GATEWAY_ID is required in .env}"
-: "${GATEWAY_SERVICE_ROLE:?GATEWAY_SERVICE_ROLE is required in .env}"
 : "${TARGET_NAME:?TARGET_NAME is required in .env}"
+
+# Gateway is optional in .env. If GATEWAY_ID is empty we treat the Gateway as
+# auto-created by deploy.sh and look it up by the conventional name.
+GATEWAY_ID="${GATEWAY_ID:-}"
+GATEWAY_SERVICE_ROLE="${GATEWAY_SERVICE_ROLE:-}"
+AUTO_GATEWAY_NAME="${AGENT_NAME}-gw"
+AUTO_GATEWAY_ROLE="${AGENT_NAME}-gateway-role"
 
 RUNTIME_NAME="${AGENT_NAME//-/_}"
 CODEBUILD_PROJECT_NAME="${AGENT_NAME}-build"
@@ -35,43 +40,78 @@ EXECUTION_ROLE_NAME="${AGENT_NAME}-execution-role"
 
 echo -e "${YELLOW}=== MCP Agent Cleanup ===${NC}\n"
 
-# Step 1: Remove Gateway Target
-echo -e "${YELLOW}Step 1: Remove Gateway Target${NC}"
 if [ ! -d ".venv" ]; then
     echo "  No .venv found, creating for boto3..."
     python3 -m venv .venv
     .venv/bin/pip install --upgrade pip boto3 -q
 fi
 
-TARGET_ID=$(.venv/bin/python -c "
+# Resolve Gateway ID + role: either user-provided, or auto-created by deploy.sh.
+RESOLVED_GATEWAY_ID=$(.venv/bin/python -c "
 import boto3
-client = boto3.client('bedrock-agentcore-control', region_name='${REGION}')
-resp = client.list_gateway_targets(gatewayIdentifier='${GATEWAY_ID}')
-for t in resp.get('targets', []):
-    if t['name'] == '${TARGET_NAME}':
-        print(t['targetId'])
+c = boto3.client('bedrock-agentcore-control', region_name='${REGION}')
+explicit = '${GATEWAY_ID}'.strip()
+if explicit:
+    print(explicit)
+else:
+    for page in c.get_paginator('list_gateways').paginate():
+        for gw in page.get('items', []):
+            if gw.get('name') == '${AUTO_GATEWAY_NAME}':
+                print(gw['gatewayId'])
+                break
+        else:
+            continue
         break
 " 2>/dev/null || echo "")
 
-if [ -n "$TARGET_ID" ]; then
-    .venv/bin/python -c "
+GATEWAY_AUTO_CREATED="no"
+if [ -z "${GATEWAY_ID}" ] && [ -n "$RESOLVED_GATEWAY_ID" ]; then
+    GATEWAY_AUTO_CREATED="yes"
+fi
+
+RESOLVED_GATEWAY_ROLE="${GATEWAY_SERVICE_ROLE}"
+if [ -z "$RESOLVED_GATEWAY_ROLE" ]; then
+    RESOLVED_GATEWAY_ROLE="${AUTO_GATEWAY_ROLE}"
+fi
+
+# Step 1: Remove Gateway Target
+echo -e "${YELLOW}Step 1: Remove Gateway Target${NC}"
+if [ -n "$RESOLVED_GATEWAY_ID" ]; then
+    TARGET_ID=$(.venv/bin/python -c "
 import boto3
-client = boto3.client('bedrock-agentcore-control', region_name='${REGION}')
-client.delete_gateway_target(gatewayIdentifier='${GATEWAY_ID}', targetId='${TARGET_ID}')
+c = boto3.client('bedrock-agentcore-control', region_name='${REGION}')
+resp = c.list_gateway_targets(gatewayIdentifier='${RESOLVED_GATEWAY_ID}')
+for t in resp.get('items', []):
+    if t.get('name') == '${TARGET_NAME}':
+        print(t['targetId'])
+        break
+" 2>/dev/null || echo "")
+    if [ -n "$TARGET_ID" ]; then
+        .venv/bin/python -c "
+import boto3
+c = boto3.client('bedrock-agentcore-control', region_name='${REGION}')
+c.delete_gateway_target(gatewayIdentifier='${RESOLVED_GATEWAY_ID}', targetId='${TARGET_ID}')
 print('  ✓ Gateway target deleted: ${TARGET_ID}')
 " 2>/dev/null || echo "  Failed to delete target"
+    else
+        echo "  No target found"
+    fi
 else
-    echo "  No target found"
+    echo "  No Gateway resolved, skipping"
 fi
 echo ""
 
-# Step 2: Remove Gateway IAM inline policy
+# Step 2: Remove Gateway IAM inline policy (only meaningful if role exists)
 echo -e "${YELLOW}Step 2: Remove Gateway IAM Policy${NC}"
-aws iam delete-role-policy \
-    --role-name ${GATEWAY_SERVICE_ROLE} \
-    --policy-name InvokeAgentRuntimePolicy 2>/dev/null && \
-    echo -e "${GREEN}✓ Gateway IAM policy removed${NC}" || \
-    echo "  No policy found"
+if aws iam get-role --role-name "${RESOLVED_GATEWAY_ROLE}" >/dev/null 2>&1; then
+    aws iam delete-role-policy \
+        --role-name "${RESOLVED_GATEWAY_ROLE}" \
+        --policy-name InvokeAgentRuntimePolicy 2>/dev/null && \
+        echo -e "${GREEN}✓ Gateway IAM policy removed${NC}" || \
+        echo "  No InvokeAgentRuntimePolicy found"
+else
+    echo "  Gateway role not found, skipping"
+fi
 echo ""
 
 # Step 3: Delete AgentCore Runtime
@@ -131,6 +171,26 @@ else
     echo "  No ECR repo found"
 fi
 echo ""
+
+# Step 6.5: Delete auto-created Gateway (only if we created it)
+if [ "$GATEWAY_AUTO_CREATED" = "yes" ] && [ -n "$RESOLVED_GATEWAY_ID" ]; then
+    echo -e "${YELLOW}Step 6.5: Delete auto-created Gateway${NC}"
+    .venv/bin/python -c "
+import boto3
+c = boto3.client('bedrock-agentcore-control', region_name='${REGION}')
+c.delete_gateway(gatewayIdentifier='${RESOLVED_GATEWAY_ID}')
+print('  ✓ Gateway deleted: ${RESOLVED_GATEWAY_ID}')
+" 2>/dev/null || echo "  Failed to delete gateway"
+
+    if aws iam get-role --role-name "${AUTO_GATEWAY_ROLE}" >/dev/null 2>&1; then
+        aws iam delete-role-policy --role-name "${AUTO_GATEWAY_ROLE}" --policy-name gateway-default 2>/dev/null || true
+        aws iam delete-role-policy --role-name "${AUTO_GATEWAY_ROLE}" --policy-name InvokeAgentRuntimePolicy 2>/dev/null || true
+        aws iam delete-role --role-name "${AUTO_GATEWAY_ROLE}" 2>/dev/null && \
+            echo -e "${GREEN}✓ Auto-created Gateway role deleted${NC}" || \
+            echo "  Failed to delete gateway role"
+    fi
+    echo ""
+fi
 
 # Step 7: Delete IAM Roles
 echo -e "${YELLOW}Step 7: Delete IAM Roles${NC}"

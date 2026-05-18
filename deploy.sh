@@ -13,9 +13,11 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 # 配置
-STACK_NAME="connect-ac-api-stack"
-REGION="us-west-2"
-BUCKET_NAME="connect-workshop-ac-20260126"
+# Override via env vars if needed:
+#   STACK_NAME=foo REGION=us-west-2 ./deploy.sh
+STACK_NAME="${STACK_NAME:-connect-repair-api-stack}"
+REGION="${REGION:-us-east-1}"
+BUCKET_NAME="${BUCKET_NAME:-connect-repair-api-${AWS_ACCOUNT_ID:-585306731051}-${REGION}}"
 OPENAPI_S3_URL="s3://${BUCKET_NAME}/connect-api-openapi.yaml"
 
 echo -e "${YELLOW}=== Midea Repair Service API 部署 ===${NC}\n"
@@ -30,32 +32,59 @@ else
     echo -e "${GREEN}✓ Bucket创建成功: ${BUCKET_NAME}${NC}\n"
 fi
 
-# 上传OpenAPI规范
-echo -e "${YELLOW}步骤 2/4: 上传OpenAPI规范${NC}"
-aws s3 cp connect-api-openapi.yaml s3://${BUCKET_NAME}/
-echo -e "${GREEN}✓ OpenAPI规范上传成功${NC}\n"
+# 上传OpenAPI规范 + 主模板（模板 > 51200 字节,必须走 S3）
+echo -e "${YELLOW}步骤 2/4: 上传OpenAPI规范 + 主模板${NC}"
+aws s3 cp connect-api-openapi.yaml s3://${BUCKET_NAME}/ --region ${REGION}
+aws s3 cp connect-api-customer.yaml s3://${BUCKET_NAME}/ --region ${REGION}
+TEMPLATE_S3_URL="https://${BUCKET_NAME}.s3.${REGION}.amazonaws.com/connect-api-customer.yaml"
+echo -e "${GREEN}✓ 上传成功${NC}\n"
 
-# 创建CloudFormation stack
-echo -e "${YELLOW}步骤 3/4: 创建CloudFormation stack${NC}"
+# 创建或更新CloudFormation stack
+echo -e "${YELLOW}步骤 3/4: 部署CloudFormation stack${NC}"
 echo "Stack名称: ${STACK_NAME}"
 echo "区域: ${REGION}"
 echo "OpenAPI URL: ${OPENAPI_S3_URL}"
 echo ""
 
-aws cloudformation create-stack \
-  --stack-name ${STACK_NAME} \
-  --template-body file://connect-api-customer.yaml \
-  --parameters ParameterKey=OpenApiSpecUrl,ParameterValue=${OPENAPI_S3_URL} \
-  --capabilities CAPABILITY_IAM \
-  --region ${REGION}
-echo -e "${GREEN}✓ Stack创建请求已提交${NC}\n"
+if aws cloudformation describe-stacks --stack-name "${STACK_NAME}" --region "${REGION}" >/dev/null 2>&1; then
+    echo "Stack 已存在，执行更新..."
+    set +e
+    UPDATE_OUT=$(aws cloudformation update-stack \
+      --stack-name ${STACK_NAME} \
+      --template-url ${TEMPLATE_S3_URL} \
+      --parameters ParameterKey=OpenApiSpecUrl,ParameterValue=${OPENAPI_S3_URL} \
+      --capabilities CAPABILITY_IAM \
+      --region ${REGION} 2>&1)
+    UPDATE_RC=$?
+    set -e
+    if [ $UPDATE_RC -ne 0 ]; then
+        if echo "$UPDATE_OUT" | grep -q "No updates are to be performed"; then
+            echo -e "${GREEN}✓ 模板无变化，跳过更新${NC}\n"
+            WAIT_OP=""
+        else
+            echo "$UPDATE_OUT"
+            exit 1
+        fi
+    else
+        echo -e "${GREEN}✓ Stack 更新请求已提交${NC}\n"
+        WAIT_OP="stack-update-complete"
+    fi
+else
+    aws cloudformation create-stack \
+      --stack-name ${STACK_NAME} \
+      --template-url ${TEMPLATE_S3_URL} \
+      --parameters ParameterKey=OpenApiSpecUrl,ParameterValue=${OPENAPI_S3_URL} \
+      --capabilities CAPABILITY_IAM \
+      --region ${REGION}
+    echo -e "${GREEN}✓ Stack 创建请求已提交${NC}\n"
+    WAIT_OP="stack-create-complete"
+fi
 
-# 等待部署完成
-echo -e "${YELLOW}步骤 4/4: 等待部署完成 (可能需要3-5分钟)${NC}"
-aws cloudformation wait stack-create-complete \
-  --stack-name ${STACK_NAME} \
-  --region ${REGION}
-echo -e "${GREEN}✓ Stack部署完成${NC}\n"
+if [ -n "$WAIT_OP" ]; then
+    echo -e "${YELLOW}步骤 4/4: 等待部署完成 (可能需要3-5分钟)${NC}"
+    aws cloudformation wait $WAIT_OP --stack-name ${STACK_NAME} --region ${REGION}
+    echo -e "${GREEN}✓ Stack 部署完成${NC}\n"
+fi
 
 # 获取输出信息
 echo -e "${YELLOW}获取API信息...${NC}"

@@ -56,22 +56,23 @@ Gateway 相关（任选其一种模式）：
 |------|------|
 | `GATEWAY_ID` | **复用现有 Gateway**：填入 ID。同时必须填 `GATEWAY_SERVICE_ROLE`（角色名，非 ARN） |
 | `GATEWAY_SERVICE_ROLE` | 现有 Gateway 的 IAM Role **名称** |
-| `GATEWAY_JWT_DISCOVERY_URL` | **自动创建 Gateway**：`GATEWAY_ID` 留空时启用；填 IDP 的 OIDC discovery URL |
-| `GATEWAY_JWT_ALLOWED_AUDIENCE` | JWT audience，多值用逗号分隔；与 `ALLOWED_CLIENTS` 至少填一个 |
-| `GATEWAY_JWT_ALLOWED_CLIENTS` | JWT 允许的 client ID 列表（逗号分隔） |
+| `GATEWAY_JWT_DISCOVERY_URL` | **自动创建 Gateway**：`GATEWAY_ID` 留空时必填，填 IDP（如 Connect 实例）的 OIDC discovery URL |
+| `GATEWAY_JWT_ALLOWED_AUDIENCE` | 可选；自动创建场景下脚本会**自动**把新 Gateway 的 ID 加到 audience 列表里，这里填的值仅作叠加 |
+| `GATEWAY_JWT_ALLOWED_CLIENTS` | 可选；JWT 允许的 client ID 列表（逗号分隔） |
 
 自动创建模式下，脚本会:
-1. 创建名为 `${AGENT_NAME}-gw` 的 Gateway，protocolType=`MCP`，authorizerType=`CUSTOM_JWT`
-2. 创建并复用 IAM 角色 `${AGENT_NAME}-gateway-role`（带 `InvokeAgentRuntime` + 日志权限）
+1. 创建 `${AGENT_NAME}-gw` Gateway：`protocolType=MCP`，`authorizerType=CUSTOM_JWT`
+2. **关键**：`allowedAudience` 设置成 Gateway 自己的 ID。Connect 颁发给该 namespace 的 JWT 中 `aud` claim 等于 Gateway ID，audience 不一致会触发 `insufficient_scope` 错误
+3. 创建并复用 IAM 角色 `${AGENT_NAME}-gateway-role`（带 `InvokeAgentRuntime` + 日志权限）
 
 复用模式下查找现有 Gateway Service Role 名称：
 
 ```bash
-aws bedrock-agentcore-control get-gateway \
-  --gateway-identifier <GATEWAY_ID> \
-  --region us-east-1 \
-  --query "roleArn" --output text
-# Role 名称是 ARN 的最后一段
+.venv/bin/python -c "
+import boto3
+g = boto3.client('bedrock-agentcore-control', region_name='us-east-1') \
+        .get_gateway(gatewayIdentifier='<GATEWAY_ID>')
+print(g['roleArn'].split('/')[-1])"
 ```
 
 ## 部署
@@ -142,7 +143,9 @@ Gateway target 就绪后，去 Amazon Connect 控制台：
 ./cleanup.sh
 ```
 
-删除本次部署创建的所有资源（Gateway target、Runtime、ECR、S3、CodeBuild、IAM 角色）。**复用模式**下用户提供的 Gateway 不会被删；**自动创建模式**下脚本可选择删除自建的 Gateway 与角色（参见 `cleanup.sh`）。
+删除本次部署创建的所有资源（Gateway target、Runtime、ECR、S3、CodeBuild、IAM 角色）。脚本会自动判断 Gateway 是否是它自己创建的：
+- **复用模式**（`.env` 里给了 `GATEWAY_ID`）：用户提供的 Gateway 与 service role **不会被删**，仅清理 target 和 InvokeAgentRuntime 内联策略
+- **自动创建模式**（`.env` 里 `GATEWAY_ID` 为空）：连同 `${AGENT_NAME}-gw` Gateway 与 `${AGENT_NAME}-gateway-role` 一并删除
 
 ## 本地测试（可选）
 
@@ -173,8 +176,10 @@ python mcp_server.py
 
 - Runtime 必须用 **ARM64** 镜像，CodeBuild 已配成 ARM 环境
 - Dockerfile 遵循官方示例：Python 3.11 基础镜像、非 root 用户 `bedrock_agentcore`、启动命令 `python -m mcp_server`
-- Tool 返回 `json.dumps(dict)`（字符串），对应 outputSchema `{result: string}`。Connect Output Filter 必须勾选 `result`，否则 LLM 拿不到返回值
+- 三个 tool 都使用 `@mcp.tool(structured_output=False)` —— 返回体只含 `content[]`，没有 `structuredContent` 字段，避免 Connect AI Agent 解析路径上的兼容问题
+- Tool 函数体内手工 `json.dumps(dict)`（字符串），Connect Output Filter 必须勾选 `result`，否则 LLM 拿不到返回值
 - `trackRepair` / `cancelRepair` 在工具内部就会校验 `woNumber` 非空且为 10 位数字，校验失败直接返回 `{"error": "INVALID_WO_NUMBER"}`，不会发出网络请求
 - Gateway name 受 AWS 限制：仅允许 `[0-9a-zA-Z-]`，最长 48 字符。脚本自动用 `${AGENT_NAME}-gw` 拼接并裁剪
+- Gateway audience 必须等于 Gateway 自身的 ID。一旦看到 Gateway 日志报 `insufficient_scope - The request requires higher privileges than provided by the access token.`，多半就是 audience 配错了
 - API Key 通过环境变量注入到 Runtime（生产环境建议改用 Secrets Manager）
 - `deploy.sh` 幂等，重复运行会更新 Runtime 并重新同步 Gateway target

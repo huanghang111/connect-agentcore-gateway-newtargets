@@ -485,28 +485,26 @@ Resources:
               try {
                   const body = JSON.parse(event.body || '{}');
                   const {
-                      product_model,
-                      serial_number,
-                      purchase_date,
-                      issue_description,
-                      full_name,
-                      phone,
-                      service_address,
-                      preferred_time,
-                      warranty_status
+                      productCategory,
+                      productsubCategory,
+                      productModel,
+                      serialNumber,
+                      province,
+                      city,
+                      district,
+                      description,
+                      brand
                   } = body;
 
-                  // Validate required fields
+                  // Validate required fields (productModel and serialNumber are optional)
                   const requiredFields = {
-                      product_model,
-                      serial_number,
-                      purchase_date,
-                      issue_description,
-                      full_name,
-                      phone,
-                      service_address,
-                      preferred_time,
-                      warranty_status
+                      productCategory,
+                      productsubCategory,
+                      province,
+                      city,
+                      district,
+                      description,
+                      brand
                   };
 
                   const missingFields = Object.entries(requiredFields)
@@ -535,15 +533,15 @@ Resources:
                   const ticketNumber = generateTicketNumber();
                   const repairTicket = {
                       ticketNumber,
-                      product_model,
-                      serial_number,
-                      purchase_date,
-                      issue_description,
-                      full_name,
-                      phone,
-                      service_address,
-                      preferred_time,
-                      warranty_status,
+                      productCategory,
+                      productsubCategory,
+                      productModel: productModel || null,
+                      serialNumber: serialNumber || null,
+                      province,
+                      city,
+                      district,
+                      description,
+                      brand,
                       status: 'pending',
                       createdAt: new Date().toISOString(),
                       updatedAt: new Date().toISOString()
@@ -633,30 +631,15 @@ Resources:
 
               try {
                   const body = JSON.parse(event.body || '{}');
-                  const {
-                      repair_notice_or_work_order_number,
-                      full_name,
-                      phone,
-                      need_to_reschedule_or_missed_visit,
-                      waiting_for_spare_part
-                  } = body;
+                  const { woNumber } = body;
 
-                  // Validate required fields
-                  if (!repair_notice_or_work_order_number || !full_name || !phone || 
-                      need_to_reschedule_or_missed_visit === undefined || 
-                      waiting_for_spare_part === undefined) {
-                      const missingFields = [];
-                      if (!repair_notice_or_work_order_number) missingFields.push('repair_notice_or_work_order_number');
-                      if (!full_name) missingFields.push('full_name');
-                      if (!phone) missingFields.push('phone');
-                      if (need_to_reschedule_or_missed_visit === undefined) missingFields.push('need_to_reschedule_or_missed_visit');
-                      if (waiting_for_spare_part === undefined) missingFields.push('waiting_for_spare_part');
-
+                  // Validate woNumber: required, 10-digit numeric
+                  if (!woNumber || !/^\d{10}$/.test(woNumber)) {
                       console.log(JSON.stringify({
                           level: 'WARN',
-                          message: 'Missing required fields',
+                          message: 'Invalid woNumber',
                           requestId,
-                          missingFields
+                          woNumber
                       }));
                       return {
                           statusCode: 400,
@@ -665,7 +648,7 @@ Resources:
                               'Access-Control-Allow-Origin': '*',
                           },
                           body: JSON.stringify({
-                              error: `Missing required fields: ${missingFields.join(', ')}`,
+                              error: 'woNumber is required and must be a 10-digit numeric string',
                           }),
                       };
                   }
@@ -674,13 +657,13 @@ Resources:
                       level: 'INFO',
                       message: 'Fetching repair ticket',
                       requestId,
-                      ticketNumber: repair_notice_or_work_order_number
+                      ticketNumber: woNumber
                   }));
 
                   // Get ticket by ticket number
                   const getParams = {
                       TableName: process.env.REPAIR_TICKETS_TABLE_NAME,
-                      Key: { ticketNumber: repair_notice_or_work_order_number },
+                      Key: { ticketNumber: woNumber },
                   };
 
                   const result = await docClient.send(new GetCommand(getParams));
@@ -690,7 +673,7 @@ Resources:
                           level: 'WARN',
                           message: 'Repair ticket not found',
                           requestId,
-                          ticketNumber: repair_notice_or_work_order_number
+                          ticketNumber: woNumber
                       }));
                       return {
                           statusCode: 404,
@@ -704,39 +687,25 @@ Resources:
                       };
                   }
 
-                  // Verify customer information
-                  if (result.Item.full_name !== full_name || result.Item.phone !== phone) {
-                      console.log(JSON.stringify({
-                          level: 'WARN',
-                          message: 'Customer information mismatch',
-                          requestId,
-                          ticketNumber: repair_notice_or_work_order_number
-                      }));
-                      return {
-                          statusCode: 403,
-                          headers: {
-                              'Content-Type': 'application/json',
-                              'Access-Control-Allow-Origin': '*',
-                          },
-                          body: JSON.stringify({
-                              error: 'Customer information does not match',
-                          }),
-                      };
-                  }
-
-                  // Prepare response with ticket status and additional context
+                  // Return ticket details. The new schema is field-driven: send back
+                  // whatever is stored on the item, plus the canonical fields the
+                  // caller cares about. Legacy fields (product_model, etc.) are
+                  // surfaced if present on the row to keep older items readable.
+                  const item = result.Item;
                   const responseData = {
-                      ticketNumber: result.Item.ticketNumber,
-                      status: result.Item.status,
-                      product_model: result.Item.product_model,
-                      issue_description: result.Item.issue_description,
-                      service_address: result.Item.service_address,
-                      preferred_time: result.Item.preferred_time,
-                      warranty_status: result.Item.warranty_status,
-                      createdAt: result.Item.createdAt,
-                      updatedAt: result.Item.updatedAt,
-                      need_to_reschedule_or_missed_visit,
-                      waiting_for_spare_part
+                      ticketNumber: item.ticketNumber,
+                      status: item.status,
+                      productCategory: item.productCategory ?? null,
+                      productsubCategory: item.productsubCategory ?? null,
+                      productModel: item.productModel ?? item.product_model ?? null,
+                      serialNumber: item.serialNumber ?? item.serial_number ?? null,
+                      brand: item.brand ?? null,
+                      province: item.province ?? null,
+                      city: item.city ?? null,
+                      district: item.district ?? null,
+                      description: item.description ?? item.issue_description ?? null,
+                      createdAt: item.createdAt,
+                      updatedAt: item.updatedAt
                   };
 
                   const response = {
@@ -755,7 +724,7 @@ Resources:
                       level: 'INFO',
                       message: 'Repair ticket retrieved successfully',
                       requestId,
-                      ticketNumber: repair_notice_or_work_order_number,
+                      ticketNumber: woNumber,
                       response: response
                   }));
 
@@ -764,6 +733,144 @@ Resources:
                   console.log(JSON.stringify({
                       level: 'ERROR',
                       message: 'Error tracking repair ticket',
+                      requestId,
+                      error: error.message,
+                      stack: error.stack
+                  }));
+                  return {
+                      statusCode: 500,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                      },
+                      body: JSON.stringify({
+                          error: 'Internal server error',
+                          message: error.message,
+                      }),
+                  };
+              }
+          };
+
+  CancelRepairFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt RepairLambdaExecutionRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref RepairLambdaLogGroup
+        LogFormat: JSON
+      Environment:
+        Variables:
+          REPAIR_TICKETS_TABLE_NAME: !Ref RepairTicketsTable
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, GetCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
+
+          const client = new DynamoDBClient({});
+          const docClient = DynamoDBDocumentClient.from(client);
+
+          exports.handler = async (event) => {
+              const requestId = event.requestContext?.requestId || 'unknown';
+              console.log(JSON.stringify({
+                  level: 'INFO',
+                  message: 'Cancel repair request received',
+                  requestId,
+                  event: event
+              }));
+
+              try {
+                  const body = JSON.parse(event.body || '{}');
+                  const { woNumber } = body;
+
+                  if (!woNumber || !/^\d{10}$/.test(woNumber)) {
+                      console.log(JSON.stringify({
+                          level: 'WARN',
+                          message: 'Invalid woNumber',
+                          requestId,
+                          woNumber
+                      }));
+                      return {
+                          statusCode: 400,
+                          headers: {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                          },
+                          body: JSON.stringify({
+                              error: 'woNumber is required and must be a 10-digit numeric string',
+                          }),
+                      };
+                  }
+
+                  // Look up the ticket first so we can return precise 404/409.
+                  const getResult = await docClient.send(new GetCommand({
+                      TableName: process.env.REPAIR_TICKETS_TABLE_NAME,
+                      Key: { ticketNumber: woNumber },
+                  }));
+
+                  if (!getResult.Item) {
+                      return {
+                          statusCode: 404,
+                          headers: {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                          },
+                          body: JSON.stringify({ error: 'Repair ticket not found' }),
+                      };
+                  }
+
+                  const currentStatus = getResult.Item.status;
+                  if (currentStatus === 'cancelled' || currentStatus === 'completed') {
+                      return {
+                          statusCode: 409,
+                          headers: {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                          },
+                          body: JSON.stringify({
+                              error: `Work order is already ${currentStatus}`,
+                              status: currentStatus,
+                          }),
+                      };
+                  }
+
+                  await docClient.send(new UpdateCommand({
+                      TableName: process.env.REPAIR_TICKETS_TABLE_NAME,
+                      Key: { ticketNumber: woNumber },
+                      UpdateExpression: 'SET #s = :s, updatedAt = :u',
+                      ExpressionAttributeNames: { '#s': 'status' },
+                      ExpressionAttributeValues: {
+                          ':s': 'cancelled',
+                          ':u': new Date().toISOString(),
+                      },
+                  }));
+
+                  console.log(JSON.stringify({
+                      level: 'INFO',
+                      message: 'Repair ticket cancelled',
+                      requestId,
+                      ticketNumber: woNumber
+                  }));
+
+                  return {
+                      statusCode: 200,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                      },
+                      body: JSON.stringify({
+                          message: 'Repair ticket cancelled',
+                          ticketNumber: woNumber,
+                          status: 'cancelled',
+                      }),
+                  };
+              } catch (error) {
+                  console.log(JSON.stringify({
+                      level: 'ERROR',
+                      message: 'Error cancelling repair ticket',
                       requestId,
                       error: error.message,
                       stack: error.stack
@@ -1027,6 +1134,14 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HotelApi}/*/*'
 
+  CancelRepairPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CancelRepairFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HotelApi}/*/*'
+
   FaqSimplePermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -1089,8 +1204,6 @@ Resources:
                   description: 'Unauthorized - API key required'
                 '400':
                   description: '400 response'
-                '403':
-                  description: '403 response'
                 '404':
                   description: '404 response'
                 '200':
@@ -1099,6 +1212,32 @@ Resources:
                 type: 'aws_proxy'
                 httpMethod: 'POST'
                 uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TrackRepairFunction.Arn}/invocations'
+          /repair/cancel:
+            post:
+              operationId: 'cancelRepair'
+              security:
+                - api_key: []
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      $ref: '#/components/schemas/CancelRepairRequest'
+              responses:
+                '401':
+                  description: 'Unauthorized - API key required'
+                '400':
+                  description: '400 response'
+                '404':
+                  description: '404 response'
+                '409':
+                  description: '409 response'
+                '200':
+                  description: '200 response'
+              x-amazon-apigateway-integration:
+                type: 'aws_proxy'
+                httpMethod: 'POST'
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CancelRepairFunction.Arn}/invocations'
           /faq/simple:
             post:
               operationId: 'faqSimple'
@@ -1131,57 +1270,48 @@ Resources:
             RepairRequest:
               type: 'object'
               required:
-                - product_model
-                - serial_number
-                - purchase_date
-                - issue_description
-                - full_name
-                - phone
-                - service_address
-                - preferred_time
-                - warranty_status
+                - productCategory
+                - productsubCategory
+                - province
+                - city
+                - district
+                - description
+                - brand
               properties:
-                product_model:
+                productCategory:
                   type: 'string'
-                serial_number:
+                productsubCategory:
                   type: 'string'
-                purchase_date:
+                productModel:
                   type: 'string'
-                  format: 'date'
-                issue_description:
+                serialNumber:
                   type: 'string'
-                full_name:
+                province:
                   type: 'string'
-                phone:
+                city:
                   type: 'string'
-                service_address:
+                district:
                   type: 'string'
-                preferred_time:
+                description:
                   type: 'string'
-                warranty_status:
+                brand:
                   type: 'string'
-                  enum: ['yes', 'no', 'unknown']
             TrackRepairRequest:
               type: 'object'
               required:
-                - repair_notice_or_work_order_number
-                - full_name
-                - phone
-                - need_to_reschedule_or_missed_visit
-                - waiting_for_spare_part
+                - woNumber
               properties:
-                repair_notice_or_work_order_number:
+                woNumber:
                   type: 'string'
-                full_name:
+                  pattern: '^\d{10}$'
+            CancelRepairRequest:
+              type: 'object'
+              required:
+                - woNumber
+              properties:
+                woNumber:
                   type: 'string'
-                phone:
-                  type: 'string'
-                need_to_reschedule_or_missed_visit:
-                  type: 'string'
-                  enum: ['yes', 'no']
-                waiting_for_spare_part:
-                  type: 'string'
-                  enum: ['yes', 'no']
+                  pattern: '^\d{10}$'
           securitySchemes:
             api_key:
               type: 'apiKey'
@@ -1251,5 +1381,6 @@ Outputs:
     Description: Available API endpoints
     Value: !Sub |
       Request Repair: https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/repair/request
-      Track Repair: https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/repair/track
-      FAQ Simple: https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/faq/simple
+      Track Repair:   https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/repair/track
+      Cancel Repair:  https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/repair/cancel
+      FAQ Simple:     https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/faq/simple

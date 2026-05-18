@@ -22,8 +22,8 @@ paths:
       operationId: requestRepair
       summary: Request a repair service
       description: |
-        Create a new repair ticket for a product. This API records customer information,
-        generates a repair ticket, and returns a unique 10-digit ticket number.
+        Create a new repair work order. Records the product, address, and a description
+        built from the dialog, and returns a unique 10-digit work-order number.
       tags:
         - Repair Service
       security:
@@ -35,54 +35,50 @@ paths:
             schema:
               type: object
               required:
-                - product_model
-                - serial_number
-                - purchase_date
-                - issue_description
-                - full_name
-                - phone
-                - service_address
-                - preferred_time
-                - warranty_status
+                - productCategory
+                - productsubCategory
+                - province
+                - city
+                - district
+                - description
+                - brand
               properties:
-                product_model:
+                productCategory:
                   type: string
-                  description: The model name or number of the product needing repair
-                  example: 'AC-2000X'
-                serial_number:
+                  description: Top-level product category. Must be validated via the product category lookup API.
+                  example: 'Refrigerator'
+                productsubCategory:
                   type: string
-                  description: The unique serial number of the product
-                  example: 'SN123456789'
-                purchase_date:
+                  description: Product sub-category. Must be validated via the product category lookup API.
+                  example: 'French Door'
+                productModel:
                   type: string
-                  format: date
-                  description: When the product was purchased (YYYY-MM-DD format)
-                  example: '2023-06-15'
-                issue_description:
+                  description: Product model. Optional. If provided, must be validated via the product model/SN API.
+                  example: 'MF200W90BE'
+                serialNumber:
                   type: string
-                  description: A detailed description of the problem or malfunction
-                  example: 'Air conditioner not cooling properly, making unusual noise'
-                full_name:
+                  description: Product serial number. Optional. If provided, must be validated via the product model/SN API.
+                  example: 'SN20231015ABC124'
+                province:
                   type: string
-                  description: Customer's complete name
-                  example: 'John Smith'
-                phone:
+                  description: Province / state. Must be validated via the address mapping API.
+                  example: 'NY'
+                city:
                   type: string
-                  description: Customer's contact phone number
-                  example: '+1-555-123-4567'
-                service_address:
+                  description: City. Must be validated via the address mapping API.
+                  example: 'New York'
+                district:
                   type: string
-                  description: The address where repair service should be performed or product picked up
-                  example: '123 Main St, Apt 4B, New York, NY 10001'
-                preferred_time:
+                  description: District / street. Must be validated via the address mapping API.
+                  example: 'Manhattan'
+                description:
                   type: string
-                  description: Customer's preferred date and time for service
-                  example: '2024-02-15 14:00'
-                warranty_status:
+                  description: Work-order remark — AI summary plus dialog transcript.
+                  example: "Refrigerator stopped cooling overnight. Already tried unplugging for 10 minutes."
+                brand:
                   type: string
-                  description: Whether the product is still under warranty
-                  enum: ['yes', 'no', 'unknown']
-                  example: 'yes'
+                  description: Product brand. Extracted from the dialog or product library.
+                  example: 'AnyCompany'
       responses:
         '201':
           description: Repair ticket created successfully
@@ -122,10 +118,11 @@ paths:
   /repair/track:
     post:
       operationId: trackRepair
-      summary: Track repair ticket status
+      summary: Track repair work-order status
       description: |
-        Check the status of an existing repair ticket. Requires the ticket number
-        and customer verification information. Returns current status and details.
+        Look up the status and details of an existing repair work order by its
+        work-order number. The caller is expected to validate that woNumber is a
+        non-empty 10-digit numeric string before invoking this endpoint.
       tags:
         - Repair Service
       security:
@@ -137,37 +134,16 @@ paths:
             schema:
               type: object
               required:
-                - repair_notice_or_work_order_number
-                - full_name
-                - phone
-                - need_to_reschedule_or_missed_visit
-                - waiting_for_spare_part
+                - woNumber
               properties:
-                repair_notice_or_work_order_number:
+                woNumber:
                   type: string
-                  description: The repair notice or work order number (REQUIRED)
+                  description: The work-order number (10-digit numeric string).
+                  pattern: '^\d{10}$'
                   example: '1234567890'
-                full_name:
-                  type: string
-                  description: Customer's complete name (REQUIRED)
-                  example: 'John Smith'
-                phone:
-                  type: string
-                  description: Customer's contact phone number (REQUIRED)
-                  example: '+1-555-123-4567'
-                need_to_reschedule_or_missed_visit:
-                  type: string
-                  description: Whether customer needs to reschedule or missed a visit (REQUIRED - must answer yes or no)
-                  enum: ['yes', 'no']
-                  example: 'no'
-                waiting_for_spare_part:
-                  type: string
-                  description: Whether customer is waiting for a spare part (REQUIRED - must answer yes or no)
-                  enum: ['yes', 'no']
-                  example: 'no'
       responses:
         '200':
-          description: Repair ticket found and status returned
+          description: Repair work order found and status returned
           content:
             application/json:
               schema:
@@ -184,24 +160,36 @@ paths:
                         example: '1234567890'
                       status:
                         type: string
-                        description: Current status of the repair ticket
+                        description: Current status of the work order
                         enum: ['pending', 'scheduled', 'in_progress', 'completed', 'cancelled']
                         example: 'pending'
-                      product_model:
+                      productCategory:
                         type: string
-                        example: 'AC-2000X'
-                      issue_description:
+                        example: 'Refrigerator'
+                      productsubCategory:
                         type: string
-                        example: 'Air conditioner not cooling properly'
-                      service_address:
+                        example: 'French Door'
+                      productModel:
                         type: string
-                        example: '123 Main St, Apt 4B, New York, NY 10001'
-                      preferred_time:
+                        example: 'MF200W90BE'
+                      serialNumber:
                         type: string
-                        example: '2024-02-15 14:00'
-                      warranty_status:
+                        example: 'SN20231015ABC124'
+                      brand:
                         type: string
-                        example: 'yes'
+                        example: 'AnyCompany'
+                      province:
+                        type: string
+                        example: 'NY'
+                      city:
+                        type: string
+                        example: 'New York'
+                      district:
+                        type: string
+                        example: 'Manhattan'
+                      description:
+                        type: string
+                        example: 'Refrigerator stopped cooling overnight'
                       createdAt:
                         type: string
                         format: date-time
@@ -210,14 +198,8 @@ paths:
                         type: string
                         format: date-time
                         example: '2024-01-20T10:30:00Z'
-                      need_to_reschedule_or_missed_visit:
-                        type: string
-                        example: 'no'
-                      waiting_for_spare_part:
-                        type: string
-                        example: 'no'
         '400':
-          description: Bad request - missing required parameters
+          description: Bad request - missing or malformed woNumber
           content:
             application/json:
               schema:
@@ -228,14 +210,83 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
-        '403':
-          description: Forbidden - customer information does not match
+        '404':
+          description: Repair work order not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /repair/cancel:
+    post:
+      operationId: cancelRepair
+      summary: Cancel a repair work order
+      description: |
+        Cancel an existing repair work order by its work-order number. The caller
+        is expected to validate that woNumber is a non-empty 10-digit numeric
+        string and to obtain explicit user confirmation before invoking this
+        endpoint, since cancellation is destructive.
+      tags:
+        - Repair Service
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - woNumber
+              properties:
+                woNumber:
+                  type: string
+                  description: The work-order number (10-digit numeric string).
+                  pattern: '^\d{10}$'
+                  example: '1234567890'
+      responses:
+        '200':
+          description: Work order cancelled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: 'Repair ticket cancelled'
+                  ticketNumber:
+                    type: string
+                    example: '1234567890'
+                  status:
+                    type: string
+                    example: 'cancelled'
+        '400':
+          description: Bad request - missing or malformed woNumber
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized - API key required
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '404':
-          description: Repair ticket not found
+          description: Repair work order not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Work order already cancelled or completed
           content:
             application/json:
               schema:

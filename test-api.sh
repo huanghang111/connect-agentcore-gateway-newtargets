@@ -28,15 +28,15 @@ RESPONSE=$(curl -s -X POST "$API_URL/repair/request" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "product_model": "MF200W90BE",
-    "serial_number": "SN20231015ABC123",
-    "purchase_date": "2023-10-15",
-    "issue_description": "Refrigerator not cooling properly, temperature not going down",
-    "full_name": "John Smith",
-    "phone": "+1-555-0123",
-    "service_address": "123 Oak Street, Apt 5B, New York, NY 10001",
-    "preferred_time": "2024-02-15 10:00",
-    "warranty_status": "yes"
+    "productCategory": "Refrigerator",
+    "productsubCategory": "French Door",
+    "productModel": "MF200W90BE",
+    "serialNumber": "SN20231015ABC123",
+    "brand": "AnyCompany",
+    "province": "NY",
+    "city": "New York",
+    "district": "Manhattan",
+    "description": "Refrigerator not cooling properly, temperature not going down. Customer already tried unplugging for 10 minutes."
   }')
 
 if echo "$RESPONSE" | grep -q "ticketNumber"; then
@@ -55,7 +55,7 @@ sleep 1
 
 # 测试2: 查询工单状态
 echo -e "${YELLOW}测试 2: 查询工单状态${NC}"
-JSON_DATA=$(printf '{"repair_notice_or_work_order_number":"%s","full_name":"John Smith","phone":"+1-555-0123","need_to_reschedule_or_missed_visit":"no","waiting_for_spare_part":"no"}' "$TICKET_NUMBER")
+JSON_DATA=$(printf '{"woNumber":"%s"}' "$TICKET_NUMBER")
 RESPONSE=$(curl -s -X POST "$API_URL/repair/track" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
@@ -114,7 +114,7 @@ echo -e "${YELLOW}测试 5: 错误处理 - 缺少必需参数${NC}"
 RESPONSE=$(curl -s -X POST "$API_URL/repair/request" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"product_model": "AC-2000X"}')
+  -d '{"productCategory": "Refrigerator"}')
 
 if echo "$RESPONSE" | grep -q "Missing required fields"; then
     echo -e "${GREEN}✓ 错误处理正确${NC}"
@@ -130,11 +130,58 @@ echo -e "${YELLOW}测试 6: 错误处理 - 工单不存在${NC}"
 RESPONSE=$(curl -s -X POST "$API_URL/repair/track" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  --data-raw '{"repair_notice_or_work_order_number":"9999999999","full_name":"Test User","phone":"+1-555-9999","need_to_reschedule_or_missed_visit":"no","waiting_for_spare_part":"no"}')
+  --data-raw '{"woNumber":"9999999999"}')
 
 if echo "$RESPONSE" | grep -q "not found"; then
     echo -e "${GREEN}✓ 错误处理正确${NC}"
     echo "  正确返回工单不存在错误"
+else
+    echo -e "${RED}✗ 错误处理异常${NC}"
+    echo "$RESPONSE"
+fi
+echo ""
+
+# 测试7: 错误处理 - 非法 woNumber 格式
+echo -e "${YELLOW}测试 7: 错误处理 - 非法 woNumber${NC}"
+RESPONSE=$(curl -s -X POST "$API_URL/repair/track" \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  --data-raw '{"woNumber":"abc"}')
+
+if echo "$RESPONSE" | grep -q "10-digit"; then
+    echo -e "${GREEN}✓ 错误处理正确${NC}"
+else
+    echo -e "${RED}✗ 错误处理异常${NC}"
+    echo "$RESPONSE"
+fi
+echo ""
+
+# 测试8: 取消工单
+echo -e "${YELLOW}测试 8: 取消工单${NC}"
+JSON_DATA=$(printf '{"woNumber":"%s"}' "$TICKET_NUMBER")
+RESPONSE=$(curl -s -X POST "$API_URL/repair/cancel" \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "$JSON_DATA")
+
+if echo "$RESPONSE" | grep -q "cancelled"; then
+    echo -e "${GREEN}✓ 工单取消成功${NC}"
+    echo "  工单号: $TICKET_NUMBER"
+else
+    echo -e "${RED}✗ 工单取消失败${NC}"
+    echo "$RESPONSE"
+fi
+echo ""
+
+# 测试9: 重复取消应返回 409
+echo -e "${YELLOW}测试 9: 错误处理 - 重复取消${NC}"
+RESPONSE=$(curl -s -X POST "$API_URL/repair/cancel" \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "$JSON_DATA")
+
+if echo "$RESPONSE" | grep -q "already"; then
+    echo -e "${GREEN}✓ 错误处理正确${NC}"
 else
     echo -e "${RED}✗ 错误处理异常${NC}"
     echo "$RESPONSE"

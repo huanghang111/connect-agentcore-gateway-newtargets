@@ -136,18 +136,19 @@ def _ensure_gateway(control, iam) -> tuple[str, str]:
 
     role_arn = _ensure_gateway_service_role(iam)
 
-    jwt_cfg: dict = {"discoveryUrl": GATEWAY_JWT_DISCOVERY_URL}
-    if GATEWAY_JWT_ALLOWED_AUDIENCE:
-        jwt_cfg["allowedAudience"] = [
-            s.strip() for s in GATEWAY_JWT_ALLOWED_AUDIENCE.split(",") if s.strip()
-        ]
-    if GATEWAY_JWT_ALLOWED_CLIENTS:
-        jwt_cfg["allowedClients"] = [
-            s.strip() for s in GATEWAY_JWT_ALLOWED_CLIENTS.split(",") if s.strip()
-        ]
-    if "allowedAudience" not in jwt_cfg and "allowedClients" not in jwt_cfg:
-        print("✗ Set GATEWAY_JWT_ALLOWED_AUDIENCE or GATEWAY_JWT_ALLOWED_CLIENTS")
-        sys.exit(1)
+    # Step 1: create the Gateway with a placeholder audience so we can learn its ID.
+    # Connect issues JWTs whose `aud` claim equals the Gateway ID, so the final
+    # allowedAudience must be the Gateway's own ID — but we only know that
+    # post-creation. We immediately update the audience right after.
+    jwt_cfg: dict = {
+        "discoveryUrl": GATEWAY_JWT_DISCOVERY_URL,
+        "allowedAudience": ["__placeholder__"],
+    }
+    extra_clients = [
+        s.strip() for s in GATEWAY_JWT_ALLOWED_CLIENTS.split(",") if s.strip()
+    ]
+    if extra_clients:
+        jwt_cfg["allowedClients"] = extra_clients
 
     print(f"  Creating Gateway: {GATEWAY_NAME}")
     resp = control.create_gateway(
@@ -160,6 +161,31 @@ def _ensure_gateway(control, iam) -> tuple[str, str]:
     )
     gw_id = resp["gatewayId"]
     print(f"  ✓ Gateway created: {gw_id}")
+
+    # Step 2: rewrite allowedAudience to the Gateway's own ID.
+    final_aud = [gw_id]
+    extra_aud = [
+        s.strip() for s in GATEWAY_JWT_ALLOWED_AUDIENCE.split(",") if s.strip()
+    ]
+    for a in extra_aud:
+        if a not in final_aud:
+            final_aud.append(a)
+    final_jwt: dict = {
+        "discoveryUrl": GATEWAY_JWT_DISCOVERY_URL,
+        "allowedAudience": final_aud,
+    }
+    if extra_clients:
+        final_jwt["allowedClients"] = extra_clients
+    control.update_gateway(
+        gatewayIdentifier=gw_id,
+        name=GATEWAY_NAME,
+        description=f"Auto-created Gateway for {AGENT_NAME_DASH}",
+        roleArn=role_arn,
+        protocolType="MCP",
+        authorizerType="CUSTOM_JWT",
+        authorizerConfiguration={"customJWTAuthorizer": final_jwt},
+    )
+    print(f"  ✓ allowedAudience set to {final_aud}")
     return gw_id, GATEWAY_ROLE_NAME
 
 

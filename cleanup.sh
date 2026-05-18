@@ -8,9 +8,9 @@ RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-STACK_NAME="connect-ac-api-stack"
-REGION="us-west-2"
-BUCKET_NAME="connect-workshop-ac-20260126"
+STACK_NAME="${STACK_NAME:-connect-repair-api-stack}"
+REGION="${REGION:-us-east-1}"
+BUCKET_NAME="${BUCKET_NAME:-connect-repair-api-${AWS_ACCOUNT_ID:-585306731051}-${REGION}}"
 
 echo -e "${YELLOW}=== 清理资源 ===${NC}\n"
 

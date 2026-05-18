@@ -61,7 +61,7 @@ def _validate_wo_number(wo_number: str) -> Optional[dict]:
     return None
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def requestRepair(
     productCategory: str,
     productsubCategory: str,
@@ -112,7 +112,7 @@ def requestRepair(
     return json.dumps(result)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def trackRepair(woNumber: str) -> str:
     """Query the status of an existing repair work order by its work-order number.
 
@@ -130,7 +130,7 @@ def trackRepair(woNumber: str) -> str:
     return json.dumps(result)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def cancelRepair(woNumber: str) -> str:
     """Cancel an existing repair work order by its work-order number.
 
@@ -148,7 +148,7 @@ def cancelRepair(woNumber: str) -> str:
     return json.dumps(result)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 def faqSearch(query: str) -> str:
     """Search the FAQ knowledge base using natural language queries. Returns relevant FAQ entries about product usage, troubleshooting, warranty, and repair services.
 
