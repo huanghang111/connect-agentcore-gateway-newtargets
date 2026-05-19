@@ -25,9 +25,18 @@ source .env
 set +a
 
 : "${REGION:?REGION is required in .env}"
-: "${ACCOUNT_ID:?ACCOUNT_ID is required in .env}"
 : "${AGENT_NAME:?AGENT_NAME is required in .env}"
 : "${ECR_REPO_NAME:?ECR_REPO_NAME is required in .env}"
+
+# ACCOUNT_ID is optional in .env on CloudShell — auto-resolve via STS.
+if [ -z "${ACCOUNT_ID:-}" ]; then
+    ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)"
+fi
+if [ -z "${ACCOUNT_ID}" ]; then
+    echo -e "${RED}✗ ACCOUNT_ID is empty and STS lookup failed. Set ACCOUNT_ID in .env or run 'aws configure'.${NC}"
+    exit 1
+fi
+export ACCOUNT_ID
 
 CODEBUILD_PROJECT_NAME="${AGENT_NAME}-build"
 S3_BUCKET="${AGENT_NAME}-source-${ACCOUNT_ID}"
@@ -36,26 +45,46 @@ ECR_URI="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO_NAME}"
 echo -e "${YELLOW}=== MCP Agent Deployment ===${NC}\n"
 
 # ========================================
-# STEP 0: Resolve Python interpreter with boto3
+# STEP 0: Resolve Python interpreter with a recent-enough boto3
 # ========================================
-# Use the system python if it already has boto3 (e.g. AWS CloudShell);
-# otherwise create / repair a local venv. Either way PY ends up pointing at
-# an interpreter where `import boto3` works.
+# The deploy_runtime.py script needs the AgentCore Gateway Target API including
+# `iamCredentialProvider`. Older boto3/botocore service-model data does not
+# carry that field, so we MUST verify the schema, not just `import boto3`.
 echo -e "${YELLOW}Step 0: Resolve Python interpreter${NC}"
-if python3 -c 'import boto3' >/dev/null 2>&1; then
+
+check_schema() {
+    "$1" - <<'PY' >/dev/null 2>&1
+import sys, boto3
+try:
+    op = boto3.client("bedrock-agentcore-control", region_name="us-east-1") \
+        .meta.service_model.operation_model("CreateGatewayTarget")
+    cred_list = op.input_shape.members["credentialProviderConfigurations"]
+    fields = cred_list.member.members["credentialProvider"].members
+    sys.exit(0 if "iamCredentialProvider" in fields else 1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+PY=""
+if python3 -c 'import boto3' >/dev/null 2>&1 && check_schema "$(command -v python3)"; then
     PY="$(command -v python3)"
-    echo -e "${GREEN}✓ Using system python3 (boto3 already installed)${NC}\n"
+    echo -e "${GREEN}✓ Using system python3 (boto3 schema OK)${NC}\n"
 else
+    if python3 -c 'import boto3' >/dev/null 2>&1; then
+        echo "  System boto3 is too old (missing iamCredentialProvider); falling back to .venv"
+    fi
     if [ ! -x ".venv/bin/python" ]; then
         echo "  Creating .venv ..."
         python3 -m venv .venv
     fi
-    if ! .venv/bin/python -c 'import boto3' >/dev/null 2>&1; then
-        echo "  Installing boto3 into .venv ..."
-        .venv/bin/pip install --upgrade pip boto3 -q
+    if ! check_schema ".venv/bin/python"; then
+        echo "  Installing/upgrading boto3 into .venv ..."
+        .venv/bin/pip install --upgrade pip 'boto3>=1.43.0' 'botocore>=1.43.0' -q
     fi
-    if ! .venv/bin/python -c 'import boto3' >/dev/null 2>&1; then
-        echo -e "${RED}✗ Failed to install boto3 into .venv${NC}"
+    if ! check_schema ".venv/bin/python"; then
+        echo -e "${RED}✗ Even after upgrade, boto3 schema does not contain iamCredentialProvider.${NC}"
+        echo -e "${RED}  Check pip output above; you likely need: pip install -U boto3${NC}"
         exit 1
     fi
     PY=".venv/bin/python"

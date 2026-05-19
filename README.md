@@ -44,12 +44,18 @@ Connect AI Agent (us-east-1)
 
 ## Fresh Deployment
 
+> 推荐在 **AWS CloudShell** 中执行;脚本会自动通过 `aws sts get-caller-identity`
+> 解析当前账号 ID,并在 boto3 schema 不够新时(CloudShell 自带 1.42.x)
+> 自动创建 venv 升级到 `boto3>=1.43`。
+
 ### 第 1 步：部署 Backend API
 
 ```bash
 cd midea
 chmod +x deploy.sh cleanup.sh test-api.sh
-./deploy.sh
+./deploy.sh                              # 默认 us-east-1
+# 或指定 region:
+# REGION=us-west-2 ./deploy.sh
 ```
 
 默认部署到 `us-east-1`、stack 名 `connect-repair-api-stack`、bucket 名 `connect-repair-api-<account>-us-east-1`。可用环境变量覆盖：
@@ -79,7 +85,8 @@ export API_KEY="..."
 ```bash
 cd midea/mcp-agent
 cp .env.example .env
-# 填入: REGION, ACCOUNT_ID, REPAIR_API_URL, REPAIR_API_KEY
+# 必填: REGION, REPAIR_API_URL, REPAIR_API_KEY
+# 可选: ACCOUNT_ID（留空时自动从 STS 解析；CloudShell 推荐留空）
 # 留空: GATEWAY_ID（让脚本自动创建一个 AgentCore Gateway）
 # 必填(自动创建场景): GATEWAY_JWT_DISCOVERY_URL（Connect 实例 OIDC discovery URL）
 chmod +x deploy.sh cleanup.sh

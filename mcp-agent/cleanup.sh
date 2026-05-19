@@ -20,10 +20,17 @@ source .env
 set +a
 
 : "${REGION:?REGION is required in .env}"
-: "${ACCOUNT_ID:?ACCOUNT_ID is required in .env}"
 : "${AGENT_NAME:?AGENT_NAME is required in .env}"
 : "${ECR_REPO_NAME:?ECR_REPO_NAME is required in .env}"
 : "${TARGET_NAME:?TARGET_NAME is required in .env}"
+
+if [ -z "${ACCOUNT_ID:-}" ]; then
+    ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)"
+fi
+if [ -z "${ACCOUNT_ID}" ]; then
+    echo -e "${RED}✗ ACCOUNT_ID is empty and STS lookup failed.${NC}"
+    exit 1
+fi
 
 # Gateway is optional in .env. If GATEWAY_ID is empty we treat the Gateway as
 # auto-created by deploy.sh and look it up by the conventional name.
@@ -40,20 +47,35 @@ EXECUTION_ROLE_NAME="${AGENT_NAME}-execution-role"
 
 echo -e "${YELLOW}=== MCP Agent Cleanup ===${NC}\n"
 
-# Resolve a Python interpreter that has boto3 available.
-if python3 -c 'import boto3' >/dev/null 2>&1; then
+# Resolve a Python interpreter with a recent-enough boto3 (must expose
+# iamCredentialProvider in the AgentCore Gateway Target schema).
+check_schema() {
+    "$1" - <<'PY' >/dev/null 2>&1
+import sys, boto3
+try:
+    op = boto3.client("bedrock-agentcore-control", region_name="us-east-1") \
+        .meta.service_model.operation_model("CreateGatewayTarget")
+    fields = op.input_shape.members["credentialProviderConfigurations"] \
+        .member.members["credentialProvider"].members
+    sys.exit(0 if "iamCredentialProvider" in fields else 1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+if python3 -c 'import boto3' >/dev/null 2>&1 && check_schema "$(command -v python3)"; then
     PY="$(command -v python3)"
 else
     if [ ! -x ./.venv/bin/python ]; then
         echo "  Creating .venv ..."
         python3 -m venv .venv
     fi
-    if ! ./.venv/bin/python -c 'import boto3' >/dev/null 2>&1; then
-        echo "  Installing boto3 into .venv ..."
-        ./.venv/bin/pip install --upgrade pip boto3 -q
+    if ! check_schema ./.venv/bin/python; then
+        echo "  Installing/upgrading boto3 into .venv ..."
+        ./.venv/bin/pip install --upgrade pip 'boto3>=1.43.0' 'botocore>=1.43.0' -q
     fi
-    if ! ./.venv/bin/python -c 'import boto3' >/dev/null 2>&1; then
-        echo -e "${RED}✗ Failed to install boto3${NC}"
+    if ! check_schema ./.venv/bin/python; then
+        echo -e "${RED}✗ Even after upgrade, boto3 schema is missing iamCredentialProvider${NC}"
         exit 1
     fi
     PY="./.venv/bin/python"

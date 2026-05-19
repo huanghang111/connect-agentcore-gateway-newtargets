@@ -10,7 +10,16 @@ NC='\033[0m'
 
 STACK_NAME="${STACK_NAME:-connect-repair-api-stack}"
 REGION="${REGION:-us-east-1}"
-BUCKET_NAME="${BUCKET_NAME:-connect-repair-api-${AWS_ACCOUNT_ID:-585306731051}-${REGION}}"
+
+if [ -z "${AWS_ACCOUNT_ID:-}" ]; then
+    AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)"
+fi
+if [ -z "${AWS_ACCOUNT_ID}" ]; then
+    echo "无法获取 AWS 账号 ID。请先登录 AWS CLI。"
+    exit 1
+fi
+
+BUCKET_NAME="${BUCKET_NAME:-connect-repair-api-${AWS_ACCOUNT_ID}-${REGION}}"
 
 echo -e "${YELLOW}=== 清理资源 ===${NC}\n"
 

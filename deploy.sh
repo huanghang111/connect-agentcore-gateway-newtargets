@@ -17,10 +17,26 @@ NC='\033[0m'
 #   STACK_NAME=foo REGION=us-west-2 ./deploy.sh
 STACK_NAME="${STACK_NAME:-connect-repair-api-stack}"
 REGION="${REGION:-us-east-1}"
-BUCKET_NAME="${BUCKET_NAME:-connect-repair-api-${AWS_ACCOUNT_ID:-585306731051}-${REGION}}"
+
+# Resolve account ID from STS to avoid hard-coding someone else's account
+# (important on AWS CloudShell where multiple users share scripts).
+if [ -z "${AWS_ACCOUNT_ID:-}" ]; then
+    AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)"
+fi
+if [ -z "${AWS_ACCOUNT_ID}" ]; then
+    echo -e "${RED}✗ 无法获取 AWS 账号 ID。请确认 AWS CLI 已登录(CloudShell 自动登录)。${NC}"
+    exit 1
+fi
+
+BUCKET_NAME="${BUCKET_NAME:-connect-repair-api-${AWS_ACCOUNT_ID}-${REGION}}"
 OPENAPI_S3_URL="s3://${BUCKET_NAME}/connect-api-openapi.yaml"
 
-echo -e "${YELLOW}=== Midea Repair Service API 部署 ===${NC}\n"
+echo -e "${YELLOW}=== Repair Service API 部署 ===${NC}\n"
+echo "  Account: ${AWS_ACCOUNT_ID}"
+echo "  Region:  ${REGION}"
+echo "  Stack:   ${STACK_NAME}"
+echo "  Bucket:  ${BUCKET_NAME}"
+echo ""
 
 # 检查S3 bucket是否存在
 echo -e "${YELLOW}步骤 1/4: 检查S3 bucket${NC}"
