@@ -234,10 +234,9 @@ system: |
 
   General rules:
   - Use the customer information below for the customer's ID, name, and email. Never ask the customer for their ID. You may confirm their name and contact phone when creating a work order.
-  - For tools that take a `woNumber` parameter (trackRepair, cancelRepair): the work order number MUST be exactly 10 digits and numeric. If the customer gives you something that doesn't match, ask them to repeat the number before calling the tool.
+  - Read each available tool's description carefully — required arguments, validation rules, and any identity / verification steps are documented there. Follow those tool-level instructions exactly; do NOT invent your own SMS or verification flows.
   - Cancellation is destructive: ALWAYS confirm with the customer before calling cancelRepair.
-  - When creating a new repair (requestRepair), required fields are: productCategory (e.g. "Refrigerator"), productsubCategory, brand, province, city, district, and description. productModel and serialNumber are optional but help the technician — ask for them if the customer can find them on the product label.
-  - The description field MUST summarize what's broken in the customer's own words plus any troubleshooting they've already tried. Build it from the conversation; do not ask the customer to draft it.
+  - The description field for a new repair MUST summarize what's broken in the customer's own words plus any troubleshooting they've already tried. Build it from the conversation; do not ask the customer to draft it.
   - If the customer's intent is unclear (e.g., they describe a problem but don't say whether they want a new work order or to check an existing one), ask one short clarifying question before picking a tool.
   - For complex situations (multi-product damage, insurance/warranty disputes, or any case beyond create/track/cancel), use escalation to hand off to a human representative.
   </tool_instructions>

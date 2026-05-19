@@ -11,6 +11,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 WO_NUMBER_PATTERN = re.compile(r"^\d{10}$")
+SMS_TOKEN_PATTERN = re.compile(r"^\d{4}$")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("mcp_server")
@@ -61,6 +62,20 @@ def _validate_wo_number(wo_number: str) -> Optional[dict]:
     return None
 
 
+def _validate_sms_token(sms_token: str) -> Optional[dict]:
+    """Return an error dict if smsToken is missing or malformed, else None.
+
+    NOTE: Until the SMS-sending backend is live, `smsToken` is repurposed as
+    the last 4 digits of the customer's phone number — collected verbally in
+    Connect — and validated as a 4-digit numeric string.
+    """
+    if not sms_token or not sms_token.strip():
+        return {"error": "INVALID_SMS_TOKEN", "message": "Please ask the customer for the last 4 digits of their phone number."}
+    if not SMS_TOKEN_PATTERN.match(sms_token.strip()):
+        return {"error": "INVALID_SMS_TOKEN", "message": "Input is not 4 digits. Please ask the customer to repeat the last 4 digits of their phone number."}
+    return None
+
+
 @mcp.tool(structured_output=False)
 def requestRepair(
     productCategory: str,
@@ -70,10 +85,25 @@ def requestRepair(
     district: str,
     description: str,
     brand: str,
+    smsToken: str,
     productModel: str = "",
     serialNumber: str = "",
 ) -> str:
     """Create a new repair work order.
+
+    IDENTITY CHECK — read this BEFORE doing anything else:
+      The `smsToken` argument is NOT a one-time SMS code. There is no SMS to
+      send. It is simply the last 4 digits of the customer's own phone number,
+      used as a lightweight identity check. You MUST:
+        1. Ask the customer in plain language for the last 4 digits of their
+           phone number (e.g. "For verification, could you tell me the last
+           four digits of your phone number?"). Never tell the customer you
+           are sending or have sent an SMS / verification code.
+        2. Pass exactly those 4 digits as `smsToken`.
+        3. If the value is not exactly 4 digits, this tool returns
+           {"error": "INVALID_SMS_TOKEN"}. In that case apologize briefly and
+           ask the customer again for the last 4 digits — do NOT retry the
+           tool with the same bad value, and do NOT mention SMS.
 
     PRECONDITIONS (the caller MUST satisfy before invoking this tool):
       - productCategory / productsubCategory: validated via the product category
@@ -95,9 +125,13 @@ def requestRepair(
         district: District / street. Required. Must be validated via interface 8.
         description: Work-order remark — AI summary plus dialog transcript. Required.
         brand: Product brand. Required. Extracted from dialog or product library (interface 9 extension recommended).
+        smsToken: Last 4 digits of the customer's phone number (NOT an SMS verification code). Required, exactly 4 digits.
         productModel: Product model. Optional. If provided, must be validated via interface 9.
         serialNumber: Product serial number. Optional. If provided, must be validated via interface 9.
     """
+    err = _validate_sms_token(smsToken)
+    if err:
+        return json.dumps(err)
     result = _call_api("/repair/request", {
         "productCategory": productCategory,
         "productsubCategory": productsubCategory,
@@ -108,13 +142,28 @@ def requestRepair(
         "district": district,
         "description": description,
         "brand": brand,
+        "smsToken": smsToken.strip(),
     })
     return json.dumps(result)
 
 
 @mcp.tool(structured_output=False)
-def trackRepair(woNumber: str) -> str:
+def trackRepair(woNumber: str, smsToken: str) -> str:
     """Query the status of an existing repair work order by its work-order number.
+
+    IDENTITY CHECK — read this BEFORE doing anything else:
+      The `smsToken` argument is NOT a one-time SMS code. There is no SMS to
+      send. It is simply the last 4 digits of the customer's own phone number,
+      used as a lightweight identity check. You MUST:
+        1. Ask the customer in plain language for the last 4 digits of their
+           phone number (e.g. "For verification, could you tell me the last
+           four digits of your phone number?"). Never tell the customer you
+           are sending or have sent an SMS / verification code.
+        2. Pass exactly those 4 digits as `smsToken`.
+        3. If the value is not exactly 4 digits, this tool returns
+           {"error": "INVALID_SMS_TOKEN"}. In that case apologize briefly and
+           ask the customer again for the last 4 digits — do NOT retry the
+           tool with the same bad value, and do NOT mention SMS.
 
     PRECONDITIONS (the caller MUST satisfy before invoking this tool):
       - woNumber must be non-empty and match the work-order number format
@@ -122,17 +171,38 @@ def trackRepair(woNumber: str) -> str:
 
     Args:
         woNumber: Work-order number. Required, non-empty, 10-digit numeric.
+        smsToken: Last 4 digits of the customer's phone number (NOT an SMS verification code). Required, exactly 4 digits.
     """
     err = _validate_wo_number(woNumber)
     if err:
         return json.dumps(err)
-    result = _call_api("/repair/track", {"woNumber": woNumber.strip()})
+    err = _validate_sms_token(smsToken)
+    if err:
+        return json.dumps(err)
+    result = _call_api("/repair/track", {
+        "woNumber": woNumber.strip(),
+        "smsToken": smsToken.strip(),
+    })
     return json.dumps(result)
 
 
 @mcp.tool(structured_output=False)
-def cancelRepair(woNumber: str) -> str:
+def cancelRepair(woNumber: str, smsToken: str) -> str:
     """Cancel an existing repair work order by its work-order number.
+
+    IDENTITY CHECK — read this BEFORE doing anything else:
+      The `smsToken` argument is NOT a one-time SMS code. There is no SMS to
+      send. It is simply the last 4 digits of the customer's own phone number,
+      used as a lightweight identity check. You MUST:
+        1. Ask the customer in plain language for the last 4 digits of their
+           phone number (e.g. "For verification, could you tell me the last
+           four digits of your phone number?"). Never tell the customer you
+           are sending or have sent an SMS / verification code.
+        2. Pass exactly those 4 digits as `smsToken`.
+        3. If the value is not exactly 4 digits, this tool returns
+           {"error": "INVALID_SMS_TOKEN"}. In that case apologize briefly and
+           ask the customer again for the last 4 digits — do NOT retry the
+           tool with the same bad value, and do NOT mention SMS.
 
     PRECONDITIONS (the caller MUST satisfy before invoking this tool):
       - woNumber must be non-empty and match the work-order number format
@@ -140,11 +210,18 @@ def cancelRepair(woNumber: str) -> str:
 
     Args:
         woNumber: Work-order number. Required, non-empty, 10-digit numeric.
+        smsToken: Last 4 digits of the customer's phone number (NOT an SMS verification code). Required, exactly 4 digits.
     """
     err = _validate_wo_number(woNumber)
     if err:
         return json.dumps(err)
-    result = _call_api("/repair/cancel", {"woNumber": woNumber.strip()})
+    err = _validate_sms_token(smsToken)
+    if err:
+        return json.dumps(err)
+    result = _call_api("/repair/cancel", {
+        "woNumber": woNumber.strip(),
+        "smsToken": smsToken.strip(),
+    })
     return json.dumps(result)
 
 

@@ -12,9 +12,13 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 
 | Tool | 功能 | 入参（前置校验要求见 docstring） |
 |------|------|----------|
-| `requestRepair` | 创建维修工单 | `productCategory`, `productsubCategory`, `province`, `city`, `district`, `description`, `brand` 必填；`productModel`, `serialNumber` 可选 |
-| `trackRepair` | 查询工单状态 | `woNumber`（10 位数字，工具内强制校验） |
-| `cancelRepair` | 取消工单 | `woNumber`（10 位数字，工具内强制校验） |
+| `requestRepair` | 创建维修工单 | `productCategory`, `productsubCategory`, `province`, `city`, `district`, `description`, `brand`, `smsToken`(4 位数字，客户手机号后 4 位) 必填；`productModel`, `serialNumber` 可选 |
+| `trackRepair` | 查询工单状态 | `woNumber`(10 位数字)、`smsToken`(4 位数字)，工具内强制校验 |
+| `cancelRepair` | 取消工单 | `woNumber`(10 位数字)、`smsToken`(4 位数字)，工具内强制校验 |
+
+> **设计原则**：所有 tool 的使用方式都写在各自的 docstring 顶部（IDENTITY CHECK 段 + PRECONDITIONS 段），LLM 通过 `toolConfigurationList` 拿到 description 即可正确使用，**Connect AI Agent 的 Orchestration Prompt 不要写任何 tool 用法**。这样后续迭代只需更新 mcp-server,不动 Connect 配置。
+>
+> **临时方案**：SMS 发送 API 还没上线之前，`smsToken` 复用为客户手机号后 4 位身份核验。docstring 已明确告知 LLM "不要发短信、只问后 4 位"。若客户输入不是 4 位数字，工具返回 `{"error": "INVALID_SMS_TOKEN"}`，agent 必须重新询问（不要重试同一错值）。SMS 后端上线后再回切到 6 位短信验证码模式（届时也会重新引入 `requestSMSToken` 工具）。
 
 每个 tool 的 docstring 顶部都列出了 **PRECONDITIONS**，明确字段在调用前必须经过哪些上游校验接口（产品大/小类、地址映射、型号/SN）。
 
