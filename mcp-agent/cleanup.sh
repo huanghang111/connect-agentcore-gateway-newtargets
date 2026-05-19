@@ -40,14 +40,27 @@ EXECUTION_ROLE_NAME="${AGENT_NAME}-execution-role"
 
 echo -e "${YELLOW}=== MCP Agent Cleanup ===${NC}\n"
 
-if [ ! -d ".venv" ]; then
-    echo "  No .venv found, creating for boto3..."
-    python3 -m venv .venv
-    .venv/bin/pip install --upgrade pip boto3 -q
+# Resolve a Python interpreter that has boto3 available.
+if python3 -c 'import boto3' >/dev/null 2>&1; then
+    PY="$(command -v python3)"
+else
+    if [ ! -x ./.venv/bin/python ]; then
+        echo "  Creating .venv ..."
+        python3 -m venv .venv
+    fi
+    if ! ./.venv/bin/python -c 'import boto3' >/dev/null 2>&1; then
+        echo "  Installing boto3 into .venv ..."
+        ./.venv/bin/pip install --upgrade pip boto3 -q
+    fi
+    if ! ./.venv/bin/python -c 'import boto3' >/dev/null 2>&1; then
+        echo -e "${RED}✗ Failed to install boto3${NC}"
+        exit 1
+    fi
+    PY="./.venv/bin/python"
 fi
 
 # Resolve Gateway ID + role: either user-provided, or auto-created by deploy.sh.
-RESOLVED_GATEWAY_ID=$(.venv/bin/python -c "
+RESOLVED_GATEWAY_ID=$("$PY" -c "
 import boto3
 c = boto3.client('bedrock-agentcore-control', region_name='${REGION}')
 explicit = '${GATEWAY_ID}'.strip()
@@ -77,7 +90,7 @@ fi
 # Step 1: Remove Gateway Target
 echo -e "${YELLOW}Step 1: Remove Gateway Target${NC}"
 if [ -n "$RESOLVED_GATEWAY_ID" ]; then
-    TARGET_ID=$(.venv/bin/python -c "
+    TARGET_ID=$("$PY" -c "
 import boto3
 c = boto3.client('bedrock-agentcore-control', region_name='${REGION}')
 resp = c.list_gateway_targets(gatewayIdentifier='${RESOLVED_GATEWAY_ID}')
@@ -87,7 +100,7 @@ for t in resp.get('items', []):
         break
 " 2>/dev/null || echo "")
     if [ -n "$TARGET_ID" ]; then
-        .venv/bin/python -c "
+        "$PY" -c "
 import boto3
 c = boto3.client('bedrock-agentcore-control', region_name='${REGION}')
 c.delete_gateway_target(gatewayIdentifier='${RESOLVED_GATEWAY_ID}', targetId='${TARGET_ID}')
@@ -116,7 +129,7 @@ echo ""
 
 # Step 3: Delete AgentCore Runtime
 echo -e "${YELLOW}Step 3: Delete AgentCore Runtime${NC}"
-RUNTIME_ID=$(.venv/bin/python -c "
+RUNTIME_ID=$("$PY" -c "
 import boto3
 client = boto3.client('bedrock-agentcore-control', region_name='${REGION}')
 resp = client.list_agent_runtimes()
@@ -127,7 +140,7 @@ for rt in resp.get('agentRuntimes', []):
 " 2>/dev/null || echo "")
 
 if [ -n "$RUNTIME_ID" ]; then
-    .venv/bin/python -c "
+    "$PY" -c "
 import boto3
 client = boto3.client('bedrock-agentcore-control', region_name='${REGION}')
 client.delete_agent_runtime(agentRuntimeId='${RUNTIME_ID}')
@@ -175,7 +188,7 @@ echo ""
 # Step 6.5: Delete auto-created Gateway (only if we created it)
 if [ "$GATEWAY_AUTO_CREATED" = "yes" ] && [ -n "$RESOLVED_GATEWAY_ID" ]; then
     echo -e "${YELLOW}Step 6.5: Delete auto-created Gateway${NC}"
-    .venv/bin/python -c "
+    "$PY" -c "
 import boto3
 c = boto3.client('bedrock-agentcore-control', region_name='${REGION}')
 c.delete_gateway(gatewayIdentifier='${RESOLVED_GATEWAY_ID}')

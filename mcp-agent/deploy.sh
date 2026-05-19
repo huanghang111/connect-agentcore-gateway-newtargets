@@ -36,14 +36,32 @@ ECR_URI="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO_NAME}"
 echo -e "${YELLOW}=== MCP Agent Deployment ===${NC}\n"
 
 # ========================================
-# STEP 0: Ensure Python venv
+# STEP 0: Resolve Python interpreter with boto3
 # ========================================
-if [ ! -d ".venv" ]; then
-    echo -e "${YELLOW}Step 0: Creating Python venv...${NC}"
-    python3 -m venv .venv
-    .venv/bin/pip install --upgrade pip boto3 -q
-    echo -e "${GREEN}✓ venv created${NC}\n"
+# Use the system python if it already has boto3 (e.g. AWS CloudShell);
+# otherwise create / repair a local venv. Either way PY ends up pointing at
+# an interpreter where `import boto3` works.
+echo -e "${YELLOW}Step 0: Resolve Python interpreter${NC}"
+if python3 -c 'import boto3' >/dev/null 2>&1; then
+    PY="$(command -v python3)"
+    echo -e "${GREEN}✓ Using system python3 (boto3 already installed)${NC}\n"
+else
+    if [ ! -x ".venv/bin/python" ]; then
+        echo "  Creating .venv ..."
+        python3 -m venv .venv
+    fi
+    if ! .venv/bin/python -c 'import boto3' >/dev/null 2>&1; then
+        echo "  Installing boto3 into .venv ..."
+        .venv/bin/pip install --upgrade pip boto3 -q
+    fi
+    if ! .venv/bin/python -c 'import boto3' >/dev/null 2>&1; then
+        echo -e "${RED}✗ Failed to install boto3 into .venv${NC}"
+        exit 1
+    fi
+    PY=".venv/bin/python"
+    echo -e "${GREEN}✓ venv ready${NC}\n"
 fi
+export PY
 
 # ========================================
 # STEP 1: ECR Repository
@@ -234,7 +252,7 @@ echo ""
 # STEPS 6-8: AgentCore Runtime + Gateway IAM + Gateway Target (Python)
 # ========================================
 echo -e "${YELLOW}Steps 6-8: AgentCore Runtime & Gateway Target${NC}"
-.venv/bin/python deploy_runtime.py
+"$PY" deploy_runtime.py
 
 echo ""
 echo -e "${GREEN}=== Done ===${NC}"
