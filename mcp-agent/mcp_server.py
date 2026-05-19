@@ -76,6 +76,61 @@ def _validate_sms_token(sms_token: str) -> Optional[dict]:
     return None
 
 
+def _validate_customer_id(customer_id: str) -> Optional[dict]:
+    """Return an error dict if customerId is missing, else None."""
+    if not customer_id or not customer_id.strip():
+        return {
+            "error": "MISSING_CUSTOMER_ID",
+            "message": "customerId is required. If unknown, call verifyCustomer first with the last 4 digits of the customer's phone number to obtain a customerId.",
+        }
+    return None
+
+
+def _verify_phone_tail_to_customer_id(phone_tail: str) -> str:
+    """Resolve a 4-digit phone tail into a customerId.
+
+    STUB: Until the real identity API is live, return ``"0000" + phone_tail``
+    so end-to-end tests have a stable, deterministic customerId.
+    """
+    return f"0000{phone_tail}"
+
+
+@mcp.tool(structured_output=False)
+def verifyCustomer(smsToken: str) -> str:
+    """Verify a customer by the last 4 digits of their phone number and return a customerId.
+
+    HOW TO USE — read this BEFORE doing anything else:
+      Call this tool ONCE per conversation when, and only when, the
+      conversation context does NOT already contain a customerId. After this
+      call succeeds, save the returned `customerId` for the rest of the
+      conversation and pass it to requestRepair / trackRepair / cancelRepair.
+      Do NOT call this tool again in the same conversation if a customerId
+      is already known.
+
+      Workflow:
+        1. Ask the customer in plain language for the last 4 digits of their
+           phone number (e.g. "For verification, could you tell me the last
+           four digits of your phone number?"). Never tell the customer you
+           are sending or have sent an SMS / verification code.
+        2. Pass exactly those 4 digits as `smsToken`.
+        3. On success the result is {"customerId": "..."} — remember this
+           customerId and reuse it for every subsequent repair tool call.
+        4. If the value is not exactly 4 digits, this tool returns
+           {"error": "INVALID_SMS_TOKEN"}. Apologize briefly and ask again
+           for the last 4 digits — do NOT retry with the same bad value,
+           and do NOT mention SMS.
+
+    Args:
+        smsToken: Last 4 digits of the customer's phone number (NOT an SMS verification code). Required, exactly 4 digits.
+    """
+    err = _validate_sms_token(smsToken)
+    if err:
+        return json.dumps(err)
+    customer_id = _verify_phone_tail_to_customer_id(smsToken.strip())
+    log.info("verifyCustomer ok phone_tail=%s customerId=%s", smsToken.strip(), customer_id)
+    return json.dumps({"customerId": customer_id})
+
+
 @mcp.tool(structured_output=False)
 def requestRepair(
     productCategory: str,
@@ -85,25 +140,23 @@ def requestRepair(
     district: str,
     description: str,
     brand: str,
-    smsToken: str,
+    customerId: str,
     productModel: str = "",
     serialNumber: str = "",
 ) -> str:
     """Create a new repair work order.
 
-    IDENTITY CHECK — read this BEFORE doing anything else:
-      The `smsToken` argument is NOT a one-time SMS code. There is no SMS to
-      send. It is simply the last 4 digits of the customer's own phone number,
-      used as a lightweight identity check. You MUST:
-        1. Ask the customer in plain language for the last 4 digits of their
-           phone number (e.g. "For verification, could you tell me the last
-           four digits of your phone number?"). Never tell the customer you
-           are sending or have sent an SMS / verification code.
-        2. Pass exactly those 4 digits as `smsToken`.
-        3. If the value is not exactly 4 digits, this tool returns
-           {"error": "INVALID_SMS_TOKEN"}. In that case apologize briefly and
-           ask the customer again for the last 4 digits — do NOT retry the
-           tool with the same bad value, and do NOT mention SMS.
+    IDENTITY — read this BEFORE doing anything else:
+      `customerId` authorizes this call. Resolve it in this order:
+        1. If the conversation already has a customerId (from earlier in the
+           conversation, or already provided in the agent's context), pass
+           that. Do NOT ask the customer for verification again.
+        2. Otherwise call verifyCustomer first with the last 4 digits of the
+           customer's phone number, store the returned customerId, and then
+           call this tool with it.
+      If `customerId` is missing/empty this tool returns
+      {"error": "MISSING_CUSTOMER_ID"}; in that case run verifyCustomer and
+      retry — do NOT retry with an empty customerId.
 
     PRECONDITIONS (the caller MUST satisfy before invoking this tool):
       - productCategory / productsubCategory: validated via the product category
@@ -125,11 +178,11 @@ def requestRepair(
         district: District / street. Required. Must be validated via interface 8.
         description: Work-order remark — AI summary plus dialog transcript. Required.
         brand: Product brand. Required. Extracted from dialog or product library (interface 9 extension recommended).
-        smsToken: Last 4 digits of the customer's phone number (NOT an SMS verification code). Required, exactly 4 digits.
+        customerId: Authenticated customer identifier. Required. Reuse the value already in the conversation; otherwise obtain via verifyCustomer first.
         productModel: Product model. Optional. If provided, must be validated via interface 9.
         serialNumber: Product serial number. Optional. If provided, must be validated via interface 9.
     """
-    err = _validate_sms_token(smsToken)
+    err = _validate_customer_id(customerId)
     if err:
         return json.dumps(err)
     result = _call_api("/repair/request", {
@@ -142,28 +195,26 @@ def requestRepair(
         "district": district,
         "description": description,
         "brand": brand,
-        "smsToken": smsToken.strip(),
+        "customerId": customerId.strip(),
     })
     return json.dumps(result)
 
 
 @mcp.tool(structured_output=False)
-def trackRepair(woNumber: str, smsToken: str) -> str:
+def trackRepair(woNumber: str, customerId: str) -> str:
     """Query the status of an existing repair work order by its work-order number.
 
-    IDENTITY CHECK — read this BEFORE doing anything else:
-      The `smsToken` argument is NOT a one-time SMS code. There is no SMS to
-      send. It is simply the last 4 digits of the customer's own phone number,
-      used as a lightweight identity check. You MUST:
-        1. Ask the customer in plain language for the last 4 digits of their
-           phone number (e.g. "For verification, could you tell me the last
-           four digits of your phone number?"). Never tell the customer you
-           are sending or have sent an SMS / verification code.
-        2. Pass exactly those 4 digits as `smsToken`.
-        3. If the value is not exactly 4 digits, this tool returns
-           {"error": "INVALID_SMS_TOKEN"}. In that case apologize briefly and
-           ask the customer again for the last 4 digits — do NOT retry the
-           tool with the same bad value, and do NOT mention SMS.
+    IDENTITY — read this BEFORE doing anything else:
+      `customerId` authorizes this call. Resolve it in this order:
+        1. If the conversation already has a customerId (from earlier in the
+           conversation, or already provided in the agent's context), pass
+           that. Do NOT ask the customer for verification again.
+        2. Otherwise call verifyCustomer first with the last 4 digits of the
+           customer's phone number, store the returned customerId, and then
+           call this tool with it.
+      If `customerId` is missing/empty this tool returns
+      {"error": "MISSING_CUSTOMER_ID"}; in that case run verifyCustomer and
+      retry — do NOT retry with an empty customerId.
 
     PRECONDITIONS (the caller MUST satisfy before invoking this tool):
       - woNumber must be non-empty and match the work-order number format
@@ -171,38 +222,36 @@ def trackRepair(woNumber: str, smsToken: str) -> str:
 
     Args:
         woNumber: Work-order number. Required, non-empty, 10-digit numeric.
-        smsToken: Last 4 digits of the customer's phone number (NOT an SMS verification code). Required, exactly 4 digits.
+        customerId: Authenticated customer identifier. Required. Reuse the value already in the conversation; otherwise obtain via verifyCustomer first.
     """
     err = _validate_wo_number(woNumber)
     if err:
         return json.dumps(err)
-    err = _validate_sms_token(smsToken)
+    err = _validate_customer_id(customerId)
     if err:
         return json.dumps(err)
     result = _call_api("/repair/track", {
         "woNumber": woNumber.strip(),
-        "smsToken": smsToken.strip(),
+        "customerId": customerId.strip(),
     })
     return json.dumps(result)
 
 
 @mcp.tool(structured_output=False)
-def cancelRepair(woNumber: str, smsToken: str) -> str:
+def cancelRepair(woNumber: str, customerId: str) -> str:
     """Cancel an existing repair work order by its work-order number.
 
-    IDENTITY CHECK — read this BEFORE doing anything else:
-      The `smsToken` argument is NOT a one-time SMS code. There is no SMS to
-      send. It is simply the last 4 digits of the customer's own phone number,
-      used as a lightweight identity check. You MUST:
-        1. Ask the customer in plain language for the last 4 digits of their
-           phone number (e.g. "For verification, could you tell me the last
-           four digits of your phone number?"). Never tell the customer you
-           are sending or have sent an SMS / verification code.
-        2. Pass exactly those 4 digits as `smsToken`.
-        3. If the value is not exactly 4 digits, this tool returns
-           {"error": "INVALID_SMS_TOKEN"}. In that case apologize briefly and
-           ask the customer again for the last 4 digits — do NOT retry the
-           tool with the same bad value, and do NOT mention SMS.
+    IDENTITY — read this BEFORE doing anything else:
+      `customerId` authorizes this call. Resolve it in this order:
+        1. If the conversation already has a customerId (from earlier in the
+           conversation, or already provided in the agent's context), pass
+           that. Do NOT ask the customer for verification again.
+        2. Otherwise call verifyCustomer first with the last 4 digits of the
+           customer's phone number, store the returned customerId, and then
+           call this tool with it.
+      If `customerId` is missing/empty this tool returns
+      {"error": "MISSING_CUSTOMER_ID"}; in that case run verifyCustomer and
+      retry — do NOT retry with an empty customerId.
 
     PRECONDITIONS (the caller MUST satisfy before invoking this tool):
       - woNumber must be non-empty and match the work-order number format
@@ -210,17 +259,17 @@ def cancelRepair(woNumber: str, smsToken: str) -> str:
 
     Args:
         woNumber: Work-order number. Required, non-empty, 10-digit numeric.
-        smsToken: Last 4 digits of the customer's phone number (NOT an SMS verification code). Required, exactly 4 digits.
+        customerId: Authenticated customer identifier. Required. Reuse the value already in the conversation; otherwise obtain via verifyCustomer first.
     """
     err = _validate_wo_number(woNumber)
     if err:
         return json.dumps(err)
-    err = _validate_sms_token(smsToken)
+    err = _validate_customer_id(customerId)
     if err:
         return json.dumps(err)
     result = _call_api("/repair/cancel", {
         "woNumber": woNumber.strip(),
-        "smsToken": smsToken.strip(),
+        "customerId": customerId.strip(),
     })
     return json.dumps(result)
 

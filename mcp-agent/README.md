@@ -1,6 +1,6 @@
 # Connect Repair MCP Server
 
-把三个 Repair Service tool 封装成 MCP Server，部署到 AgentCore Runtime，通过 AgentCore Gateway 暴露给 Amazon Connect AI Agent。
+把 Repair Service 工具封装成 MCP Server，部署到 AgentCore Runtime，通过 AgentCore Gateway 暴露给 Amazon Connect AI Agent。包含一个轻量身份核验工具 `verifyCustomer` 和三个 repair 业务工具。
 
 ## 架构
 
@@ -12,13 +12,18 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 
 | Tool | 功能 | 入参（前置校验要求见 docstring） |
 |------|------|----------|
-| `requestRepair` | 创建维修工单 | `productCategory`, `productsubCategory`, `province`, `city`, `district`, `description`, `brand`, `smsToken`(4 位数字，客户手机号后 4 位) 必填；`productModel`, `serialNumber` 可选 |
-| `trackRepair` | 查询工单状态 | `woNumber`(10 位数字)、`smsToken`(4 位数字)，工具内强制校验 |
-| `cancelRepair` | 取消工单 | `woNumber`(10 位数字)、`smsToken`(4 位数字)，工具内强制校验 |
+| `verifyCustomer` | 用手机号后 4 位（`smsToken`）核身,返回 `customerId`(目前 stub: `"0000" + 后 4 位`) | `smsToken`(4 位数字) 必填 |
+| `requestRepair` | 创建维修工单 | `productCategory`, `productsubCategory`, `province`, `city`, `district`, `description`, `brand`, `customerId` 必填；`productModel`, `serialNumber` 可选 |
+| `trackRepair` | 查询工单状态 | `woNumber`(10 位数字)、`customerId`，工具内强制校验 |
+| `cancelRepair` | 取消工单 | `woNumber`(10 位数字)、`customerId`，工具内强制校验 |
 
-> **设计原则**：所有 tool 的使用方式都写在各自的 docstring 顶部（IDENTITY CHECK 段 + PRECONDITIONS 段），LLM 通过 `toolConfigurationList` 拿到 description 即可正确使用，**Connect AI Agent 的 Orchestration Prompt 不要写任何 tool 用法**。这样后续迭代只需更新 mcp-server,不动 Connect 配置。
+> **设计原则**：所有 tool 的使用方式都写在各自的 docstring 顶部，LLM 通过 `toolConfigurationList` 拿到 description 即可正确使用，**Connect AI Agent 的 Orchestration Prompt 不要写任何 tool 用法**。这样后续迭代只需更新 mcp-server,不动 Connect 配置。
 >
-> **临时方案**：SMS 发送 API 还没上线之前，`smsToken` 复用为客户手机号后 4 位身份核验。docstring 已明确告知 LLM "不要发短信、只问后 4 位"。若客户输入不是 4 位数字，工具返回 `{"error": "INVALID_SMS_TOKEN"}`，agent 必须重新询问（不要重试同一错值）。SMS 后端上线后再回切到 6 位短信验证码模式（届时也会重新引入 `requestSMSToken` 工具）。
+> **身份核验流程**（SMS 发送 API 上线前的临时方案）：
+> 1. Connect 上下文若已带 `customerId`，repair tool 直接传该值，跳过核身。
+> 2. 没有 `customerId` 时，先调一次 `verifyCustomer(smsToken=电话号码后 4 位)` —— `smsToken` 必须严格 4 位数字，docstring 已明确告诉 LLM "不要发短信、只问后 4 位"。
+> 3. `verifyCustomer` 返回 `{"customerId": "0000XXXX"}`（当前为 stub）。Connect AI Agent **保存** 该 `customerId` 到对话上下文，后续整段对话的 repair tool 都用它。
+> 4. `customerId` 为空时 repair tool 返回 `{"error": "MISSING_CUSTOMER_ID"}`，agent 必须先跑 `verifyCustomer` 再重试，不要用空值反复重试。
 
 每个 tool 的 docstring 顶部都列出了 **PRECONDITIONS**，明确字段在调用前必须经过哪些上游校验接口（产品大/小类、地址映射、型号/SN）。
 
@@ -134,12 +139,15 @@ Gateway target 就绪后，去 Amazon Connect 控制台：
 
 1. **AI Agent Designer** → 选择 AI Agent → **Add tool** → **Add existing AI Tool**
 2. Namespace 选 `gateway_<gateway-name>`
-3. AI Tool 分别选这三个（重复三次）：
+3. 把这四个 AI Tool 都加进来（每次重复 Add existing AI Tool）：
+   - `connect-repair-mcp-agent___verifyCustomer`
    - `connect-repair-mcp-agent___requestRepair`
    - `connect-repair-mcp-agent___trackRepair`
    - `connect-repair-mcp-agent___cancelRepair`
-4. **Output Filters** → Select Property Keys 里加 `result`（必须勾选，否则 LLM 读不到返回值）
+4. **Output Filters** → Select Property Keys 里加 `result`（必须勾选，否则 LLM 读不到 `customerId` 等返回值）
 5. 点 **Update** 保存
+
+> **更新工具签名后必须重做引用**：MCP server 修改 tool 签名（参数名/必填项变化）并重新 deploy 后，AI Agent 持有的是更早部署时的工具描述快照。Gateway target 同步只刷新 Gateway 侧 schema，AI Agent 侧不会自动跟随。需要在 AI Agent Designer 里把这些工具 **Remove → 再 Add 回来**，让它拉到新 schema，否则 LLM 会按旧签名调用。
 
 ## 清理
 
