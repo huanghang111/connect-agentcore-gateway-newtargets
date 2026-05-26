@@ -27,6 +27,17 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 
 每个 tool 的 docstring 顶部都列出了 **PRECONDITIONS**，明确字段在调用前必须经过哪些上游校验接口（产品大/小类、地址映射、型号/SN）。
 
+### 服务端校验（`requestRepair`）
+
+除了 `customerId` / 工单号格式校验之外，`requestRepair` 在打到后端之前会再做两层本地校验，校验失败立刻返回错误、不发出网络请求：
+
+| 字段 | 规则 | 失败时返回 |
+|------|------|------------|
+| `productsubCategory` | 必须是 `smart version` / `premium version` / `elite version` 三个枚举值之一（大小写、内部空格不敏感） | `{"error": "INVALID_SUB_CATEGORY", "allowed": [...]}` |
+| `province` / `city` / `district` | 用 `china_regions_pinyin.json` 校验，接受**中文**或**拼音**（带不带行政后缀都行）；三者必须层级一致。**直辖市特例**：北京/上海/天津/重庆没有真正的 city 层，允许 `city == province`（如 `province="Beijing", city="Beijing", district="Chaoyang"`）；docstring 已显式提示 LLM 不要追问 city | `{"error": "INVALID_PROVINCE" \| "INVALID_CITY" \| "INVALID_DISTRICT"}` |
+
+数据来源：[modood/Administrative-divisions-of-China](https://github.com/modood/Administrative-divisions-of-China)（WTFPL）。当行政区划数据需要刷新时跑一次 `gen_regions.py` 重新生成 `china_regions_pinyin.json`（依赖 `pypinyin`，仅在生成时需要，运行时不依赖）。
+
 ## 前置条件
 
 - AWS CLI 已配置
@@ -183,6 +194,8 @@ python mcp_server.py
 | `deploy.sh` | 主部署脚本（Step 1-5 shell，Step 6-8 调 Python） |
 | `deploy_runtime.py` | Step 6-8：Runtime、IAM、Gateway target |
 | `cleanup.sh` | 清理脚本 |
+| `china_regions_pinyin.json` | 中国省/市/区拼音清单（运行时用于地址校验） |
+| `gen_regions.py` | 一次性生成上面 JSON 的脚本（数据源变更时再跑） |
 
 ## 注意事项
 

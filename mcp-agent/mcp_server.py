@@ -5,6 +5,7 @@ import re
 import time
 import urllib.request
 import urllib.error
+from pathlib import Path
 from typing import Optional
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
@@ -12,6 +13,10 @@ from starlette.responses import JSONResponse
 
 WO_NUMBER_PATTERN = re.compile(r"^\d{10}$")
 SMS_TOKEN_PATTERN = re.compile(r"^\d{4}$")
+
+SUBCATEGORY_ENUM = ("smart version", "premium version", "elite version")
+
+REGIONS_FILE = Path(__file__).with_name("china_regions_pinyin.json")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("mcp_server")
@@ -73,6 +78,124 @@ def _validate_sms_token(sms_token: str) -> Optional[dict]:
         return {"error": "INVALID_SMS_TOKEN", "message": "Please ask the customer for the last 4 digits of their phone number."}
     if not SMS_TOKEN_PATTERN.match(sms_token.strip()):
         return {"error": "INVALID_SMS_TOKEN", "message": "Input is not 4 digits. Please ask the customer to repeat the last 4 digits of their phone number."}
+    return None
+
+
+def _norm(s: str) -> str:
+    """Normalize a region/enum input: strip + lowercase + collapse internal whitespace."""
+    return re.sub(r"\s+", "", (s or "").strip().lower())
+
+
+def _load_regions() -> dict:
+    """Build a province-level lookup table.
+
+    Schema:
+      {
+        norm(province_variant): {
+          "self": frozenset(norm(province_variant), ...),   # to detect city==province
+          "cities": { norm(city_variant): frozenset(norm(district), ...) },
+          "all_districts": frozenset(norm(district), ...),  # union across cities
+        }
+      }
+    """
+    with open(REGIONS_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    index: dict = {}
+    for prov in data["regions"]:
+        cities_idx: dict = {}
+        all_dists: set = set()
+        for city in prov["cities"]:
+            dist_set = set()
+            for dist in city["districts"]:
+                for v in dist["d"]:
+                    dist_set.add(_norm(v))
+            dist_fset = frozenset(dist_set)
+            for v in city["c"]:
+                cities_idx[_norm(v)] = dist_fset
+            all_dists |= dist_set
+        prov_self = frozenset(_norm(v) for v in prov["p"])
+        prov_entry = {
+            "self": prov_self,
+            "cities": cities_idx,
+            "all_districts": frozenset(all_dists),
+        }
+        for v in prov["p"]:
+            index[_norm(v)] = prov_entry
+    log.info("loaded china regions: %d provinces", len(index))
+    return index
+
+
+_REGION_INDEX: dict = _load_regions()
+
+# Virtual "市辖区" city layer that the official dataset interposes between
+# direct-administered municipalities (Beijing/Shanghai/Tianjin/Chongqing) and
+# their districts. Customers/LLMs never actually say this — they say
+# "Beijing, Chaoyang" — so we accept either pattern.
+_MUNICIPALITY_PROXY_CITY = frozenset({"shixiaqu", "shixia", "市辖区", "市辖"})
+
+# Direct-administered municipalities (直辖市). For these provinces only, we
+# also accept city == province name (the way users/LLMs naturally phrase it).
+_MUNICIPALITY_PROVINCES = frozenset({
+    "beijingshi", "beijing", "北京市", "北京",
+    "shanghaishi", "shanghai", "上海市", "上海",
+    "tianjinshi", "tianjin", "天津市", "天津",
+    "chongqingshi", "chongqing", "重庆市", "重庆",
+})
+
+
+_SUBCATEGORY_NORMALIZED = {_norm(s) for s in SUBCATEGORY_ENUM}
+
+
+def _validate_subcategory(value: str) -> Optional[dict]:
+    """Reject sub-category values outside the fixed enum (case/space insensitive)."""
+    if _norm(value) not in _SUBCATEGORY_NORMALIZED:
+        return {
+            "error": "INVALID_SUB_CATEGORY",
+            "message": f"productsubCategory must be one of: {', '.join(SUBCATEGORY_ENUM)}.",
+            "allowed": list(SUBCATEGORY_ENUM),
+        }
+    return None
+
+
+def _validate_region(province: str, city: str, district: str) -> Optional[dict]:
+    """Validate the (province, city, district) triple against the China admin-division pinyin list.
+
+    Accepts either Chinese names or pinyin (with/without administrative suffix), case-insensitive.
+
+    Special case for direct-administered municipalities (Beijing/Shanghai/
+    Tianjin/Chongqing): the official dataset puts a virtual "市辖区" city between
+    the municipality and its districts; users say "Beijing, Chaoyang" instead.
+    We accept three city patterns for these provinces:
+      - city == province name (e.g., province=Beijing, city=Beijing)
+      - city == "市辖区" / "shixiaqu"
+      - the literal city in the dataset
+
+    Returns an error dict pinpointing the first level that fails, else None.
+    """
+    p, c, d = _norm(province), _norm(city), _norm(district)
+    prov = _REGION_INDEX.get(p)
+    if prov is None:
+        return {
+            "error": "INVALID_PROVINCE",
+            "message": f"Unknown province '{province}'. Please ask the customer for the Chinese-administrative province name (in Chinese or pinyin).",
+        }
+
+    is_municipality = p in _MUNICIPALITY_PROVINCES
+    if is_municipality and (c in prov["self"] or c in _MUNICIPALITY_PROXY_CITY):
+        districts = prov["all_districts"]
+    else:
+        districts = prov["cities"].get(c)
+        if districts is None:
+            return {
+                "error": "INVALID_CITY",
+                "message": f"City '{city}' is not part of province '{province}'. Please ask the customer to confirm the city.",
+            }
+
+    if d not in districts:
+        return {
+            "error": "INVALID_DISTRICT",
+            "message": f"District '{district}' is not part of city '{city}'. Please ask the customer to confirm the district.",
+        }
     return None
 
 
@@ -159,10 +282,26 @@ def requestRepair(
       retry — do NOT retry with an empty customerId.
 
     PRECONDITIONS (the caller MUST satisfy before invoking this tool):
-      - productCategory / productsubCategory: validated via the product category
-        lookup API (interface 7); only values returned by that API are accepted.
-      - province / city / district: validated via the address mapping API
-        (interface 8); the triple must form a valid administrative region.
+      - productCategory: validated via the product category lookup API
+        (interface 7); only values returned by that API are accepted.
+      - productsubCategory: MUST be one of the fixed enum values
+        "smart version", "premium version", or "elite version"
+        (case-insensitive). Any other value is rejected with
+        {"error": "INVALID_SUB_CATEGORY"}.
+      - province / city / district: validated server-side against the official
+        China administrative-division list (Chinese name or pinyin accepted,
+        case-insensitive, suffix optional). The triple must be hierarchically
+        consistent — district must belong to city, city must belong to
+        province. Failures return {"error": "INVALID_PROVINCE" |
+        "INVALID_CITY" | "INVALID_DISTRICT"}; ask the customer to clarify the
+        offending level and retry — do NOT retry with the same bad value.
+
+        DIRECT-ADMINISTERED MUNICIPALITIES — Beijing, Shanghai, Tianjin,
+        Chongqing have NO real city layer. When the customer mentions one of
+        these four, do NOT ask which city — pass the municipality name as
+        BOTH `province` and `city`, e.g. province="Beijing", city="Beijing",
+        district="Chaoyang". This is accepted by the validator. Same for
+        北京/上海/天津/重庆.
       - productModel / serialNumber (optional): if provided, validated via the
         product model/SN API (interface 9).
       - brand: extracted from the dialog or the product library (recommended to
@@ -172,10 +311,10 @@ def requestRepair(
 
     Args:
         productCategory: Top-level product category (e.g., "Refrigerator"). Required. Must be validated via interface 7.
-        productsubCategory: Product sub-category. Required. Must be validated via interface 7.
-        province: Province / state. Required. Must be validated via interface 8.
-        city: City. Required. Must be validated via interface 8.
-        district: District / street. Required. Must be validated via interface 8.
+        productsubCategory: Product sub-category. Required. MUST be one of: "smart version", "premium version", "elite version" (case-insensitive).
+        province: Province / state. Required. Chinese name or pinyin; validated against China admin divisions.
+        city: City. Required. Chinese name or pinyin; must belong to the given province.
+        district: District / street. Required. Chinese name or pinyin; must belong to the given city.
         description: Work-order remark — AI summary plus dialog transcript. Required.
         brand: Product brand. Required. Extracted from dialog or product library (interface 9 extension recommended).
         customerId: Authenticated customer identifier. Required. Reuse the value already in the conversation; otherwise obtain via verifyCustomer first.
@@ -183,6 +322,12 @@ def requestRepair(
         serialNumber: Product serial number. Optional. If provided, must be validated via interface 9.
     """
     err = _validate_customer_id(customerId)
+    if err:
+        return json.dumps(err)
+    err = _validate_subcategory(productsubCategory)
+    if err:
+        return json.dumps(err)
+    err = _validate_region(province, city, district)
     if err:
         return json.dumps(err)
     result = _call_api("/repair/request", {
