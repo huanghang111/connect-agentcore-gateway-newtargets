@@ -54,6 +54,13 @@ TARGET_NAME = _require("TARGET_NAME")
 REPAIR_API_URL = _require("REPAIR_API_URL")
 REPAIR_API_KEY = _require("REPAIR_API_KEY")
 
+# Optional response-normalization knobs — only forwarded to the Runtime when set
+# in .env, otherwise mcp_server.py picks its own defaults.
+NORMALIZE_RESPONSE_ENV = os.environ.get("NORMALIZE_RESPONSE", "").strip()
+NORMALIZE_MODEL_ID_ENV = os.environ.get("NORMALIZE_MODEL_ID", "").strip()
+BEDROCK_REGION_ENV = os.environ.get("BEDROCK_REGION", "").strip()
+NORMALIZE_TIMEOUT_S_ENV = os.environ.get("NORMALIZE_TIMEOUT_S", "").strip()
+
 ECR_URI = f"{ACCOUNT_ID}.dkr.ecr.{REGION}.amazonaws.com/{ECR_REPO_NAME}"
 ROLE_ARN = f"arn:aws:iam::{ACCOUNT_ID}:role/{AGENT_NAME_DASH}-execution-role"
 
@@ -223,6 +230,15 @@ def main():
         environmentVariables={
             "REPAIR_API_URL": REPAIR_API_URL,
             "REPAIR_API_KEY": REPAIR_API_KEY,
+            # OTEL service.name — used by Strands/ADOT to tag spans in CloudWatch
+            # GenAI Observability. The rest of the OTEL_EXPORTER_* vars are
+            # injected automatically by AgentCore Runtime when Tracing is enabled
+            # on the runtime resource.
+            "OTEL_SERVICE_NAME": AGENT_NAME,
+            **({"NORMALIZE_RESPONSE": NORMALIZE_RESPONSE_ENV} if NORMALIZE_RESPONSE_ENV else {}),
+            **({"NORMALIZE_MODEL_ID": NORMALIZE_MODEL_ID_ENV} if NORMALIZE_MODEL_ID_ENV else {}),
+            **({"BEDROCK_REGION": BEDROCK_REGION_ENV} if BEDROCK_REGION_ENV else {}),
+            **({"NORMALIZE_TIMEOUT_S": NORMALIZE_TIMEOUT_S_ENV} if NORMALIZE_TIMEOUT_S_ENV else {}),
         },
     )
 
@@ -357,7 +373,7 @@ def main():
     print(f"Gateway ID:        {gateway_id}")
     print(f"Gateway Role:      {gateway_service_role}")
     print(f"Target Name:       {TARGET_NAME}")
-    print(f"\nMCP Tools: requestRepair, trackRepair, cancelRepair")
+    print(f"\nMCP Tools: verifyCustomer, verifyCustomerByPhoneAndName, requestRepair, trackRepair, cancelRepair")
 
     # Save info
     with open("deployment-info.log", "w") as f:

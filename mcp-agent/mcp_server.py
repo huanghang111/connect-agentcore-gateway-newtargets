@@ -7,12 +7,18 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 from typing import Optional
+
+from botocore.config import Config as BotoConfig
 from mcp.server.fastmcp import FastMCP
+from pydantic import BaseModel, Field
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from strands import Agent
+from strands.models import BedrockModel
 
 WO_NUMBER_PATTERN = re.compile(r"^\d{10}$")
 SMS_TOKEN_PATTERN = re.compile(r"^\d{4}$")
+PHONE_NUMBER_PATTERN = re.compile(r"^\d{6,15}$")
 
 SUBCATEGORY_ENUM = ("smart version", "premium version", "elite version")
 
@@ -30,6 +36,146 @@ async def ping(request: Request) -> JSONResponse:
 
 API_URL = os.environ.get("REPAIR_API_URL", "")
 API_KEY = os.environ.get("REPAIR_API_KEY", "")
+
+NORMALIZE_RESPONSE = os.environ.get("NORMALIZE_RESPONSE", "1").strip().lower() not in (
+    "", "0", "false", "no", "off",
+)
+BEDROCK_REGION = os.environ.get("BEDROCK_REGION", os.environ.get("AWS_REGION", "us-east-1"))
+NORMALIZE_MODEL_ID = os.environ.get(
+    "NORMALIZE_MODEL_ID",
+    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+)
+NORMALIZE_TIMEOUT_S = float(os.environ.get("NORMALIZE_TIMEOUT_S", "4"))
+
+# Canonical schemas. Every query tool advertises these fields verbatim in its
+# docstring so the orchestrator LLM sees one shape regardless of the upstream
+# BU's field names. The Pydantic models double as the prompt schema for
+# Strands' structured_output() — Strands maps them onto Bedrock tool-use, so
+# the model is forced to emit valid JSON matching these types.
+
+class TrackResponse(BaseModel):
+    """Canonical track-repair response. Pull values from semantically equivalent
+    upstream keys regardless of name (e.g. ticketstatus / tstatus / statusName
+    all map to `status`). Use empty strings for unknown fields — never invent
+    values that aren't grounded in the input."""
+
+    woNumber: str = Field(default="", description="Work-order number.")
+    status: str = Field(default="", description="Current work-order status (free-form string).")
+    statusDescription: str = Field(default="", description="Human-readable explanation of the status.")
+    scheduledAt: str = Field(default="", description="Scheduled service time, ISO 8601 if known, else empty.")
+    technicianName: str = Field(default="", description="Assigned technician's full name; empty if unassigned.")
+    technicianPhone: str = Field(default="", description="Assigned technician's contact phone; empty if unknown.")
+    address: str = Field(default="", description="Service address.")
+    lastUpdatedAt: str = Field(default="", description="Last update timestamp, ISO 8601 if known, else empty.")
+    remarks: str = Field(default="", description="Additional notes from the upstream system.")
+
+
+class CancelResponse(BaseModel):
+    """Canonical cancel-repair response. Pull values from semantically equivalent
+    upstream keys; use empty strings for unknown text fields. `cancelled` is
+    true only when the upstream confirms the work order was cancelled."""
+
+    woNumber: str = Field(default="", description="Work-order number.")
+    cancelled: bool = Field(default=False, description="True iff the cancellation succeeded.")
+    status: str = Field(default="", description="Resulting work-order status after the cancel call.")
+    message: str = Field(default="", description="Human-readable confirmation or failure reason.")
+
+
+class RequestResponse(BaseModel):
+    """Canonical create-repair response. Pull values from semantically equivalent
+    upstream keys (e.g. wono / ticketId / orderNumber → woNumber). Use empty
+    strings for unknown text fields. `created` is true only when the upstream
+    confirms a work order has been opened."""
+
+    woNumber: str = Field(default="", description="Newly created work-order number; \"\" if creation failed.")
+    created: bool = Field(default=False, description="True iff the upstream confirms the work order was created.")
+    status: str = Field(default="", description="Initial work-order status, e.g. 'open' / 'pending'.")
+    scheduledAt: str = Field(default="", description="Initial scheduled service time, ISO 8601 if known, else empty.")
+    message: str = Field(default="", description="Human-readable confirmation or failure reason.")
+
+
+_normalize_agent = None
+
+
+def _get_normalize_agent():
+    """Lazily build a single Strands Agent for response normalization."""
+    global _normalize_agent
+    if _normalize_agent is not None:
+        return _normalize_agent
+    try:
+        boto_cfg = BotoConfig(
+            read_timeout=NORMALIZE_TIMEOUT_S,
+            connect_timeout=2,
+            retries={"max_attempts": 1, "mode": "standard"},
+        )
+        model = BedrockModel(
+            model_id=NORMALIZE_MODEL_ID,
+            region_name=BEDROCK_REGION,
+            boto_client_config=boto_cfg,
+            temperature=0,
+            max_tokens=512,
+            streaming=False,
+        )
+        _normalize_agent = Agent(
+            model=model,
+            system_prompt=(
+                "You normalize backend API responses for an MCP repair-service "
+                "server. Given a raw JSON payload, fill the requested schema by "
+                "mapping semantically equivalent upstream keys onto canonical "
+                "field names. Use empty strings (\"\") for unknown text fields "
+                "and false for unknown booleans. Never invent values that "
+                "aren't present or directly inferable from the input."
+            ),
+            name="repair-response-normalizer",
+            description="Maps heterogeneous upstream API responses onto canonical repair-tool schemas.",
+        )
+        return _normalize_agent
+    except Exception:
+        log.exception("failed to init Strands normalize agent; normalization disabled")
+        return None
+
+
+def _normalize_with_llm(raw: dict, schema: type, tool_name: str) -> dict:
+    """Coerce a raw upstream response into ``schema`` (a Pydantic model) via
+    Strands' structured_output(). Best-effort: any failure (timeout, throttle,
+    schema-validation error) returns the raw response unchanged so the
+    normalizer is never a hard dependency.
+
+    Fast-path skips:
+      - NORMALIZE_RESPONSE flag is off → raw.
+      - input is not a dict → raw.
+      - input already carries an "error" key → raw (error envelopes pass through).
+    """
+    if not NORMALIZE_RESPONSE:
+        return raw
+    if not isinstance(raw, dict):
+        return raw
+    if "error" in raw:
+        return raw
+
+    agent = _get_normalize_agent()
+    if agent is None:
+        return raw
+
+    prompt = (
+        f"Tool: {tool_name}\n"
+        f"Map the following upstream JSON onto the requested schema. "
+        f"For any canonical field whose value is not present or inferable, "
+        f"use \"\" (empty string) for text fields and false for booleans.\n\n"
+        f"Upstream JSON:\n{json.dumps(raw, ensure_ascii=False)}"
+    )
+    start = time.time()
+    try:
+        result = agent.structured_output(schema, prompt)
+        out = result.model_dump()
+        log.info(
+            "normalize ok tool=%s in %.2fs raw_keys=%s",
+            tool_name, time.time() - start, list(raw.keys())[:10],
+        )
+        return out
+    except Exception:
+        log.exception("normalize failed tool=%s in %.2fs — returning raw", tool_name, time.time() - start)
+        return raw
 
 
 def _call_api(path: str, payload: dict) -> dict:
@@ -204,18 +350,38 @@ def _validate_customer_id(customer_id: str) -> Optional[dict]:
     if not customer_id or not customer_id.strip():
         return {
             "error": "MISSING_CUSTOMER_ID",
-            "message": "customerId is required. If unknown, call verifyCustomer first with the last 4 digits of the customer's phone number to obtain a customerId.",
+            "message": "customerId is required. If unknown, call verifyCustomer first with the last 4 digits of the customer's phone number; if that returns CUSTOMER_NOT_FOUND, fall back to verifyCustomerByPhoneAndName with the customer's full phone number and full name.",
         }
     return None
 
 
-def _verify_phone_tail_to_customer_id(phone_tail: str) -> str:
-    """Resolve a 4-digit phone tail into a customerId.
+def _verify_phone_tail_to_customer_id(phone_tail: str) -> Optional[str]:
+    """Resolve a 4-digit phone tail into a customerId, or ``None`` if no match.
 
-    STUB: Until the real identity API is live, return ``"0000" + phone_tail``
-    so end-to-end tests have a stable, deterministic customerId.
+    STUB: Until the real identity API is live this returns
+    ``"0000" + phone_tail`` for any 4-digit input EXCEPT the magic value
+    ``"0000"``, which simulates a "customer not found" outcome so the
+    fallback (full phone number + full name) flow can be exercised end-to-end
+    on Connect.
     """
+    if phone_tail == "0000":
+        return None
     return f"0000{phone_tail}"
+
+
+def _verify_phone_and_name_to_customer_id(phone_number: str, full_name: str) -> Optional[str]:
+    """Resolve a (full phone number, full name) pair into a customerId, or ``None``.
+
+    STUB: Until the real identity API is live, return ``"PHN" + last 4 digits
+    of phone_number`` for any input where the phone number does NOT end in
+    ``0000``. A phone number ending in ``0000`` simulates a still-not-found
+    outcome so the agent can fall back to a human handoff during testing.
+    """
+    _ = full_name  # reserved for the real identity API; stub keys only on phone tail
+    tail = phone_number[-4:]
+    if tail == "0000":
+        return None
+    return f"PHN{tail}"
 
 
 @mcp.tool(structured_output=False)
@@ -223,12 +389,12 @@ def verifyCustomer(smsToken: str) -> str:
     """Verify a customer by the last 4 digits of their phone number and return a customerId.
 
     HOW TO USE — read this BEFORE doing anything else:
-      Call this tool ONCE per conversation when, and only when, the
-      conversation context does NOT already contain a customerId. After this
-      call succeeds, save the returned `customerId` for the rest of the
-      conversation and pass it to requestRepair / trackRepair / cancelRepair.
-      Do NOT call this tool again in the same conversation if a customerId
-      is already known.
+      This is the PRIMARY identity check. Call it ONCE per conversation when,
+      and only when, the conversation context does NOT already contain a
+      customerId. After this call succeeds, save the returned `customerId` for
+      the rest of the conversation and pass it to requestRepair / trackRepair
+      / cancelRepair. Do NOT call this tool again in the same conversation if
+      a customerId is already known.
 
       Workflow:
         1. Ask the customer in plain language for the last 4 digits of their
@@ -242,6 +408,14 @@ def verifyCustomer(smsToken: str) -> str:
            {"error": "INVALID_SMS_TOKEN"}. Apologize briefly and ask again
            for the last 4 digits — do NOT retry with the same bad value,
            and do NOT mention SMS.
+        5. If the lookup succeeds in format but no customer matches, this
+           tool returns {"error": "CUSTOMER_NOT_FOUND"}. In that case tell
+           the customer "Sorry, we couldn't find an account with that phone
+           number. Could you provide a different full phone number along
+           with the account holder's full name so we can look it up?" and
+           then call `verifyCustomerByPhoneAndName` with the values they
+           supply. Do NOT keep retrying verifyCustomer with new last-4
+           guesses, and do NOT ask for the last 4 digits a second time.
 
     Args:
         smsToken: Last 4 digits of the customer's phone number (NOT an SMS verification code). Required, exactly 4 digits.
@@ -249,8 +423,67 @@ def verifyCustomer(smsToken: str) -> str:
     err = _validate_sms_token(smsToken)
     if err:
         return json.dumps(err)
-    customer_id = _verify_phone_tail_to_customer_id(smsToken.strip())
-    log.info("verifyCustomer ok phone_tail=%s customerId=%s", smsToken.strip(), customer_id)
+    phone_tail = smsToken.strip()
+    customer_id = _verify_phone_tail_to_customer_id(phone_tail)
+    if customer_id is None:
+        log.info("verifyCustomer not_found phone_tail=%s", phone_tail)
+        return json.dumps({
+            "error": "CUSTOMER_NOT_FOUND",
+            "message": "No customer matches the given last 4 digits. Ask the customer for a full phone number and full name, then call verifyCustomerByPhoneAndName.",
+        })
+    log.info("verifyCustomer ok phone_tail=%s customerId=%s", phone_tail, customer_id)
+    return json.dumps({"customerId": customer_id})
+
+
+@mcp.tool(structured_output=False)
+def verifyCustomerByPhoneAndName(phoneNumber: str, fullName: str) -> str:
+    """Fallback identity check — verify a customer by FULL phone number plus full name.
+
+    HOW TO USE — read this BEFORE doing anything else:
+      Call this tool ONLY after `verifyCustomer` has already returned
+      {"error": "CUSTOMER_NOT_FOUND"} earlier in this same conversation, AND
+      the customer has supplied BOTH a different full phone number AND the
+      account holder's full name. Do NOT call this tool as the first identity
+      check — start with `verifyCustomer` instead.
+
+      Workflow:
+        1. After verifyCustomer returns CUSTOMER_NOT_FOUND, ask: "Could you
+           provide a different full phone number, and the full name on the
+           account?" Collect BOTH values before calling this tool.
+        2. Pass the full digits-only phone number as `phoneNumber` and the
+           full name as `fullName`.
+        3. On success the result is {"customerId": "..."} — remember this
+           customerId and reuse it for every subsequent repair tool call.
+        4. On {"error": "INVALID_PHONE_NUMBER"} or {"error": "INVALID_NAME"},
+           apologize briefly and ask the customer to repeat the offending
+           field — do NOT retry with the same bad value.
+        5. On {"error": "CUSTOMER_NOT_FOUND"} the second time, do NOT loop.
+           Apologize and offer to transfer the customer to a human agent.
+
+    Args:
+        phoneNumber: Customer's full phone number, digits only (no spaces, dashes, or country-code prefix symbols). Required.
+        fullName: Account holder's full name. Required, non-empty.
+    """
+    phone = (phoneNumber or "").strip()
+    name = (fullName or "").strip()
+    if not phone or not PHONE_NUMBER_PATTERN.match(phone):
+        return json.dumps({
+            "error": "INVALID_PHONE_NUMBER",
+            "message": "phoneNumber must be a digits-only string of 6–15 digits (no spaces, dashes, or '+'). Ask the customer to repeat the full phone number.",
+        })
+    if not name:
+        return json.dumps({
+            "error": "INVALID_NAME",
+            "message": "fullName must not be empty. Ask the customer for the full name on the account.",
+        })
+    customer_id = _verify_phone_and_name_to_customer_id(phone, name)
+    if customer_id is None:
+        log.info("verifyCustomerByPhoneAndName not_found phone=%s name=%s", phone, name)
+        return json.dumps({
+            "error": "CUSTOMER_NOT_FOUND",
+            "message": "No customer matches the given phone number and name. Do NOT loop — apologize and offer to transfer to a human agent.",
+        })
+    log.info("verifyCustomerByPhoneAndName ok phone=%s name=%s customerId=%s", phone, name, customer_id)
     return json.dumps({"customerId": customer_id})
 
 
@@ -277,9 +510,13 @@ def requestRepair(
         2. Otherwise call verifyCustomer first with the last 4 digits of the
            customer's phone number, store the returned customerId, and then
            call this tool with it.
+        3. If verifyCustomer returns {"error": "CUSTOMER_NOT_FOUND"}, ask
+           the customer for a different full phone number AND the account
+           holder's full name, then call verifyCustomerByPhoneAndName with
+           those values. Use the customerId it returns.
       If `customerId` is missing/empty this tool returns
-      {"error": "MISSING_CUSTOMER_ID"}; in that case run verifyCustomer and
-      retry — do NOT retry with an empty customerId.
+      {"error": "MISSING_CUSTOMER_ID"}; in that case run the appropriate
+      verify tool and retry — do NOT retry with an empty customerId.
 
     PRECONDITIONS (the caller MUST satisfy before invoking this tool):
       - productCategory: validated via the product category lookup API
@@ -308,6 +545,16 @@ def requestRepair(
         reuse the extended response of interface 9).
       - description: AI-generated summary plus the dialog transcript, produced
         from the conversation context.
+
+    RETURNS — canonical schema (upstream field names like `wono` / `ticketId` /
+    `orderNumber` are normalized onto `woNumber`):
+      - woNumber:    Newly created work-order number (string, "" on failure).
+      - created:     Boolean — true iff upstream confirms the work order was created.
+      - status:      Initial work-order status (string, e.g. "open" / "pending").
+      - scheduledAt: Initial scheduled service time (ISO 8601 string, "" if unknown).
+      - message:     Human-readable confirmation or failure reason (string).
+    Empty strings mean "unknown" — phrase them to the customer accordingly.
+    Error envelopes ({"error": "..."}) are returned unchanged.
 
     Args:
         productCategory: Top-level product category (e.g., "Refrigerator"). Required. Must be validated via interface 7.
@@ -342,6 +589,7 @@ def requestRepair(
         "brand": brand,
         "customerId": customerId.strip(),
     })
+    result = _normalize_with_llm(result, RequestResponse, "requestRepair")
     return json.dumps(result)
 
 
@@ -357,13 +605,33 @@ def trackRepair(woNumber: str, customerId: str) -> str:
         2. Otherwise call verifyCustomer first with the last 4 digits of the
            customer's phone number, store the returned customerId, and then
            call this tool with it.
+        3. If verifyCustomer returns {"error": "CUSTOMER_NOT_FOUND"}, ask
+           the customer for a different full phone number AND the account
+           holder's full name, then call verifyCustomerByPhoneAndName with
+           those values. Use the customerId it returns.
       If `customerId` is missing/empty this tool returns
-      {"error": "MISSING_CUSTOMER_ID"}; in that case run verifyCustomer and
-      retry — do NOT retry with an empty customerId.
+      {"error": "MISSING_CUSTOMER_ID"}; in that case run the appropriate
+      verify tool and retry — do NOT retry with an empty customerId.
 
     PRECONDITIONS (the caller MUST satisfy before invoking this tool):
       - woNumber must be non-empty and match the work-order number format
         (10-digit numeric string).
+
+    RETURNS — canonical schema (the upstream API may use different field names
+    such as `ticketstatus`, `tstatus`, `statusName`; this tool normalizes them
+    so you can rely on these exact keys):
+      - woNumber:           Work-order number (string).
+      - status:             Current work-order status (string).
+      - statusDescription:  Human-readable status explanation (string).
+      - scheduledAt:        Scheduled service time (ISO 8601 string, "" if unknown).
+      - technicianName:     Technician's full name (string, "" if unassigned).
+      - technicianPhone:    Technician's contact phone (string, "" if unknown).
+      - address:            Service address (string).
+      - lastUpdatedAt:      Last update timestamp (ISO 8601 string, "" if unknown).
+      - remarks:            Additional notes (string).
+    Empty strings mean "unknown" — phrase them to the customer accordingly
+    (e.g. "no technician has been assigned yet"), do NOT invent values.
+    Error envelopes ({"error": "..."}) are returned unchanged.
 
     Args:
         woNumber: Work-order number. Required, non-empty, 10-digit numeric.
@@ -379,6 +647,7 @@ def trackRepair(woNumber: str, customerId: str) -> str:
         "woNumber": woNumber.strip(),
         "customerId": customerId.strip(),
     })
+    result = _normalize_with_llm(result, TrackResponse, "trackRepair")
     return json.dumps(result)
 
 
@@ -394,13 +663,24 @@ def cancelRepair(woNumber: str, customerId: str) -> str:
         2. Otherwise call verifyCustomer first with the last 4 digits of the
            customer's phone number, store the returned customerId, and then
            call this tool with it.
+        3. If verifyCustomer returns {"error": "CUSTOMER_NOT_FOUND"}, ask
+           the customer for a different full phone number AND the account
+           holder's full name, then call verifyCustomerByPhoneAndName with
+           those values. Use the customerId it returns.
       If `customerId` is missing/empty this tool returns
-      {"error": "MISSING_CUSTOMER_ID"}; in that case run verifyCustomer and
-      retry — do NOT retry with an empty customerId.
+      {"error": "MISSING_CUSTOMER_ID"}; in that case run the appropriate
+      verify tool and retry — do NOT retry with an empty customerId.
 
     PRECONDITIONS (the caller MUST satisfy before invoking this tool):
       - woNumber must be non-empty and match the work-order number format
         (10-digit numeric string).
+
+    RETURNS — canonical schema (upstream field names are normalized):
+      - woNumber:   Work-order number (string).
+      - cancelled:  Boolean — true if the cancellation succeeded.
+      - status:     Resulting work-order status after the cancel call (string).
+      - message:    Human-readable confirmation or failure reason (string).
+    Error envelopes ({"error": "..."}) are returned unchanged.
 
     Args:
         woNumber: Work-order number. Required, non-empty, 10-digit numeric.
@@ -416,6 +696,7 @@ def cancelRepair(woNumber: str, customerId: str) -> str:
         "woNumber": woNumber.strip(),
         "customerId": customerId.strip(),
     })
+    result = _normalize_with_llm(result, CancelResponse, "cancelRepair")
     return json.dumps(result)
 
 

@@ -13,4 +13,9 @@ EXPOSE 8000
 
 COPY . .
 
-CMD ["python", "-m", "mcp_server"]
+# AgentCore Observability: opentelemetry-instrument auto-loads aws-opentelemetry-distro
+# (ADOT) so Strands' built-in OTEL emits spans/metrics/logs to the AgentCore-managed
+# OTLP endpoint. Runtime injects the OTEL_EXPORTER_OTLP_* env vars; we only need
+# the wrapper here. To opt out for a debug run, override CMD or set
+# DISABLE_ADOT_OBSERVABILITY=true on the Runtime.
+CMD ["opentelemetry-instrument", "python", "-m", "mcp_server"]

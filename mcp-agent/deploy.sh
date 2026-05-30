@@ -275,6 +275,57 @@ else
     sleep 10
     echo -e "${GREEN}✓ Created${NC}"
 fi
+
+# Ensure bedrock:InvokeModel is granted (response normalization in mcp_server.py
+# calls bedrock-runtime). Run unconditionally — put-role-policy is idempotent —
+# so existing roles created before this feature also get the permission.
+BEDROCK_INVOKE_POLICY='{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+    "Resource": [
+      "arn:aws:bedrock:*::foundation-model/*",
+      "arn:aws:bedrock:*:*:inference-profile/*",
+      "arn:aws:bedrock:*:*:application-inference-profile/*"
+    ]
+  }]
+}'
+aws iam put-role-policy \
+    --role-name ${ROLE_NAME} \
+    --policy-name bedrock-invoke-model \
+    --policy-document "${BEDROCK_INVOKE_POLICY}" >/dev/null
+echo -e "${GREEN}✓ bedrock:InvokeModel granted${NC}"
+
+# OTEL / AgentCore Observability — X-Ray PutTraceSegments + spans log group.
+# BedrockAgentCoreFullAccess covers most of this, but we attach explicit ADOT
+# permissions in case the managed policy lags behind. put-role-policy is
+# idempotent.
+OBSERVABILITY_POLICY='{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": [
+      "xray:PutTraceSegments",
+      "xray:PutSpans",
+      "xray:PutSpansForIndexing",
+      "xray:GetSamplingRules",
+      "xray:GetSamplingTargets",
+      "logs:CreateLogGroup",
+      "logs:CreateLogStream",
+      "logs:PutLogEvents",
+      "logs:DescribeLogStreams",
+      "logs:DescribeLogGroups",
+      "cloudwatch:PutMetricData"
+    ],
+    "Resource": "*"
+  }]
+}'
+aws iam put-role-policy \
+    --role-name ${ROLE_NAME} \
+    --policy-name otel-observability \
+    --policy-document "${OBSERVABILITY_POLICY}" >/dev/null
+echo -e "${GREEN}✓ OTEL/X-Ray permissions granted${NC}"
 echo ""
 
 # ========================================
