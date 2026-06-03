@@ -38,6 +38,26 @@ if [ -z "${ACCOUNT_ID}" ]; then
 fi
 export ACCOUNT_ID
 
+# ========================================
+# Auto-generate IDENTITY_TOKEN_SECRET on first deploy
+# ========================================
+# Persist a fresh 32-byte hex secret back into .env if it's empty, so every
+# subsequent deploy reuses the SAME secret (otherwise in-flight customer
+# identity tokens would be invalidated on every redeploy). To rotate, empty
+# the line in .env and re-run this script.
+if [ -z "${IDENTITY_TOKEN_SECRET:-}" ]; then
+    NEW_SECRET="$(openssl rand -hex 32)"
+    if grep -qE '^IDENTITY_TOKEN_SECRET=' .env; then
+        # macOS/BSD sed and GNU sed differ on -i; write through a tmp file to be portable.
+        awk -v val="$NEW_SECRET" 'BEGIN{FS=OFS="="} /^IDENTITY_TOKEN_SECRET=/{$0="IDENTITY_TOKEN_SECRET=" val} {print}' .env > .env.tmp && mv .env.tmp .env
+    else
+        printf '\nIDENTITY_TOKEN_SECRET=%s\n' "$NEW_SECRET" >> .env
+    fi
+    IDENTITY_TOKEN_SECRET="$NEW_SECRET"
+    export IDENTITY_TOKEN_SECRET
+    echo -e "${GREEN}✓ Generated and persisted IDENTITY_TOKEN_SECRET to .env (one-time)${NC}"
+fi
+
 CODEBUILD_PROJECT_NAME="${AGENT_NAME}-build"
 S3_BUCKET="${AGENT_NAME}-source-${ACCOUNT_ID}"
 ECR_URI="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO_NAME}"

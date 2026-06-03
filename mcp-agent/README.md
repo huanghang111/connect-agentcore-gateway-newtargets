@@ -12,23 +12,36 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 
 | Tool | 功能 | 入参（前置校验要求见 docstring） |
 |------|------|----------|
-| `verifyCustomer` | 主核身：用手机号后 4 位（`smsToken`）查 `customerId`（目前 stub：`smsToken == "0000"` 时返回 `CUSTOMER_NOT_FOUND`，其他 4 位数字返回 `"0000" + 后 4 位`） | `smsToken`(4 位数字) 必填 |
-| `verifyCustomerByPhoneAndName` | Fallback 核身：用**完整手机号 + 姓名**查 `customerId`（仅在 `verifyCustomer` 返回 `CUSTOMER_NOT_FOUND` 后调用；目前 stub：手机号末 4 位为 `0000` 时返回 `CUSTOMER_NOT_FOUND`，其他返回 `"PHN" + 末 4 位`） | `phoneNumber`(纯数字 6–15 位)、`fullName` 必填 |
+| `verifyCustomer` | 主核身（流程 1，每通电话必跑）：让客户口述手机号后 4 位（`smsToken`），由 LLM 从 Connect AI Agent 系统上下文的 `<customer_info>` 块里读出 `userNumber`（需要在 Orchestration Prompt 模板里写一行 `- userNumber: {{$.Custom.userNumber}}`，并在 Contact Flow 里通过 `Set contact attributes` 把这次通话的 userNumber 写进 `Custom.userNumber`）一并传给本工具。MCP 校验 `userNumber` 末 4 位 == `smsToken` 一致后**签发一个 HMAC token** 当作 `customerId` 返回（底层真实 customerId 直接复用 `userNumber`） | `smsToken`(4 位数字) 必填；`userNumber`(LLM 从 customer_info 里取) |
+| `verifyCustomerByPhoneAndName` | Fallback 核身（流程 2）：用**完整手机号 + 姓名**查到客户后签发 token；仅在 `verifyCustomer` 返回 `CUSTOMER_NOT_FOUND` 后调用（stub：手机号末 4 位为 `0000` 时返回 `CUSTOMER_NOT_FOUND`，其他底层 customerId 为 `"PHN" + 末 4 位`） | `phoneNumber`(纯数字 6–15 位)、`fullName` 必填 |
 | `requestRepair` | 创建维修工单 | `productCategory`, `productsubCategory`, `province`, `city`, `district`, `description`, `brand`, `customerId` 必填；`productModel`, `serialNumber` 可选 |
 | `trackRepair` | 查询工单状态 | `woNumber`(10 位数字)、`customerId`，工具内强制校验 |
 | `cancelRepair` | 取消工单 | `woNumber`(10 位数字)、`customerId`，工具内强制校验 |
 | `faqSearch` | FAQ 知识库自然语言检索（产品使用 / 故障排查 / 保修 / 维修） | `query`(任意自然语言问题) 必填 |
 
-> **设计原则**：所有 tool 的使用方式都写在各自的 docstring 顶部，LLM 通过 `toolConfigurationList` 拿到 description 即可正确使用，**Connect AI Agent 的 Orchestration Prompt 不要写任何 tool 用法**。这样后续迭代只需更新 mcp-server,不动 Connect 配置。
+> **设计原则**：所有 tool 的使用方式都写在各自的 docstring 顶部，LLM 通过 `toolConfigurationList` 拿到 description 即可正确使用，**Connect AI Agent 的 Orchestration Prompt 只需要做一处身份相关改动**（在 `<customer_info>` 块里加一行 `- userNumber: {{$.Custom.userNumber}}`，并在 Contact Flow 里把这通电话的 userNumber 写进 `Custom.userNumber` 属性）；其余所有约束（包括"必须先核身"）都内置在 MCP server 的工具签名 + 服务端校验里。
 >
-> **身份核验流程**（SMS 发送 API 上线前的临时方案）：
-> 1. Connect 上下文若已带 `customerId`，repair tool 直接传该值，跳过核身。
-> 2. 没有 `customerId` 时，先调一次 `verifyCustomer(smsToken=电话号码后 4 位)` —— `smsToken` 必须严格 4 位数字，docstring 已明确告诉 LLM "不要发短信、只问后 4 位"。
-> 3. **核身命中**（`verifyCustomer` 返回 `{"customerId": "0000XXXX"}`）：Connect AI Agent **保存**该 `customerId` 到对话上下文，后续整段对话的 repair tool 都用它。
-> 4. **核身未命中**（`verifyCustomer` 返回 `{"error": "CUSTOMER_NOT_FOUND"}`）：agent 提示客户"该手机号查不到客户信息，请提供另一个完整手机号 + 姓名"，然后调 `verifyCustomerByPhoneAndName(phoneNumber, fullName)`。该工具命中后返回 `{"customerId": "PHNXXXX"}`，仍走第 3 步保存逻辑；如再次返回 `CUSTOMER_NOT_FOUND`，agent 不再循环，转人工。
-> 5. `customerId` 为空时 repair tool 返回 `{"error": "MISSING_CUSTOMER_ID"}`，agent 必须先跑核身工具再重试，不要用空值反复重试。
+> ⚠️ **不要使用** Connect AI Agent 的 "Function input parameters → Set manually / Set dynamically" 来注入 `userNumber`：经端到端验证（Wisdom transcript + Gateway APPLICATION_LOGS 双向交叉对照），该 UI 配置在 **MCP Gateway 类型工具上不会生效** —— 配置可以保存，但 Connect 在转发 `tools/call` 时不会把它合并进 arguments。必须走"customer_info + LLM 主动取"这条路径。
 >
-> **Stub 测试触发器**：在真实身份 API 接通前，stub 通过两个"幻数"模拟核身失败 —— `smsToken == "0000"` 让 `verifyCustomer` 返回 `CUSTOMER_NOT_FOUND`；`phoneNumber` 末 4 位为 `0000` 让 `verifyCustomerByPhoneAndName` 也返回 `CUSTOMER_NOT_FOUND`。这样 Connect 端可以端到端演练 fallback 分支。
+> **身份核验流程**（每通电话强制执行，由 MCP server 服务端硬性兜底）：
+> 1. **流程 1（主核身，每通电话必跑）**：机器人提示用户口述手机号后 4 位 → LLM 从系统上下文 `<customer_info>` 块里读出 `userNumber`（需要 Orchestration Prompt 里有一行 `- userNumber: {{$.Custom.userNumber}}`，且 Contact Flow 已经把这通电话的 userNumber 写进 `Custom.userNumber` 属性）→ LLM 调 `verifyCustomer(smsToken=4 位数字, userNumber=<从 customer_info 取到的值>)` → MCP 在服务端比较 `userNumber[-4:] == smsToken`，一致才放行并签发 token，真实底层 customerId 复用 `userNumber` 本身 → 成功返回 `{"customerId": "<token>"}`。这里的 `customerId` 是 MCP server 用 HMAC-SHA256 签发的**短期 token**（默认 60 分钟），**不是**真实的 customerId 字符串。⚠️ Connect AI Agent 的 "Function input parameters → Set manually" 在 MCP Gateway 类型工具上经验证不会被注入，因此不要依赖那条路径，必须靠 customer_info + LLM 主动取。
+> 2. **整通电话复用一次核身**：Agent 把这个 token 保存在对话上下文里，后续 `requestRepair` / `trackRepair` / `cancelRepair` 一律把它当作 `customerId` 透传给 MCP server；MCP server 验签后取出真实 customerId 再打到后端。
+> 3. **流程 2（fallback）**：流程 1 返回 `{"error": "CUSTOMER_NOT_FOUND"}`（口述后 4 位与 `userNumber` 末 4 位不一致）或 `{"error": "INVALID_USER_NUMBER"}`（Connect 没透传 `userNumber` 或长度不足 4）时进入此分支。Agent 提示"该手机号查不到客户信息，请提供另一个完整手机号 + 姓名"，收齐两个字段后调 `verifyCustomerByPhoneAndName(phoneNumber, fullName)`。命中同样返回 `{"customerId": "<token>"}`；若再次 `CUSTOMER_NOT_FOUND`，**不要循环**，转人工。
+> 4. **服务端硬性兜底**：三个 repair tool 在入口处对 `customerId` 进行 HMAC 验签 + 过期检查。任何**没跑过 verify**、**篡改 token**、或**幻觉编造 customerId** 的调用一律被拦下：
+>    - `MISSING_CUSTOMER_ID`：参数为空
+>    - `IDENTITY_INVALID`：不是合法 token / 签名不匹配 / payload 损坏
+>    - `IDENTITY_EXPIRED`：token 已过期，需要重新走 verify
+>
+>    无论 LLM 看不看得懂 prompt、有没有被劫持，**只要它没拿到 verify tool 颁发的合法 token，就一行后端接口都打不出去**。
+>
+> **签名密钥配置**：
+> - **首次部署**：`.env` 里 `IDENTITY_TOKEN_SECRET=` 留空即可，`deploy.sh` 会自动跑一次 `openssl rand -hex 32` 生成 32 字节密钥并**回写到 `.env`**，之后每次部署都复用同一份 secret（避免重新部署把所有在线通话的 token 全废掉）
+> - **轮换**：把 `.env` 里那一行清空再 `./deploy.sh` —— 会重新生成并回写；副作用是当前所有在线 token 立即失效，客户需要重新报手机后 4 位
+> - **不要在 `.env` 里直接写 `$(openssl rand -hex 32)`** —— `deploy.sh` 用 `set -a; source .env`，会在每次部署时重新执行子 shell，相当于每次都换密钥，**正在通话中的客户全部 token 失效**
+> - 不设也没回写时（比如 CI 直接跑 `mcp_server.py`）server 会用进程内随机 secret 并打 WARNING，单副本调试可用，但 Runtime 重启或扩成多副本后所有已发 token 立即失效
+> - Token TTL 默认 3600 秒（60 分钟，覆盖典型通话时长），可通过 `IDENTITY_TOKEN_TTL_S` 调整
+>
+> **Stub 测试触发器**：在真实身份 API 接通前，`verifyCustomer` 的"对得上 / 对不上"完全由 Agent 传进来的 `userNumber` 控制 —— 只要让 `smsToken` 与 `userNumber` 末 4 位不一致就能复现 `CUSTOMER_NOT_FOUND`，把 `userNumber` 留空或不到 4 位即可复现 `INVALID_USER_NUMBER`，两者都会驱动 Agent 走 fallback。`verifyCustomerByPhoneAndName` 仍保留幻数：`phoneNumber` 末 4 位为 `0000` 时返回 `CUSTOMER_NOT_FOUND`，模拟"再次找不到"的人工兜底分支。
 
 每个 tool 的 docstring 顶部都列出了 **PRECONDITIONS**，明确字段在调用前必须经过哪些上游校验接口（产品大/小类、地址映射、型号/SN）。
 
@@ -37,16 +50,16 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 > 三个 repair tool 收到的 `customerId` 已经透传给后端，但当前部署的 Lambda（`midea/connect-api-customer.yaml`）**还没读这个字段**，等真实身份系统接入后再加上 `customerId` 校验/查询；MCP 这层先把字段对齐，避免上线时再改 tool schema。
 > 全部三个 repair tool 都会在拿到后端响应后过一次 Strands+Bedrock 归一化（详见上面的"响应归一化"章节），表里的"出参"指的就是归一化后的 schema —— 也是 LLM 实际看到的字段。
 
-#### 1. `verifyCustomer` — 主核身（无后端 API，纯 stub）
+#### 1. `verifyCustomer` — 主核身（无后端 API，纯本地比对）
 
 | 项 | 内容 |
 |----|------|
-| 入参 | `smsToken: str` —— 4 位数字（手机号后 4 位） |
-| 本地校验失败 | `{"error":"INVALID_SMS_TOKEN", "message":"..."}` |
-| Stub 触发 | `smsToken == "0000"` → `CUSTOMER_NOT_FOUND` |
-| 成功出参 | `{"customerId":"0000XXXX"}` |
-| 失败出参 | `{"error":"CUSTOMER_NOT_FOUND","message":"... fall back to verifyCustomerByPhoneAndName"}` |
-| 后端 API | 无（真实身份 API 上线后替换 `_verify_phone_tail_to_customer_id` 函数即可，tool 签名不变） |
+| 入参 | `smsToken: str`(4 位数字，客户口述，**LLM 必填**); `userNumber: str`(LLM 从 `<customer_info>` 块的 `- userNumber: <digits>` 行原样读出后传入，digits-only) |
+| 本地校验失败 | `{"error":"INVALID_SMS_TOKEN"}` / `{"error":"INVALID_USER_NUMBER"}` |
+| 比对规则 | `userNumber[-4:] == smsToken` 才算通过；不一致 → `CUSTOMER_NOT_FOUND` |
+| 成功出参 | `{"customerId":"<HMAC token，形如 base64url(payload).base64url(sig)>"}` —— 短期签名 token，token 内嵌的真实 customerId 即 `userNumber` 本身，repair tool 透传后服务端验签后再打到后端 |
+| 失败出参 | `{"error":"CUSTOMER_NOT_FOUND","message":"... fall back to verifyCustomerByPhoneAndName"}` 或 `{"error":"INVALID_USER_NUMBER","message":"..."}` |
+| 后端 API | 无（接入真实身份 API 时改写 `_verify_phone_tail_to_customer_id`，tool 签名不变） |
 
 #### 2. `verifyCustomerByPhoneAndName` — Fallback 核身（无后端 API，纯 stub）
 
@@ -55,7 +68,7 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 | 入参 | `phoneNumber: str`(6–15 位纯数字), `fullName: str`(非空) |
 | 本地校验失败 | `{"error":"INVALID_PHONE_NUMBER" \| "INVALID_NAME"}` |
 | Stub 触发 | `phoneNumber` 末 4 位为 `0000` → `CUSTOMER_NOT_FOUND`（**不再循环，提示转人工**） |
-| 成功出参 | `{"customerId":"PHNXXXX"}` |
+| 成功出参 | `{"customerId":"<HMAC token>"}` —— 同 `verifyCustomer`，是签名 token 不是真实 ID |
 | 失败出参 | `{"error":"CUSTOMER_NOT_FOUND","message":"... do NOT loop"}` |
 | 后端 API | 无 |
 
@@ -102,9 +115,12 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 | 错误码 | 触发位置 |
 |--------|---------|
 | `INVALID_SMS_TOKEN` | `verifyCustomer` |
+| `INVALID_USER_NUMBER` | `verifyCustomer`（`userNumber` 缺失或长度不足 4） |
 | `CUSTOMER_NOT_FOUND` | `verifyCustomer` / `verifyCustomerByPhoneAndName` |
 | `INVALID_PHONE_NUMBER` / `INVALID_NAME` | `verifyCustomerByPhoneAndName` |
-| `MISSING_CUSTOMER_ID` | `requestRepair` / `trackRepair` / `cancelRepair` |
+| `MISSING_CUSTOMER_ID` | `requestRepair` / `trackRepair` / `cancelRepair`（参数为空） |
+| `IDENTITY_INVALID` | `requestRepair` / `trackRepair` / `cancelRepair`（token 非法 / 篡改 / LLM 幻觉） |
+| `IDENTITY_EXPIRED` | `requestRepair` / `trackRepair` / `cancelRepair`（token 超过 `IDENTITY_TOKEN_TTL_S`） |
 | `INVALID_SUB_CATEGORY` | `requestRepair` |
 | `INVALID_PROVINCE` / `INVALID_CITY` / `INVALID_DISTRICT` | `requestRepair` |
 | `INVALID_WO_NUMBER` | `trackRepair` / `cancelRepair` |
@@ -150,6 +166,8 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 | `NORMALIZE_MODEL_ID` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Bedrock inference profile / model ID |
 | `BEDROCK_REGION` | 同 `AWS_REGION`（默认 `us-east-1`） | 哪个 region 调 Bedrock |
 | `NORMALIZE_TIMEOUT_S` | `4` | 单次归一化的 read timeout（秒），超时 fail-soft 退回原始响应 |
+| `IDENTITY_TOKEN_SECRET` | 进程内随机（仅调试可用） | 身份 token HMAC 密钥；首次部署时 `.env` 留空，`deploy.sh` 会自动 `openssl rand -hex 32` 并回写 |
+| `IDENTITY_TOKEN_TTL_S` | `3600` | 身份 token 有效期（秒），过期返回 `IDENTITY_EXPIRED` 强制重新核身 |
 
 部署脚本已经给 Runtime execution role 加了 `bedrock:InvokeModel` 权限（针对 foundation-model + inference-profile 资源），所以重新跑一次 `./deploy.sh` 即可生效；如要换模型，改 `.env` 里的 `NORMALIZE_MODEL_ID` 再重新部署即可。
 
@@ -293,10 +311,25 @@ Gateway target 就绪后，去 Amazon Connect 控制台：
    - `connect-repair-mcp-agent___trackRepair`
    - `connect-repair-mcp-agent___cancelRepair`
    - `connect-repair-mcp-agent___faqSearch`
-4. **Output Filters** → Select Property Keys 里加 `result`（必须勾选，否则 LLM 读不到 `customerId` 等返回值）
-5. 点 **Update** 保存
+4. 每个 tool 的 **Output Filters** → Select Property Keys 里加 `result`（必须勾选，否则 LLM 读不到 `customerId` 等返回值）
+5. **不要**在 `verifyCustomer` 上配 Function input parameters（已验证不生效，详见上面的设计原则提示）
+6. 编辑 AI Agent 的 **Orchestration Prompt**，在 `<customer_info>` 块里加一行（如已有 `phoneNumber` 等字段可以保留）：
+   ```
+   <customer_info>
+   - userNumber: {{$.Custom.userNumber}}
+   - BU: {{$.Custom.BU}}
+   </customer_info>
+   ```
+   LLM 会把这里的 `userNumber` 当作 `verifyCustomer` 的 `userNumber` 入参原样传给 MCP server。
+7. 在对应的 **Contact Flow** 里加一个 **Set contact attributes** block，destination=*User Defined*，key=`userNumber`，value 来自 lookup（CRM / DynamoDB / Lambda）或对接系统已知字段；Custom attribute 的命名要和上一步 Orchestration Prompt 里的占位符一致。
+8. 点 **Update / Publish** 保存 AI Agent。
 
 > **更新工具签名后必须重做引用**：MCP server 修改 tool 签名（参数名/必填项变化）并重新 deploy 后，AI Agent 持有的是更早部署时的工具描述快照。Gateway target 同步只刷新 Gateway 侧 schema，AI Agent 侧不会自动跟随。需要在 AI Agent Designer 里把这些工具 **Remove → 再 Add 回来**，让它拉到新 schema，否则 LLM 会按旧签名调用。
+
+> **如何快速诊断 verifyCustomer 失败**：
+> - 看 **AgentCore Gateway APPLICATION_LOGS**（log group `/aws/vendedlogs/bedrock-agentcore/gateway/APPLICATION_LOGS/<gateway-name>`）的 `tools/call` 行，确认 `arguments` 里是否有 `userNumber`。没有 → 上下文里取不到。
+> - 看 **Connect Wisdom transcript**（log group `/aws/connect/wisdom/<assistant-id>`）的 `TRANSCRIPT_AGENTIC_MESSAGE` 里 `prompt.system` 中 `<customer_info>` 块是否真有 `- userNumber: <digits>`。空值或字段缺失 → Orchestration Prompt 模板没生效，或 Contact Flow 没写入对应 Custom attribute。
+> - 同一 transcript 里 `TRANSCRIPT_LARGE_LANGUAGE_MODEL_INVOCATION.completion.toolUseList[].toolInput` 是 LLM 实际生成的入参，跟 Gateway 收到的 arguments 对比可以判断"丢字段"是 LLM 端还是 Connect 端发生的。
 
 ## 清理
 

@@ -1,12 +1,16 @@
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import time
 import urllib.request
 import urllib.error
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from botocore.config import Config as BotoConfig
 from mcp.server.fastmcp import FastMCP
@@ -46,6 +50,102 @@ NORMALIZE_MODEL_ID = os.environ.get(
     "us.anthropic.claude-haiku-4-5-20251001-v1:0",
 )
 NORMALIZE_TIMEOUT_S = float(os.environ.get("NORMALIZE_TIMEOUT_S", "4"))
+
+# --- Identity token (server-side hard enforcement) ----------------------------
+# Repair tools (requestRepair / trackRepair / cancelRepair) require a customerId
+# that is actually a signed identity token issued by verifyCustomer or
+# verifyCustomerByPhoneAndName. The token is self-contained
+# (base64url(payload).base64url(hmac_sha256(payload, secret))), so it survives
+# Runtime restarts and works across replicas without external state — but
+# cannot be forged by an LLM that skipped verification, because the LLM never
+# sees IDENTITY_TOKEN_SECRET.
+
+IDENTITY_TOKEN_TTL_S = int(os.environ.get("IDENTITY_TOKEN_TTL_S", "3600"))
+_IDENTITY_TOKEN_SECRET_ENV = os.environ.get("IDENTITY_TOKEN_SECRET", "").strip()
+if _IDENTITY_TOKEN_SECRET_ENV:
+    _IDENTITY_TOKEN_SECRET = _IDENTITY_TOKEN_SECRET_ENV.encode("utf-8")
+else:
+    _IDENTITY_TOKEN_SECRET = secrets.token_bytes(32)
+    log.warning(
+        "IDENTITY_TOKEN_SECRET not set; using a random per-process secret. "
+        "Tokens will not validate across Runtime replicas or restarts. "
+        "Set IDENTITY_TOKEN_SECRET (>=32 random bytes) in production."
+    )
+
+
+def _b64u_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64u_decode(s: str) -> bytes:
+    pad = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+
+
+def _issue_identity_token(customer_id: str) -> str:
+    """Mint a short-lived signed token that downstream repair tools accept as customerId.
+
+    Format: ``<b64u(payload)>.<b64u(hmac_sha256(payload, secret))>``
+    Payload: ``{"cid": "<customer_id>", "exp": <unix_seconds>}``
+    """
+    payload = json.dumps(
+        {"cid": customer_id, "exp": int(time.time()) + IDENTITY_TOKEN_TTL_S},
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    sig = hmac.new(_IDENTITY_TOKEN_SECRET, payload, hashlib.sha256).digest()
+    return f"{_b64u_encode(payload)}.{_b64u_encode(sig)}"
+
+
+def _verify_identity_token(token: str) -> Tuple[Optional[str], Optional[dict]]:
+    """Validate an identity token. Returns (customer_id, None) on success, or
+    (None, error_dict) on any failure (malformed / bad signature / expired).
+    The error_dict is the exact envelope the repair tools should return."""
+    if not token or not isinstance(token, str):
+        return None, {
+            "error": "MISSING_CUSTOMER_ID",
+            "message": "customerId is required and must be a token returned by verifyCustomer or verifyCustomerByPhoneAndName earlier in this conversation.",
+        }
+    parts = token.split(".")
+    if len(parts) != 2:
+        return None, {
+            "error": "IDENTITY_INVALID",
+            "message": "customerId is not a valid identity token. Call verifyCustomer first (or verifyCustomerByPhoneAndName as fallback) and pass the token it returns.",
+        }
+    try:
+        payload_raw = _b64u_decode(parts[0])
+        sig = _b64u_decode(parts[1])
+    except Exception:
+        return None, {
+            "error": "IDENTITY_INVALID",
+            "message": "customerId is not a valid identity token. Call verifyCustomer first (or verifyCustomerByPhoneAndName as fallback) and pass the token it returns.",
+        }
+    expected = hmac.new(_IDENTITY_TOKEN_SECRET, payload_raw, hashlib.sha256).digest()
+    if not hmac.compare_digest(sig, expected):
+        return None, {
+            "error": "IDENTITY_INVALID",
+            "message": "Identity token signature mismatch. Call verifyCustomer first (or verifyCustomerByPhoneAndName as fallback) and pass the token it returns.",
+        }
+    try:
+        payload = json.loads(payload_raw.decode("utf-8"))
+        cid = payload["cid"]
+        exp = int(payload["exp"])
+    except Exception:
+        return None, {
+            "error": "IDENTITY_INVALID",
+            "message": "Identity token payload is malformed. Call verifyCustomer to obtain a fresh token.",
+        }
+    if exp < int(time.time()):
+        return None, {
+            "error": "IDENTITY_EXPIRED",
+            "message": "Identity token has expired. Apologise briefly to the customer, then call verifyCustomer again with the last 4 digits of their phone number.",
+        }
+    if not cid:
+        return None, {
+            "error": "IDENTITY_INVALID",
+            "message": "Identity token has no customer id. Call verifyCustomer to obtain a fresh token.",
+        }
+    return cid, None
 
 # Canonical schemas. Every query tool advertises these fields verbatim in its
 # docstring so the orchestrator LLM sees one shape regardless of the upstream
@@ -345,28 +445,41 @@ def _validate_region(province: str, city: str, district: str) -> Optional[dict]:
     return None
 
 
-def _validate_customer_id(customer_id: str) -> Optional[dict]:
-    """Return an error dict if customerId is missing, else None."""
+def _resolve_customer_id(customer_id: str) -> Tuple[Optional[str], Optional[dict]]:
+    """Validate the caller-supplied customerId as a signed identity token issued
+    by verifyCustomer / verifyCustomerByPhoneAndName, and return the underlying
+    real customerId on success.
+
+    Returns ``(real_customer_id, None)`` on success or ``(None, error_dict)`` on
+    any failure (missing / forged / expired). Repair tools MUST use this to
+    obtain the customerId they forward to the backend — never trust the raw
+    string. This is the server-side hard enforcement that makes it impossible
+    for the LLM to skip identity verification, regardless of what the
+    orchestrator prompt says or how the model behaves."""
     if not customer_id or not customer_id.strip():
-        return {
+        return None, {
             "error": "MISSING_CUSTOMER_ID",
-            "message": "customerId is required. If unknown, call verifyCustomer first with the last 4 digits of the customer's phone number; if that returns CUSTOMER_NOT_FOUND, fall back to verifyCustomerByPhoneAndName with the customer's full phone number and full name.",
+            "message": "customerId is required and must be the token returned by verifyCustomer or verifyCustomerByPhoneAndName earlier in this conversation. Identity verification is mandatory on every call — call verifyCustomer with the last 4 digits of the customer's phone number first; if that returns CUSTOMER_NOT_FOUND, fall back to verifyCustomerByPhoneAndName with the customer's full phone number and full name.",
         }
-    return None
+    return _verify_identity_token(customer_id.strip())
 
 
-def _verify_phone_tail_to_customer_id(phone_tail: str) -> Optional[str]:
-    """Resolve a 4-digit phone tail into a customerId, or ``None`` if no match.
+def _verify_phone_tail_to_customer_id(phone_tail: str, user_number: str) -> Optional[str]:
+    """Resolve a (4-digit phone tail, Connect-provided userNumber) pair into a
+    customerId, or ``None`` if they do not agree.
 
-    STUB: Until the real identity API is live this returns
-    ``"0000" + phone_tail`` for any 4-digit input EXCEPT the magic value
-    ``"0000"``, which simulates a "customer not found" outcome so the
-    fallback (full phone number + full name) flow can be exercised end-to-end
-    on Connect.
+    Flow 1 success criterion: the last 4 digits of ``user_number`` must equal
+    ``phone_tail`` (which the customer recited verbally on the call). When they
+    match, ``user_number`` itself is the customerId we hand to the backend;
+    otherwise the caller is told CUSTOMER_NOT_FOUND so the fallback Flow 2 (full
+    phone + full name) can take over.
+
+    Both inputs are assumed pre-validated by the caller — ``phone_tail`` is a
+    4-digit numeric string and ``user_number`` is at least 4 characters long.
     """
-    if phone_tail == "0000":
+    if user_number[-4:] != phone_tail:
         return None
-    return f"0000{phone_tail}"
+    return user_number
 
 
 def _verify_phone_and_name_to_customer_id(phone_number: str, full_name: str) -> Optional[str]:
@@ -385,75 +498,121 @@ def _verify_phone_and_name_to_customer_id(phone_number: str, full_name: str) -> 
 
 
 @mcp.tool(structured_output=False)
-def verifyCustomer(smsToken: str) -> str:
-    """Verify a customer by the last 4 digits of their phone number and return a customerId.
+def verifyCustomer(smsToken: str, userNumber: str = "") -> str:
+    """Verify a customer by cross-checking the 4 digits the customer just spoke against the `userNumber` carried in customer_info, and return a customerId.
 
     HOW TO USE — read this BEFORE doing anything else:
-      This is the PRIMARY identity check. Call it ONCE per conversation when,
-      and only when, the conversation context does NOT already contain a
-      customerId. After this call succeeds, save the returned `customerId` for
-      the rest of the conversation and pass it to requestRepair / trackRepair
-      / cancelRepair. Do NOT call this tool again in the same conversation if
-      a customerId is already known.
+      This is the PRIMARY identity check (Flow 1) and is MANDATORY on every
+      single call. Identity verification is REQUIRED before any repair tool
+      (requestRepair / trackRepair / cancelRepair) can be invoked, even if
+      the agent context already contains a customerId — any pre-existing
+      customerId in customer_info MUST be ignored. Call this tool ONCE at
+      the start of every conversation, before doing any repair work, and
+      reuse the returned customerId for the rest of THIS conversation only.
+      Do NOT call this tool a second time in the same conversation once it
+      has already returned a customerId — reuse the saved value.
 
       Workflow:
         1. Ask the customer in plain language for the last 4 digits of their
            phone number (e.g. "For verification, could you tell me the last
            four digits of your phone number?"). Never tell the customer you
            are sending or have sent an SMS / verification code.
-        2. Pass exactly those 4 digits as `smsToken`.
-        3. On success the result is {"customerId": "..."} — remember this
-           customerId and reuse it for every subsequent repair tool call.
-        4. If the value is not exactly 4 digits, this tool returns
+        2. Read the caller's `userNumber` from the `<customer_info>`
+           block in your system context (it appears as
+           `- userNumber: <digits>`) and pass BOTH `smsToken` (the 4
+           digits the customer just spoke) AND `userNumber` (the value
+           you read from customer_info, verbatim, digits only — do NOT
+           reformat, mask, or substitute it) as arguments to this tool.
+           The server checks that the last 4 digits of `userNumber`
+           equal `smsToken`. If `<customer_info>` does NOT contain a
+           `userNumber` line (or its value is empty), omit the
+           `userNumber` argument — the server will return
+           `INVALID_USER_NUMBER` and you should follow step 5.
+        3. On success the result is {"customerId": "<opaque token>"} —
+           save this token verbatim and pass it as `customerId` to every
+           subsequent repair tool call in this conversation. The value
+           is a short-lived signed token (NOT a human-readable ID); do
+           NOT modify, summarise, or invent it. This is Flow 1
+           verification passing; proceed to the customer's repair
+           request.
+        4. If `smsToken` is not exactly 4 digits, this tool returns
            {"error": "INVALID_SMS_TOKEN"}. Apologize briefly and ask again
            for the last 4 digits — do NOT retry with the same bad value,
            and do NOT mention SMS.
-        5. If the lookup succeeds in format but no customer matches, this
-           tool returns {"error": "CUSTOMER_NOT_FOUND"}. In that case tell
-           the customer "Sorry, we couldn't find an account with that phone
-           number. Could you provide a different full phone number along
-           with the account holder's full name so we can look it up?" and
-           then call `verifyCustomerByPhoneAndName` with the values they
-           supply. Do NOT keep retrying verifyCustomer with new last-4
-           guesses, and do NOT ask for the last 4 digits a second time.
+        5. If `userNumber` is missing from the call (because customer_info
+           did not contain it) or shorter than 4 characters, this tool
+           returns {"error": "INVALID_USER_NUMBER"}. This indicates the
+           caller's userNumber isn't on file, not anything the customer
+           said wrong — fall back to Flow 2 immediately (do NOT retry
+           verifyCustomer): tell the customer "Sorry, could you provide
+           your full phone number along with the account holder's full
+           name so we can look it up?" and then call
+           `verifyCustomerByPhoneAndName`.
+        6. If the smsToken format is fine but its 4 digits do not
+           match the last 4 digits of the `userNumber` you passed, this
+           tool returns {"error": "CUSTOMER_NOT_FOUND"} — Flow 1 has
+           failed, fall back
+           to Flow 2. Tell the customer "Sorry, we couldn't find an
+           account with that phone number. Could you provide a different
+           full phone number along with the account holder's full name so
+           we can look it up?" and then call `verifyCustomerByPhoneAndName`
+           with the values they supply. Do NOT keep retrying verifyCustomer
+           with new last-4 guesses, and do NOT ask for the last 4 digits a
+           second time.
 
     Args:
-        smsToken: Last 4 digits of the customer's phone number (NOT an SMS verification code). Required, exactly 4 digits.
+        smsToken: Last 4 digits of the customer's phone number that the customer just spoke (NOT an SMS verification code). Required, exactly 4 digits.
+        userNumber: Caller's full userNumber, taken verbatim from the `<customer_info>` block in the system context (it appears there as `- userNumber: <digits>`). Required when customer_info exposes one. Pass digits only, no spaces / dashes / formatting. The server compares its last 4 characters against `smsToken`. If customer_info does not include a `userNumber` line, omit this argument; the server will return `INVALID_USER_NUMBER` and you should fall back to verifyCustomerByPhoneAndName.
     """
     err = _validate_sms_token(smsToken)
     if err:
         return json.dumps(err)
+    user_number = (userNumber or "").strip()
+    if len(user_number) < 4:
+        log.info("verifyCustomer invalid_user_number len=%d", len(user_number))
+        return json.dumps({
+            "error": "INVALID_USER_NUMBER",
+            "message": "userNumber is missing or shorter than 4 characters. Connect did not provide a usable userNumber for this caller — fall back to verifyCustomerByPhoneAndName with the customer's full phone number and full name.",
+        })
     phone_tail = smsToken.strip()
-    customer_id = _verify_phone_tail_to_customer_id(phone_tail)
+    customer_id = _verify_phone_tail_to_customer_id(phone_tail, user_number)
     if customer_id is None:
-        log.info("verifyCustomer not_found phone_tail=%s", phone_tail)
+        log.info("verifyCustomer not_found phone_tail=%s user_number_tail=%s", phone_tail, user_number[-4:])
         return json.dumps({
             "error": "CUSTOMER_NOT_FOUND",
-            "message": "No customer matches the given last 4 digits. Ask the customer for a full phone number and full name, then call verifyCustomerByPhoneAndName.",
+            "message": "The last 4 digits the customer provided do not match the userNumber on file. Ask the customer for a full phone number and full name, then call verifyCustomerByPhoneAndName.",
         })
+    token = _issue_identity_token(customer_id)
     log.info("verifyCustomer ok phone_tail=%s customerId=%s", phone_tail, customer_id)
-    return json.dumps({"customerId": customer_id})
+    return json.dumps({"customerId": token})
 
 
 @mcp.tool(structured_output=False)
 def verifyCustomerByPhoneAndName(phoneNumber: str, fullName: str) -> str:
-    """Fallback identity check — verify a customer by FULL phone number plus full name.
+    """Fallback identity check (Flow 2) — verify a customer by FULL phone number plus full name.
 
     HOW TO USE — read this BEFORE doing anything else:
-      Call this tool ONLY after `verifyCustomer` has already returned
-      {"error": "CUSTOMER_NOT_FOUND"} earlier in this same conversation, AND
-      the customer has supplied BOTH a different full phone number AND the
-      account holder's full name. Do NOT call this tool as the first identity
-      check — start with `verifyCustomer` instead.
+      This is Flow 2, the fallback path. Call this tool ONLY after
+      `verifyCustomer` (Flow 1) has already returned
+      {"error": "CUSTOMER_NOT_FOUND"} earlier in this same conversation,
+      AND the customer has supplied BOTH a different full phone number AND
+      the account holder's full name. Do NOT call this tool as the first
+      identity check — Flow 1 (`verifyCustomer`) is mandatory first.
 
       Workflow:
-        1. After verifyCustomer returns CUSTOMER_NOT_FOUND, ask: "Could you
-           provide a different full phone number, and the full name on the
-           account?" Collect BOTH values before calling this tool.
+        1. After verifyCustomer returns CUSTOMER_NOT_FOUND, tell the
+           customer "Sorry, we couldn't find an account with that phone
+           number. Could you provide a different full phone number, and
+           the full name on the account?" Collect BOTH values before
+           calling this tool.
         2. Pass the full digits-only phone number as `phoneNumber` and the
            full name as `fullName`.
-        3. On success the result is {"customerId": "..."} — remember this
-           customerId and reuse it for every subsequent repair tool call.
+        3. On success the result is {"customerId": "<opaque token>"} —
+           save this token verbatim and pass it as `customerId` to every
+           subsequent repair tool call in this conversation. The value
+           is a short-lived signed token (NOT a human-readable ID); do
+           NOT modify, summarise, or invent it. Flow 2 verification has
+           passed; proceed to the customer's repair request.
         4. On {"error": "INVALID_PHONE_NUMBER"} or {"error": "INVALID_NAME"},
            apologize briefly and ask the customer to repeat the offending
            field — do NOT retry with the same bad value.
@@ -483,8 +642,9 @@ def verifyCustomerByPhoneAndName(phoneNumber: str, fullName: str) -> str:
             "error": "CUSTOMER_NOT_FOUND",
             "message": "No customer matches the given phone number and name. Do NOT loop — apologize and offer to transfer to a human agent.",
         })
+    token = _issue_identity_token(customer_id)
     log.info("verifyCustomerByPhoneAndName ok phone=%s name=%s customerId=%s", phone, name, customer_id)
-    return json.dumps({"customerId": customer_id})
+    return json.dumps({"customerId": token})
 
 
 @mcp.tool(structured_output=False)
@@ -503,20 +663,30 @@ def requestRepair(
     """Create a new repair work order.
 
     IDENTITY — read this BEFORE doing anything else:
-      `customerId` authorizes this call. Resolve it in this order:
-        1. If the conversation already has a customerId (from earlier in the
-           conversation, or already provided in the agent's context), pass
-           that. Do NOT ask the customer for verification again.
-        2. Otherwise call verifyCustomer first with the last 4 digits of the
-           customer's phone number, store the returned customerId, and then
-           call this tool with it.
-        3. If verifyCustomer returns {"error": "CUSTOMER_NOT_FOUND"}, ask
-           the customer for a different full phone number AND the account
-           holder's full name, then call verifyCustomerByPhoneAndName with
-           those values. Use the customerId it returns.
-      If `customerId` is missing/empty this tool returns
-      {"error": "MISSING_CUSTOMER_ID"}; in that case run the appropriate
-      verify tool and retry — do NOT retry with an empty customerId.
+      `customerId` authorizes this call and MUST come from a verifyCustomer
+      / verifyCustomerByPhoneAndName call earlier in THIS conversation.
+      Identity verification is MANDATORY on every conversation; any
+      customerId in the agent's customer_info context is informational
+      only and MUST NOT be passed here. Resolve `customerId` like this:
+        1. (Flow 1) Call verifyCustomer with both the last 4 digits of
+           the customer's phone number AND the caller's userNumber from
+           the Connect environment / customer_info context. If it
+           returns a customerId, save and pass it here. If verifyCustomer
+           has already succeeded earlier in THIS conversation, reuse the
+           saved customerId — do NOT call verifyCustomer a second time.
+        2. (Flow 2) If verifyCustomer returned
+           {"error": "CUSTOMER_NOT_FOUND"}, tell the customer that phone
+           number isn't on file and ask for a different full phone number
+           AND the account holder's full name, then call
+           verifyCustomerByPhoneAndName with those values and use the
+           customerId it returns.
+      The `customerId` you pass MUST be the opaque token returned by a
+      verify tool — it is HMAC-signed and validated server-side, so any
+      missing / forged / expired token is rejected with
+      {"error": "MISSING_CUSTOMER_ID"} | {"error": "IDENTITY_INVALID"} |
+      {"error": "IDENTITY_EXPIRED"}. In all three cases, run the
+      appropriate verify tool to mint a fresh token, then retry. Do NOT
+      retry with the same bad value.
 
     PRECONDITIONS (the caller MUST satisfy before invoking this tool):
       - productCategory: validated via the product category lookup API
@@ -564,11 +734,11 @@ def requestRepair(
         district: District / street. Required. Chinese name or pinyin; must belong to the given city.
         description: Work-order remark — AI summary plus dialog transcript. Required.
         brand: Product brand. Required. Extracted from dialog or product library (interface 9 extension recommended).
-        customerId: Authenticated customer identifier. Required. Reuse the value already in the conversation; otherwise obtain via verifyCustomer first.
+        customerId: Opaque short-lived identity token returned by verifyCustomer (Flow 1) or verifyCustomerByPhoneAndName (Flow 2) earlier in THIS conversation. Required. Pass the token verbatim — it is signed and validated server-side. Do NOT invent, edit, summarise, or substitute any value (including any customerId from the agent's customer_info context); the server will reject it with {"error": "IDENTITY_INVALID"}. If the token has expired the server returns {"error": "IDENTITY_EXPIRED"} — call verifyCustomer again to mint a fresh one.
         productModel: Product model. Optional. If provided, must be validated via interface 9.
         serialNumber: Product serial number. Optional. If provided, must be validated via interface 9.
     """
-    err = _validate_customer_id(customerId)
+    real_customer_id, err = _resolve_customer_id(customerId)
     if err:
         return json.dumps(err)
     err = _validate_subcategory(productsubCategory)
@@ -587,7 +757,7 @@ def requestRepair(
         "district": district,
         "description": description,
         "brand": brand,
-        "customerId": customerId.strip(),
+        "customerId": real_customer_id,
     })
     result = _normalize_with_llm(result, RequestResponse, "requestRepair")
     return json.dumps(result)
@@ -598,20 +768,30 @@ def trackRepair(woNumber: str, customerId: str) -> str:
     """Query the status of an existing repair work order by its work-order number.
 
     IDENTITY — read this BEFORE doing anything else:
-      `customerId` authorizes this call. Resolve it in this order:
-        1. If the conversation already has a customerId (from earlier in the
-           conversation, or already provided in the agent's context), pass
-           that. Do NOT ask the customer for verification again.
-        2. Otherwise call verifyCustomer first with the last 4 digits of the
-           customer's phone number, store the returned customerId, and then
-           call this tool with it.
-        3. If verifyCustomer returns {"error": "CUSTOMER_NOT_FOUND"}, ask
-           the customer for a different full phone number AND the account
-           holder's full name, then call verifyCustomerByPhoneAndName with
-           those values. Use the customerId it returns.
-      If `customerId` is missing/empty this tool returns
-      {"error": "MISSING_CUSTOMER_ID"}; in that case run the appropriate
-      verify tool and retry — do NOT retry with an empty customerId.
+      `customerId` authorizes this call and MUST come from a verifyCustomer
+      / verifyCustomerByPhoneAndName call earlier in THIS conversation.
+      Identity verification is MANDATORY on every conversation; any
+      customerId in the agent's customer_info context is informational
+      only and MUST NOT be passed here. Resolve `customerId` like this:
+        1. (Flow 1) Call verifyCustomer with both the last 4 digits of
+           the customer's phone number AND the caller's userNumber from
+           the Connect environment / customer_info context. If it
+           returns a customerId, save and pass it here. If verifyCustomer
+           has already succeeded earlier in THIS conversation, reuse the
+           saved customerId — do NOT call verifyCustomer a second time.
+        2. (Flow 2) If verifyCustomer returned
+           {"error": "CUSTOMER_NOT_FOUND"}, tell the customer that phone
+           number isn't on file and ask for a different full phone number
+           AND the account holder's full name, then call
+           verifyCustomerByPhoneAndName with those values and use the
+           customerId it returns.
+      The `customerId` you pass MUST be the opaque token returned by a
+      verify tool — it is HMAC-signed and validated server-side, so any
+      missing / forged / expired token is rejected with
+      {"error": "MISSING_CUSTOMER_ID"} | {"error": "IDENTITY_INVALID"} |
+      {"error": "IDENTITY_EXPIRED"}. In all three cases, run the
+      appropriate verify tool to mint a fresh token, then retry. Do NOT
+      retry with the same bad value.
 
     PRECONDITIONS (the caller MUST satisfy before invoking this tool):
       - woNumber must be non-empty and match the work-order number format
@@ -635,17 +815,17 @@ def trackRepair(woNumber: str, customerId: str) -> str:
 
     Args:
         woNumber: Work-order number. Required, non-empty, 10-digit numeric.
-        customerId: Authenticated customer identifier. Required. Reuse the value already in the conversation; otherwise obtain via verifyCustomer first.
+        customerId: Opaque short-lived identity token returned by verifyCustomer (Flow 1) or verifyCustomerByPhoneAndName (Flow 2) earlier in THIS conversation. Required. Pass the token verbatim — it is signed and validated server-side. Do NOT invent, edit, summarise, or substitute any value (including any customerId from the agent's customer_info context); the server will reject it with {"error": "IDENTITY_INVALID"}. If the token has expired the server returns {"error": "IDENTITY_EXPIRED"} — call verifyCustomer again to mint a fresh one.
     """
     err = _validate_wo_number(woNumber)
     if err:
         return json.dumps(err)
-    err = _validate_customer_id(customerId)
+    real_customer_id, err = _resolve_customer_id(customerId)
     if err:
         return json.dumps(err)
     result = _call_api("/repair/track", {
         "woNumber": woNumber.strip(),
-        "customerId": customerId.strip(),
+        "customerId": real_customer_id,
     })
     result = _normalize_with_llm(result, TrackResponse, "trackRepair")
     return json.dumps(result)
@@ -656,20 +836,30 @@ def cancelRepair(woNumber: str, customerId: str) -> str:
     """Cancel an existing repair work order by its work-order number.
 
     IDENTITY — read this BEFORE doing anything else:
-      `customerId` authorizes this call. Resolve it in this order:
-        1. If the conversation already has a customerId (from earlier in the
-           conversation, or already provided in the agent's context), pass
-           that. Do NOT ask the customer for verification again.
-        2. Otherwise call verifyCustomer first with the last 4 digits of the
-           customer's phone number, store the returned customerId, and then
-           call this tool with it.
-        3. If verifyCustomer returns {"error": "CUSTOMER_NOT_FOUND"}, ask
-           the customer for a different full phone number AND the account
-           holder's full name, then call verifyCustomerByPhoneAndName with
-           those values. Use the customerId it returns.
-      If `customerId` is missing/empty this tool returns
-      {"error": "MISSING_CUSTOMER_ID"}; in that case run the appropriate
-      verify tool and retry — do NOT retry with an empty customerId.
+      `customerId` authorizes this call and MUST come from a verifyCustomer
+      / verifyCustomerByPhoneAndName call earlier in THIS conversation.
+      Identity verification is MANDATORY on every conversation; any
+      customerId in the agent's customer_info context is informational
+      only and MUST NOT be passed here. Resolve `customerId` like this:
+        1. (Flow 1) Call verifyCustomer with both the last 4 digits of
+           the customer's phone number AND the caller's userNumber from
+           the Connect environment / customer_info context. If it
+           returns a customerId, save and pass it here. If verifyCustomer
+           has already succeeded earlier in THIS conversation, reuse the
+           saved customerId — do NOT call verifyCustomer a second time.
+        2. (Flow 2) If verifyCustomer returned
+           {"error": "CUSTOMER_NOT_FOUND"}, tell the customer that phone
+           number isn't on file and ask for a different full phone number
+           AND the account holder's full name, then call
+           verifyCustomerByPhoneAndName with those values and use the
+           customerId it returns.
+      The `customerId` you pass MUST be the opaque token returned by a
+      verify tool — it is HMAC-signed and validated server-side, so any
+      missing / forged / expired token is rejected with
+      {"error": "MISSING_CUSTOMER_ID"} | {"error": "IDENTITY_INVALID"} |
+      {"error": "IDENTITY_EXPIRED"}. In all three cases, run the
+      appropriate verify tool to mint a fresh token, then retry. Do NOT
+      retry with the same bad value.
 
     PRECONDITIONS (the caller MUST satisfy before invoking this tool):
       - woNumber must be non-empty and match the work-order number format
@@ -684,17 +874,17 @@ def cancelRepair(woNumber: str, customerId: str) -> str:
 
     Args:
         woNumber: Work-order number. Required, non-empty, 10-digit numeric.
-        customerId: Authenticated customer identifier. Required. Reuse the value already in the conversation; otherwise obtain via verifyCustomer first.
+        customerId: Opaque short-lived identity token returned by verifyCustomer (Flow 1) or verifyCustomerByPhoneAndName (Flow 2) earlier in THIS conversation. Required. Pass the token verbatim — it is signed and validated server-side. Do NOT invent, edit, summarise, or substitute any value (including any customerId from the agent's customer_info context); the server will reject it with {"error": "IDENTITY_INVALID"}. If the token has expired the server returns {"error": "IDENTITY_EXPIRED"} — call verifyCustomer again to mint a fresh one.
     """
     err = _validate_wo_number(woNumber)
     if err:
         return json.dumps(err)
-    err = _validate_customer_id(customerId)
+    real_customer_id, err = _resolve_customer_id(customerId)
     if err:
         return json.dumps(err)
     result = _call_api("/repair/cancel", {
         "woNumber": woNumber.strip(),
-        "customerId": customerId.strip(),
+        "customerId": real_customer_id,
     })
     result = _normalize_with_llm(result, CancelResponse, "cancelRepair")
     return json.dumps(result)

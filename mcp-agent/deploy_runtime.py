@@ -61,6 +61,13 @@ NORMALIZE_MODEL_ID_ENV = os.environ.get("NORMALIZE_MODEL_ID", "").strip()
 BEDROCK_REGION_ENV = os.environ.get("BEDROCK_REGION", "").strip()
 NORMALIZE_TIMEOUT_S_ENV = os.environ.get("NORMALIZE_TIMEOUT_S", "").strip()
 
+# Identity-token signing key (server-side hard enforcement of the verify-first
+# flow). Forwarded only when set so the Runtime keeps a stable secret across
+# restarts/replicas; if unset, mcp_server.py falls back to a per-process random
+# secret and logs a WARNING.
+IDENTITY_TOKEN_SECRET_ENV = os.environ.get("IDENTITY_TOKEN_SECRET", "").strip()
+IDENTITY_TOKEN_TTL_S_ENV = os.environ.get("IDENTITY_TOKEN_TTL_S", "").strip()
+
 ECR_URI = f"{ACCOUNT_ID}.dkr.ecr.{REGION}.amazonaws.com/{ECR_REPO_NAME}"
 ROLE_ARN = f"arn:aws:iam::{ACCOUNT_ID}:role/{AGENT_NAME_DASH}-execution-role"
 
@@ -239,6 +246,8 @@ def main():
             **({"NORMALIZE_MODEL_ID": NORMALIZE_MODEL_ID_ENV} if NORMALIZE_MODEL_ID_ENV else {}),
             **({"BEDROCK_REGION": BEDROCK_REGION_ENV} if BEDROCK_REGION_ENV else {}),
             **({"NORMALIZE_TIMEOUT_S": NORMALIZE_TIMEOUT_S_ENV} if NORMALIZE_TIMEOUT_S_ENV else {}),
+            **({"IDENTITY_TOKEN_SECRET": IDENTITY_TOKEN_SECRET_ENV} if IDENTITY_TOKEN_SECRET_ENV else {}),
+            **({"IDENTITY_TOKEN_TTL_S": IDENTITY_TOKEN_TTL_S_ENV} if IDENTITY_TOKEN_TTL_S_ENV else {}),
         },
     )
 
