@@ -192,86 +192,20 @@ MCP server 通过 **AWS Distro for OpenTelemetry (ADOT)** 把 trace / metric / l
 
 **临时关闭 ADOT**（调试需要）：在 Runtime 上设置 `DISABLE_ADOT_OBSERVABILITY=true` 重新部署即可，无需改代码。
 
-## 前置条件
-
-- AWS CLI 已配置
-- Python 3.9+（用于创建本地 venv 跑 boto3）
-- `zip` 命令
-- 后端 Repair API 已部署（提供 `/repair/request`、`/repair/track`、`/repair/cancel`、`/faq/simple`）
-
-> 不需要本地装 Docker，镜像构建在 CodeBuild 上完成。
-> AgentCore Gateway **可选** —— 留空 `GATEWAY_ID` 时部署脚本会自动创建一个 (CUSTOM_JWT)。
-
-## 配置
-
-把 `.env.example` 复制为 `.env`，填写你的配置：
-
-```bash
-cp .env.example .env
-```
-
-`.env` 已在 `.gitignore` 中，不会被提交到 Git。
-
-必填项：
-
-| 变量 | 说明 |
-|------|------|
-| `REGION` | AWS Region，如 `us-east-1` |
-| `ACCOUNT_ID` | AWS 账号 ID |
-| `AGENT_NAME` | Runtime / 资源名（用短横线，如 `connect-repair-mcp-server`） |
-| `ECR_REPO_NAME` | ECR 仓库名 |
-| `TARGET_NAME` | Gateway target 名 |
-| `REPAIR_API_URL` | 后端 API 地址 |
-| `REPAIR_API_KEY` | 后端 API Key |
-
-Gateway 相关（任选其一种模式）：
-
-| 变量 | 说明 |
-|------|------|
-| `GATEWAY_ID` | **复用现有 Gateway**：填入 ID。同时必须填 `GATEWAY_SERVICE_ROLE`（角色名，非 ARN） |
-| `GATEWAY_SERVICE_ROLE` | 现有 Gateway 的 IAM Role **名称** |
-| `GATEWAY_JWT_DISCOVERY_URL` | **自动创建 Gateway**：`GATEWAY_ID` 留空时必填，填 IDP（如 Connect 实例）的 OIDC discovery URL |
-| `GATEWAY_JWT_ALLOWED_AUDIENCE` | 可选；自动创建场景下脚本会**自动**把新 Gateway 的 ID 加到 audience 列表里，这里填的值仅作叠加 |
-| `GATEWAY_JWT_ALLOWED_CLIENTS` | 可选；JWT 允许的 client ID 列表（逗号分隔） |
-
-自动创建模式下，脚本会:
-1. 创建 `${AGENT_NAME}-gw` Gateway：`protocolType=MCP`，`authorizerType=CUSTOM_JWT`
-2. **关键**：`allowedAudience` 设置成 Gateway 自己的 ID。Connect 颁发给该 namespace 的 JWT 中 `aud` claim 等于 Gateway ID，audience 不一致会触发 `insufficient_scope` 错误
-3. 创建并复用 IAM 角色 `${AGENT_NAME}-gateway-role`（带 `InvokeAgentRuntime` + 日志权限）
-
-复用模式下查找现有 Gateway Service Role 名称：
-
-```bash
-.venv/bin/python -c "
-import boto3
-g = boto3.client('bedrock-agentcore-control', region_name='us-east-1') \
-        .get_gateway(gatewayIdentifier='<GATEWAY_ID>')
-print(g['roleArn'].split('/')[-1])"
-```
-
 ## 部署
 
+> 本目录**不再有自己的 `deploy.sh`** —— 在 `quick-mcp` 分支里所有部署逻辑都合并到了仓库根目录的 `midea/deploy.sh`，从 backend API 到 AgentCore Runtime/Gateway/Target 一条命令搞定。详见 [`../README.md`](../README.md)。
+
 ```bash
-cd mcp-agent
-chmod +x deploy.sh
+cd midea           # 注意是上一级目录
+chmod +x deploy.sh cleanup.sh
+cp .env.example .env
 ./deploy.sh
 ```
 
-耗时约 5-10 分钟，脚本依次执行：
+`./deploy.sh` 把这个目录里的源码 (`mcp_server.py`、`Dockerfile`、`requirements.txt`、`buildspec.yml`、`china_regions_pinyin.json`) 打包送进 CodeBuild 构建 ARM64 镜像、创建 Runtime、并自动创建一个 `authorizerType=NONE` 的 Gateway（仅适用于测试 / Quick Desktop & Quick Web 演示）。
 
-| 步骤 | 内容 |
-|-----|------|
-| 1 | 创建 ECR 仓库 |
-| 2 | 打包源码上传 S3 |
-| 3 | 创建 CodeBuild 项目和 IAM 角色 |
-| 4 | CodeBuild 构建 ARM64 镜像推送到 ECR |
-| 5 | 创建 Runtime 执行角色 |
-| 6 | 创建/更新 AgentCore Runtime |
-| 6.5 | **(新)** Gateway 不存在则自动创建（含 IAM 角色） |
-| 7 | 给 Gateway Service Role 加 `InvokeAgentRuntime` 权限 |
-| 8 | 创建/更新 Gateway 的 mcpServer target |
-
-成功后生成 `deployment-info.log`，包含 Runtime ID、ARN、MCP Endpoint 等信息。
+> ⚠️ Inbound auth 是 `NONE` —— 任何拿到 MCP URL 的人都能调你的工具。生产环境请通过 `.env` 的 `GATEWAY_ID` + `GATEWAY_SERVICE_ROLE` 复用一个已经配好 `CUSTOM_JWT` 或 `AWS_IAM` 的 Gateway。
 
 ## 验证
 
@@ -334,10 +268,11 @@ Gateway target 就绪后，去 Amazon Connect 控制台：
 ## 清理
 
 ```bash
+cd midea          # 上一级目录
 ./cleanup.sh
 ```
 
-删除本次部署创建的所有资源（Gateway target、Runtime、ECR、S3、CodeBuild、IAM 角色）。脚本会自动判断 Gateway 是否是它自己创建的：
+按 deploy 的反向顺序拆 Gateway target / Runtime / ECR / S3 / CodeBuild / IAM 角色 / CFN stack / API CFN bucket。脚本会自动判断 Gateway 是否是 deploy.sh 自建的：
 - **复用模式**（`.env` 里给了 `GATEWAY_ID`）：用户提供的 Gateway 与 service role **不会被删**，仅清理 target 和 InvokeAgentRuntime 内联策略
 - **自动创建模式**（`.env` 里 `GATEWAY_ID` 为空）：连同 `${AGENT_NAME}-gw` Gateway 与 `${AGENT_NAME}-gateway-role` 一并删除
 
@@ -357,16 +292,14 @@ python mcp_server.py
 
 | 文件 | 作用 |
 |------|------|
-| `.env.example` | 配置模板（复制为 `.env` 后填写） |
 | `mcp_server.py` | MCP Server 实现（FastMCP + 6 个 tool：2 核验 + 3 repair + 1 FAQ） |
 | `Dockerfile` | ARM64 容器（Python 3.11，非 root 用户） |
 | `requirements.txt` | Python 依赖 |
 | `buildspec.yml` | CodeBuild 构建脚本 |
-| `deploy.sh` | 主部署脚本（Step 1-5 shell，Step 6-8 调 Python） |
-| `deploy_runtime.py` | Step 6-8：Runtime、IAM、Gateway target |
-| `cleanup.sh` | 清理脚本 |
 | `china_regions_pinyin.json` | 中国省/市/区拼音清单（运行时用于地址校验） |
 | `gen_regions.py` | 一次性生成上面 JSON 的脚本（数据源变更时再跑） |
+
+> 部署/清理脚本和 `.env` 模板都在仓库根目录 `midea/`，详见 [`../README.md`](../README.md)。
 
 ## 注意事项
 

@@ -13,6 +13,14 @@
 # Logs
 *.log
 
+# Local config (never commit)
+.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
 # Temporary files
 *.tmp
 *~

@@ -1,6 +1,13 @@
-"""Deploy AgentCore Runtime and add Gateway Target (Steps 6-8 of deploy.sh).
+"""Deploy AgentCore Runtime + Gateway + Target (steps 10-12 of deploy.sh).
 
-Configuration is loaded from the `.env` file in this directory.
+Configuration is loaded from the `.env` file in the same directory as this
+script. Called by the unified `deploy.sh` after the Backend API stack is
+deployed and after the MCP Agent ARM64 image has been pushed to ECR.
+
+The Gateway is created with ``authorizerType=NONE`` (open inbound) for
+testing — anyone with the MCP URL can call the tools. To switch to a
+production-grade Gateway, set ``GATEWAY_ID`` + ``GATEWAY_SERVICE_ROLE`` in
+.env to a Gateway already configured with CUSTOM_JWT or AWS_IAM.
 """
 import json
 import os
@@ -43,28 +50,22 @@ ACCOUNT_ID = _require("ACCOUNT_ID")
 AGENT_NAME_DASH = _require("AGENT_NAME")          # e.g. connect-repair-mcp-server
 AGENT_NAME = AGENT_NAME_DASH.replace("-", "_")     # Runtime names must use underscores
 ECR_REPO_NAME = _require("ECR_REPO_NAME")
-# Gateway is optional — if GATEWAY_ID is empty the script will create one.
+# Gateway is optional. Empty GATEWAY_ID → script auto-creates one with
+# authorizerType=NONE (testing only).
 GATEWAY_ID = os.environ.get("GATEWAY_ID", "").strip()
 GATEWAY_SERVICE_ROLE = os.environ.get("GATEWAY_SERVICE_ROLE", "").strip()
-GATEWAY_JWT_DISCOVERY_URL = os.environ.get("GATEWAY_JWT_DISCOVERY_URL", "").strip()
-GATEWAY_JWT_ALLOWED_AUDIENCE = os.environ.get("GATEWAY_JWT_ALLOWED_AUDIENCE", "").strip()
-GATEWAY_JWT_ALLOWED_CLIENTS = os.environ.get("GATEWAY_JWT_ALLOWED_CLIENTS", "").strip()
 TARGET_NAME = _require("TARGET_NAME")
 
 REPAIR_API_URL = _require("REPAIR_API_URL")
 REPAIR_API_KEY = _require("REPAIR_API_KEY")
 
-# Optional response-normalization knobs — only forwarded to the Runtime when set
-# in .env, otherwise mcp_server.py picks its own defaults.
+# Optional response-normalization knobs.
 NORMALIZE_RESPONSE_ENV = os.environ.get("NORMALIZE_RESPONSE", "").strip()
 NORMALIZE_MODEL_ID_ENV = os.environ.get("NORMALIZE_MODEL_ID", "").strip()
 BEDROCK_REGION_ENV = os.environ.get("BEDROCK_REGION", "").strip()
 NORMALIZE_TIMEOUT_S_ENV = os.environ.get("NORMALIZE_TIMEOUT_S", "").strip()
 
-# Identity-token signing key (server-side hard enforcement of the verify-first
-# flow). Forwarded only when set so the Runtime keeps a stable secret across
-# restarts/replicas; if unset, mcp_server.py falls back to a per-process random
-# secret and logs a WARNING.
+# Identity-token signing key — Runtime must keep a stable secret across replicas.
 IDENTITY_TOKEN_SECRET_ENV = os.environ.get("IDENTITY_TOKEN_SECRET", "").strip()
 IDENTITY_TOKEN_TTL_S_ENV = os.environ.get("IDENTITY_TOKEN_TTL_S", "").strip()
 
@@ -77,7 +78,7 @@ GATEWAY_ROLE_NAME = f"{AGENT_NAME_DASH}-gateway-role"
 
 
 def _ensure_gateway_service_role(iam) -> str:
-    """Create or return the IAM role that the auto-provisioned Gateway uses."""
+    """Create or return the IAM role the auto-provisioned Gateway uses."""
     try:
         role = iam.get_role(RoleName=GATEWAY_ROLE_NAME)
         return role["Role"]["Arn"]
@@ -121,7 +122,12 @@ def _ensure_gateway_service_role(iam) -> str:
 
 
 def _ensure_gateway(control, iam) -> tuple[str, str]:
-    """Return (gateway_id, gateway_service_role_name), creating a Gateway if needed."""
+    """Return (gateway_id, gateway_service_role_name), creating if needed.
+
+    Auto-created Gateway uses ``authorizerType=NONE`` — open inbound, intended
+    for Quick Connect / Quick Web testing. Provide ``GATEWAY_ID`` +
+    ``GATEWAY_SERVICE_ROLE`` in .env to reuse a hardened Gateway instead.
+    """
     global GATEWAY_ID, GATEWAY_SERVICE_ROLE
 
     if GATEWAY_ID:
@@ -131,7 +137,6 @@ def _ensure_gateway(control, iam) -> tuple[str, str]:
         print(f"  Using existing Gateway: {GATEWAY_ID}")
         return GATEWAY_ID, GATEWAY_SERVICE_ROLE
 
-    # Reuse a previously auto-created Gateway with the same name
     paginator = control.get_paginator("list_gateways")
     for page in paginator.paginate():
         for gw in page.get("items", []):
@@ -141,65 +146,18 @@ def _ensure_gateway(control, iam) -> tuple[str, str]:
                 role_name = (GATEWAY_SERVICE_ROLE or GATEWAY_ROLE_NAME)
                 return gw_id, role_name
 
-    if not GATEWAY_JWT_DISCOVERY_URL:
-        print("✗ GATEWAY_ID is empty and GATEWAY_JWT_DISCOVERY_URL is not set.")
-        print("  Either set GATEWAY_ID to use an existing Gateway, or provide JWT")
-        print("  authorizer config (GATEWAY_JWT_DISCOVERY_URL plus AUDIENCE/CLIENTS)")
-        print("  so the script can create one.")
-        sys.exit(1)
-
     role_arn = _ensure_gateway_service_role(iam)
 
-    # Step 1: create the Gateway with a placeholder audience so we can learn its ID.
-    # Connect issues JWTs whose `aud` claim equals the Gateway ID, so the final
-    # allowedAudience must be the Gateway's own ID — but we only know that
-    # post-creation. We immediately update the audience right after.
-    jwt_cfg: dict = {
-        "discoveryUrl": GATEWAY_JWT_DISCOVERY_URL,
-        "allowedAudience": ["__placeholder__"],
-    }
-    extra_clients = [
-        s.strip() for s in GATEWAY_JWT_ALLOWED_CLIENTS.split(",") if s.strip()
-    ]
-    if extra_clients:
-        jwt_cfg["allowedClients"] = extra_clients
-
-    print(f"  Creating Gateway: {GATEWAY_NAME}")
+    print(f"  Creating Gateway: {GATEWAY_NAME} (authorizerType=NONE — testing only)")
     resp = control.create_gateway(
         name=GATEWAY_NAME,
-        description=f"Auto-created Gateway for {AGENT_NAME_DASH}",
+        description=f"Auto-created Gateway for {AGENT_NAME_DASH} (inbound auth disabled)",
         roleArn=role_arn,
         protocolType="MCP",
-        authorizerType="CUSTOM_JWT",
-        authorizerConfiguration={"customJWTAuthorizer": jwt_cfg},
+        authorizerType="NONE",
     )
     gw_id = resp["gatewayId"]
     print(f"  ✓ Gateway created: {gw_id}")
-
-    # Step 2: rewrite allowedAudience to the Gateway's own ID.
-    final_aud = [gw_id]
-    extra_aud = [
-        s.strip() for s in GATEWAY_JWT_ALLOWED_AUDIENCE.split(",") if s.strip()
-    ]
-    for a in extra_aud:
-        if a not in final_aud:
-            final_aud.append(a)
-    final_jwt: dict = {
-        "discoveryUrl": GATEWAY_JWT_DISCOVERY_URL,
-        "allowedAudience": final_aud,
-    }
-    if extra_clients:
-        final_jwt["allowedClients"] = extra_clients
-    control.update_gateway(
-        gatewayIdentifier=gw_id,
-        name=GATEWAY_NAME,
-        description=f"Auto-created Gateway for {AGENT_NAME_DASH}",
-        roleArn=role_arn,
-        protocolType="MCP",
-        authorizerType="CUSTOM_JWT",
-        authorizerConfiguration={"customJWTAuthorizer": final_jwt},
-    )
-    print(f"  ✓ allowedAudience set to {final_aud}")
     return gw_id, GATEWAY_ROLE_NAME
 
 
@@ -207,8 +165,8 @@ def main():
     control = boto3.client("bedrock-agentcore-control", region_name=REGION)
     iam = boto3.client("iam")
 
-    # Step 6: Create or Update Runtime
-    print("Step 6/8: AgentCore Runtime (MCP)")
+    # Step 10: Create or update Runtime
+    print("Step 10/12: AgentCore Runtime (MCP)")
     runtime_id = None
 
     paginator = control.get_paginator("list_agent_runtimes")
@@ -238,9 +196,8 @@ def main():
             "REPAIR_API_URL": REPAIR_API_URL,
             "REPAIR_API_KEY": REPAIR_API_KEY,
             # OTEL service.name — used by Strands/ADOT to tag spans in CloudWatch
-            # GenAI Observability. The rest of the OTEL_EXPORTER_* vars are
-            # injected automatically by AgentCore Runtime when Tracing is enabled
-            # on the runtime resource.
+            # GenAI Observability. Other OTEL_EXPORTER_* vars are injected by
+            # AgentCore Runtime when Tracing is enabled on the runtime.
             "OTEL_SERVICE_NAME": AGENT_NAME,
             **({"NORMALIZE_RESPONSE": NORMALIZE_RESPONSE_ENV} if NORMALIZE_RESPONSE_ENV else {}),
             **({"NORMALIZE_MODEL_ID": NORMALIZE_MODEL_ID_ENV} if NORMALIZE_MODEL_ID_ENV else {}),
@@ -264,7 +221,6 @@ def main():
     resp = control.get_agent_runtime(agentRuntimeId=runtime_id)
     runtime_arn = resp["agentRuntimeArn"]
 
-    # Wait for READY
     print("  Waiting for READY...")
     for i in range(60):
         resp = control.get_agent_runtime(agentRuntimeId=runtime_id)
@@ -282,12 +238,10 @@ def main():
         print("  ✗ Timeout waiting for READY")
         sys.exit(1)
 
-    # Step 6.5: Ensure Gateway exists (auto-create if user didn't provide one)
-    print("\nEnsuring AgentCore Gateway")
+    # Step 11: Ensure Gateway and grant Gateway role InvokeAgentRuntime
+    print("\nStep 11/12: AgentCore Gateway")
     gateway_id, gateway_service_role = _ensure_gateway(control, iam)
 
-    # Step 7: Ensure Gateway service role can invoke this runtime
-    print("\nStep 7/8: Gateway IAM Permission")
     policy_doc = json.dumps({
         "Version": "2012-10-17",
         "Statement": [{
@@ -302,18 +256,17 @@ def main():
         PolicyName="InvokeAgentRuntimePolicy",
         PolicyDocument=policy_doc,
     )
-    print("  ✓ InvokeAgentRuntime permission added")
+    print("  ✓ InvokeAgentRuntime granted to Gateway role")
     time.sleep(10)
 
-    # Step 8: Gateway Target
-    print("\nStep 8/8: Gateway Target (mcpServer)")
+    # Step 12: Gateway Target (mcpServer)
+    print("\nStep 12/12: Gateway Target")
     encoded_arn = quote(runtime_arn, safe="")
     mcp_endpoint = (
         f"https://bedrock-agentcore.{REGION}.amazonaws.com"
         f"/runtimes/{encoded_arn}/invocations?qualifier=DEFAULT"
     )
 
-    # Check existing targets
     targets_resp = control.list_gateway_targets(gatewayIdentifier=gateway_id)
     existing_target_id = None
     for t in targets_resp.get("items", []):
@@ -323,7 +276,6 @@ def main():
 
     if existing_target_id:
         print(f"  Target exists: {existing_target_id}")
-        print("  Synchronizing tools...")
         try:
             control.synchronize_gateway_targets(
                 gatewayIdentifier=gateway_id,
@@ -372,30 +324,34 @@ def main():
             print("  ✗ Timeout waiting for target READY")
             sys.exit(1)
 
-    # Summary
+    # Resolve the public Gateway URL so users can wire it into Quick Connect / Quick Web.
+    gateway_url = control.get_gateway(gatewayIdentifier=gateway_id).get("gatewayUrl", "")
+
     print(f"\n{'='*50}")
-    print("Deployment Complete!")
+    print("MCP Agent deployed")
     print(f"{'='*50}")
-    print(f"Agent Runtime ID:  {runtime_id}")
-    print(f"Agent Runtime ARN: {runtime_arn}")
+    print(f"Runtime ID:        {runtime_id}")
+    print(f"Runtime ARN:       {runtime_arn}")
     print(f"MCP Endpoint:      {mcp_endpoint}")
     print(f"Gateway ID:        {gateway_id}")
+    print(f"Gateway URL:       {gateway_url}")
+    print(f"Gateway authorizer: NONE (testing — open inbound)")
     print(f"Gateway Role:      {gateway_service_role}")
     print(f"Target Name:       {TARGET_NAME}")
-    print(f"\nMCP Tools: verifyCustomer, verifyCustomerByPhoneAndName, requestRepair, trackRepair, cancelRepair")
+    print(f"\nMCP Tools: verifyCustomer, verifyCustomerByPhoneAndName, "
+          f"requestRepair, trackRepair, cancelRepair, faqSearch")
 
-    # Save info
-    with open("deployment-info.log", "w") as f:
-        f.write(f"=== MCP Agent Deployment Info ===\n")
-        f.write(f"Region: {REGION}\n")
-        f.write(f"Agent Runtime ID: {runtime_id}\n")
-        f.write(f"Agent Runtime ARN: {runtime_arn}\n")
-        f.write(f"ECR Image: {ECR_URI}:latest\n")
-        f.write(f"MCP Endpoint: {mcp_endpoint}\n")
-        f.write(f"Gateway ID: {gateway_id}\n")
-        f.write(f"Gateway Service Role: {gateway_service_role}\n")
-        f.write(f"Target Name: {TARGET_NAME}\n")
-        f.write(f"CodeBuild: {AGENT_NAME_DASH}-build\n")
+    with open("deployment-info-runtime.log", "w") as f:
+        f.write(f"Runtime ID:        {runtime_id}\n")
+        f.write(f"Runtime ARN:       {runtime_arn}\n")
+        f.write(f"ECR Image:         {ECR_URI}:latest\n")
+        f.write(f"MCP Endpoint:      {mcp_endpoint}\n")
+        f.write(f"Gateway ID:        {gateway_id}\n")
+        f.write(f"Gateway URL:       {gateway_url}\n")
+        f.write(f"Gateway authorizer: NONE (testing — open inbound)\n")
+        f.write(f"Gateway Role:      {gateway_service_role}\n")
+        f.write(f"Target Name:       {TARGET_NAME}\n")
+        f.write(f"CodeBuild Project: {AGENT_NAME_DASH}-build\n")
 
 
 if __name__ == "__main__":

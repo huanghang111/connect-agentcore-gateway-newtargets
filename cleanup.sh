@@ -1,56 +1,290 @@
 #!/bin/bash
-# 清理脚本
+# Unified cleanup — tears down everything created by deploy.sh in reverse order.
+# Idempotent: missing resources are skipped, not treated as errors.
 
 set -e
+cd "$(dirname "$0")"
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-STACK_NAME="${STACK_NAME:-connect-repair-api-stack}"
+if [ ! -f ".env" ]; then
+    echo -e "${RED}✗ .env not found. Nothing to clean up — or run deploy.sh first.${NC}"
+    exit 1
+fi
+set -a
+# shellcheck disable=SC1091
+source .env
+set +a
+
 REGION="${REGION:-us-east-1}"
 
-if [ -z "${AWS_ACCOUNT_ID:-}" ]; then
-    AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)"
+if [ -z "${ACCOUNT_ID:-}" ]; then
+    ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)"
 fi
-if [ -z "${AWS_ACCOUNT_ID}" ]; then
-    echo "无法获取 AWS 账号 ID。请先登录 AWS CLI。"
+if [ -z "${ACCOUNT_ID}" ]; then
+    echo -e "${RED}✗ Cannot resolve AWS account.${NC}"
     exit 1
 fi
 
-BUCKET_NAME="${BUCKET_NAME:-connect-repair-api-${AWS_ACCOUNT_ID}-${REGION}}"
+STACK_NAME="${STACK_NAME:-connect-repair-api-stack}"
+BUCKET_NAME="${BUCKET_NAME:-connect-repair-api-${ACCOUNT_ID}-${REGION}}"
+AGENT_NAME="${AGENT_NAME:-connect-repair-mcp-server}"
+ECR_REPO_NAME="${ECR_REPO_NAME:-connect-repair-mcp-server}"
+TARGET_NAME="${TARGET_NAME:-connect-repair-mcp-agent}"
 
-echo -e "${YELLOW}=== 清理资源 ===${NC}\n"
+GATEWAY_ID="${GATEWAY_ID:-}"
+GATEWAY_SERVICE_ROLE="${GATEWAY_SERVICE_ROLE:-}"
+AUTO_GATEWAY_NAME="${AGENT_NAME}-gw"
+AUTO_GATEWAY_ROLE="${AGENT_NAME}-gateway-role"
 
-# 删除CloudFormation stack
-echo -e "\n${YELLOW}删除CloudFormation stack...${NC}"
-aws cloudformation delete-stack \
-  --stack-name ${STACK_NAME} \
-  --region ${REGION}
-echo -e "${GREEN}✓ Stack删除请求已提交${NC}"
+RUNTIME_NAME="${AGENT_NAME//-/_}"
+CODEBUILD_PROJECT_NAME="${AGENT_NAME}-build"
+CODEBUILD_ROLE_NAME="${AGENT_NAME}-codebuild-role"
+S3_BUCKET="${AGENT_NAME}-source-${ACCOUNT_ID}"
+EXECUTION_ROLE_NAME="${AGENT_NAME}-execution-role"
 
-echo -e "\n${YELLOW}等待Stack删除完成...${NC}"
-aws cloudformation wait stack-delete-complete \
-  --stack-name ${STACK_NAME} \
-  --region ${REGION}
-echo -e "${GREEN}✓ Stack删除完成${NC}"
+echo -e "${YELLOW}=== Connect Repair — unified cleanup ===${NC}"
+echo "  Account: ${ACCOUNT_ID}"
+echo "  Region:  ${REGION}"
+echo ""
 
-# 删除S3 bucket (可选)
-echo -e "\n${YELLOW}是否删除S3 bucket? (y/N)${NC}"
-read -p "> " DELETE_BUCKET
-if [ "$DELETE_BUCKET" = "y" ] || [ "$DELETE_BUCKET" = "Y" ]; then
-    echo -e "${YELLOW}删除S3 bucket...${NC}"
-    aws s3 rb s3://${BUCKET_NAME} --force --region ${REGION} 2>/dev/null || true
-    echo -e "${GREEN}✓ Bucket删除完成${NC}"
+# Resolve a Python interpreter with a fresh enough boto3 (must expose
+# iamCredentialProvider on the AgentCore Gateway Target schema).
+check_schema() {
+    "$1" - <<'PY' >/dev/null 2>&1
+import sys, boto3
+try:
+    op = boto3.client("bedrock-agentcore-control", region_name="us-east-1") \
+        .meta.service_model.operation_model("CreateGatewayTarget")
+    fields = op.input_shape.members["credentialProviderConfigurations"] \
+        .member.members["credentialProvider"].members
+    sys.exit(0 if "iamCredentialProvider" in fields else 1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+if python3 -c 'import boto3' >/dev/null 2>&1 && check_schema "$(command -v python3)"; then
+    PY="$(command -v python3)"
 else
-    echo -e "${YELLOW}跳过S3 bucket删除${NC}"
+    if [ ! -x ./.venv/bin/python ]; then
+        echo "  Creating .venv ..."
+        python3 -m venv .venv
+    fi
+    if ! check_schema ./.venv/bin/python; then
+        echo "  Installing/upgrading boto3 into .venv ..."
+        ./.venv/bin/pip install --upgrade pip 'boto3>=1.43.0' 'botocore>=1.43.0' -q
+    fi
+    if ! check_schema ./.venv/bin/python; then
+        echo -e "${RED}✗ boto3 schema still missing iamCredentialProvider after upgrade${NC}"
+        exit 1
+    fi
+    PY="./.venv/bin/python"
 fi
 
-# 删除部署信息文件
-if [ -f "deployment-info.log" ]; then
-    rm deployment-info.log
-    echo -e "${GREEN}✓ 部署信息文件已删除${NC}"
+# Resolve Gateway ID — explicit (.env) or auto-created by deploy.sh
+RESOLVED_GATEWAY_ID=$("$PY" -c "
+import boto3
+c = boto3.client('bedrock-agentcore-control', region_name='${REGION}')
+explicit = '${GATEWAY_ID}'.strip()
+if explicit:
+    print(explicit)
+else:
+    for page in c.get_paginator('list_gateways').paginate():
+        for gw in page.get('items', []):
+            if gw.get('name') == '${AUTO_GATEWAY_NAME}':
+                print(gw['gatewayId'])
+                break
+        else:
+            continue
+        break
+" 2>/dev/null || echo "")
+
+GATEWAY_AUTO_CREATED="no"
+if [ -z "${GATEWAY_ID}" ] && [ -n "$RESOLVED_GATEWAY_ID" ]; then
+    GATEWAY_AUTO_CREATED="yes"
 fi
 
-echo -e "\n${GREEN}=== 清理完成 ===${NC}\n"
+RESOLVED_GATEWAY_ROLE="${GATEWAY_SERVICE_ROLE:-${AUTO_GATEWAY_ROLE}}"
+
+# ============================================================
+# PART B (reverse order) — MCP Agent first
+# ============================================================
+echo -e "${YELLOW}=== MCP Agent ===${NC}"
+
+# Step 1: Gateway Target
+echo -e "${YELLOW}Step 1/9: Remove Gateway Target${NC}"
+if [ -n "$RESOLVED_GATEWAY_ID" ]; then
+    TARGET_ID=$("$PY" -c "
+import boto3
+c = boto3.client('bedrock-agentcore-control', region_name='${REGION}')
+resp = c.list_gateway_targets(gatewayIdentifier='${RESOLVED_GATEWAY_ID}')
+for t in resp.get('items', []):
+    if t.get('name') == '${TARGET_NAME}':
+        print(t['targetId'])
+        break
+" 2>/dev/null || echo "")
+    if [ -n "$TARGET_ID" ]; then
+        "$PY" -c "
+import boto3
+c = boto3.client('bedrock-agentcore-control', region_name='${REGION}')
+c.delete_gateway_target(gatewayIdentifier='${RESOLVED_GATEWAY_ID}', targetId='${TARGET_ID}')
+print('  ✓ Gateway target deleted: ${TARGET_ID}')
+" 2>/dev/null || echo "  Failed to delete target"
+    else
+        echo "  No target found"
+    fi
+else
+    echo "  No Gateway resolved, skipping"
+fi
+echo ""
+
+# Step 2: Gateway IAM inline policy
+echo -e "${YELLOW}Step 2/9: Remove Gateway IAM Policy${NC}"
+if aws iam get-role --role-name "${RESOLVED_GATEWAY_ROLE}" >/dev/null 2>&1; then
+    aws iam delete-role-policy \
+        --role-name "${RESOLVED_GATEWAY_ROLE}" \
+        --policy-name InvokeAgentRuntimePolicy 2>/dev/null && \
+        echo -e "${GREEN}✓ Gateway IAM policy removed${NC}" || \
+        echo "  No InvokeAgentRuntimePolicy found"
+else
+    echo "  Gateway role not found, skipping"
+fi
+echo ""
+
+# Step 3: AgentCore Runtime
+echo -e "${YELLOW}Step 3/9: Delete AgentCore Runtime${NC}"
+RUNTIME_ID=$("$PY" -c "
+import boto3
+client = boto3.client('bedrock-agentcore-control', region_name='${REGION}')
+resp = client.list_agent_runtimes()
+for rt in resp.get('agentRuntimes', []):
+    if rt['agentRuntimeName'] == '${RUNTIME_NAME}':
+        print(rt['agentRuntimeId'])
+        break
+" 2>/dev/null || echo "")
+
+if [ -n "$RUNTIME_ID" ]; then
+    "$PY" -c "
+import boto3
+client = boto3.client('bedrock-agentcore-control', region_name='${REGION}')
+client.delete_agent_runtime(agentRuntimeId='${RUNTIME_ID}')
+print('  ✓ Runtime deleted: ${RUNTIME_ID}')
+" 2>/dev/null || echo "  Failed to delete runtime"
+else
+    echo "  No runtime found"
+fi
+echo ""
+
+# Step 4: CodeBuild project
+echo -e "${YELLOW}Step 4/9: Delete CodeBuild project${NC}"
+if aws codebuild batch-get-projects --names "${CODEBUILD_PROJECT_NAME}" --region "${REGION}" \
+    --query "projects[0].name" --output text 2>/dev/null | grep -q "${CODEBUILD_PROJECT_NAME}"; then
+    aws codebuild delete-project --name "${CODEBUILD_PROJECT_NAME}" --region "${REGION}"
+    echo -e "${GREEN}✓ CodeBuild project deleted${NC}"
+else
+    echo "  No CodeBuild project found"
+fi
+echo ""
+
+# Step 5: MCP Agent S3 bucket
+echo -e "${YELLOW}Step 5/9: Delete MCP source S3 bucket${NC}"
+if aws s3 ls "s3://${S3_BUCKET}" --region "${REGION}" >/dev/null 2>&1; then
+    aws s3 rb "s3://${S3_BUCKET}" --force --region "${REGION}"
+    echo -e "${GREEN}✓ S3 bucket deleted${NC}"
+else
+    echo "  No S3 bucket found"
+fi
+echo ""
+
+# Step 6: ECR repository
+echo -e "${YELLOW}Step 6/9: Delete ECR repository${NC}"
+if aws ecr describe-repositories --repository-names "${ECR_REPO_NAME}" --region "${REGION}" >/dev/null 2>&1; then
+    aws ecr delete-repository \
+        --repository-name "${ECR_REPO_NAME}" \
+        --region "${REGION}" \
+        --force >/dev/null
+    echo -e "${GREEN}✓ ECR repo deleted${NC}"
+else
+    echo "  No ECR repo found"
+fi
+echo ""
+
+# Step 6.5: Auto-created Gateway (only if we created it)
+if [ "$GATEWAY_AUTO_CREATED" = "yes" ] && [ -n "$RESOLVED_GATEWAY_ID" ]; then
+    echo -e "${YELLOW}Step 6.5/9: Delete auto-created Gateway${NC}"
+    "$PY" -c "
+import boto3
+c = boto3.client('bedrock-agentcore-control', region_name='${REGION}')
+c.delete_gateway(gatewayIdentifier='${RESOLVED_GATEWAY_ID}')
+print('  ✓ Gateway deleted: ${RESOLVED_GATEWAY_ID}')
+" 2>/dev/null || echo "  Failed to delete gateway"
+
+    if aws iam get-role --role-name "${AUTO_GATEWAY_ROLE}" >/dev/null 2>&1; then
+        aws iam delete-role-policy --role-name "${AUTO_GATEWAY_ROLE}" --policy-name gateway-default 2>/dev/null || true
+        aws iam delete-role-policy --role-name "${AUTO_GATEWAY_ROLE}" --policy-name InvokeAgentRuntimePolicy 2>/dev/null || true
+        aws iam delete-role --role-name "${AUTO_GATEWAY_ROLE}" 2>/dev/null && \
+            echo -e "${GREEN}✓ Auto-created Gateway role deleted${NC}" || \
+            echo "  Failed to delete gateway role"
+    fi
+    echo ""
+fi
+
+# Step 7: Runtime + CodeBuild IAM roles
+echo -e "${YELLOW}Step 7/9: Delete IAM roles (execution + codebuild)${NC}"
+if aws iam get-role --role-name "${EXECUTION_ROLE_NAME}" >/dev/null 2>&1; then
+    aws iam delete-role-policy --role-name "${EXECUTION_ROLE_NAME}" --policy-name ecr-and-logs 2>/dev/null || true
+    aws iam delete-role-policy --role-name "${EXECUTION_ROLE_NAME}" --policy-name bedrock-invoke-model 2>/dev/null || true
+    aws iam delete-role-policy --role-name "${EXECUTION_ROLE_NAME}" --policy-name otel-observability 2>/dev/null || true
+    aws iam detach-role-policy --role-name "${EXECUTION_ROLE_NAME}" \
+        --policy-arn arn:aws:iam::aws:policy/BedrockAgentCoreFullAccess 2>/dev/null || true
+    aws iam delete-role --role-name "${EXECUTION_ROLE_NAME}"
+    echo -e "${GREEN}✓ Execution role deleted${NC}"
+else
+    echo "  No execution role found"
+fi
+
+if aws iam get-role --role-name "${CODEBUILD_ROLE_NAME}" >/dev/null 2>&1; then
+    aws iam delete-role-policy --role-name "${CODEBUILD_ROLE_NAME}" --policy-name codebuild-policy 2>/dev/null || true
+    aws iam delete-role --role-name "${CODEBUILD_ROLE_NAME}"
+    echo -e "${GREEN}✓ CodeBuild role deleted${NC}"
+else
+    echo "  No CodeBuild role found"
+fi
+echo ""
+
+# ============================================================
+# PART A — Backend API
+# ============================================================
+echo -e "${YELLOW}=== Backend Repair API ===${NC}"
+
+# Step 8: CFN stack
+echo -e "${YELLOW}Step 8/9: Delete CloudFormation stack${NC}"
+if aws cloudformation describe-stacks --stack-name "${STACK_NAME}" --region "${REGION}" >/dev/null 2>&1; then
+    aws cloudformation delete-stack --stack-name "${STACK_NAME}" --region "${REGION}"
+    echo "  Waiting for stack delete..."
+    aws cloudformation wait stack-delete-complete --stack-name "${STACK_NAME}" --region "${REGION}"
+    echo -e "${GREEN}✓ Stack deleted${NC}"
+else
+    echo "  No stack found"
+fi
+echo ""
+
+# Step 9: API CFN bucket
+echo -e "${YELLOW}Step 9/9: Delete API CFN S3 bucket${NC}"
+if aws s3 ls "s3://${BUCKET_NAME}" --region "${REGION}" >/dev/null 2>&1; then
+    aws s3 rb "s3://${BUCKET_NAME}" --force --region "${REGION}" 2>/dev/null || true
+    echo -e "${GREEN}✓ Bucket deleted${NC}"
+else
+    echo "  No bucket found"
+fi
+echo ""
+
+# Local logs
+[ -f deployment-info.log ] && rm -f deployment-info.log && echo -e "${GREEN}✓ deployment-info.log removed${NC}"
+[ -f deployment-info-runtime.log ] && rm -f deployment-info-runtime.log && echo -e "${GREEN}✓ deployment-info-runtime.log removed${NC}"
+
+echo -e "\n${GREEN}=== Cleanup complete ===${NC}"
