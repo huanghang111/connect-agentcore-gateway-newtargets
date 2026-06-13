@@ -115,7 +115,8 @@ paths:
         work-order number. The caller is expected to validate that woNumber is a
         non-empty WO-YYYY-NNNN string before invoking this endpoint. customerId
         (the verified caller phone number) is required — a customer may only see
-        work orders that belong to their own company.
+        work orders that belong to their own company; a work order owned by a
+        different customer returns 404 (its existence is not revealed).
       tags:
         - Repair Service
       security:
@@ -137,7 +138,7 @@ paths:
                   example: 'WO-2026-0001'
                 customerId:
                   type: string
-                  description: Verified caller identity (the customer's phone number) forwarded by the MCP server. Used to enforce ticket ownership.
+                  description: Verified caller identity (the customer's phone number) forwarded by the MCP server. Used to enforce ticket ownership — a work order owned by a different customer returns 404.
                   example: '13800018888'
       responses:
         '200':
@@ -232,8 +233,9 @@ paths:
         is expected to validate that woNumber is a non-empty WO-YYYY-NNNN string
         and to obtain explicit user confirmation before invoking this endpoint,
         since cancellation is destructive. customerId (the verified caller phone
-        number) is required — a customer may only cancel their own company's work
-        orders.
+        number) is required — a customer may only cancel work orders that belong
+        to their own company; a work order owned by a different customer returns
+        404 (its existence is not revealed).
       tags:
         - Repair Service
       security:
@@ -255,7 +257,7 @@ paths:
                   example: 'WO-2026-0001'
                 customerId:
                   type: string
-                  description: Verified caller identity (the customer's phone number) forwarded by the MCP server. Used to enforce ticket ownership.
+                  description: Verified caller identity (the customer's phone number) forwarded by the MCP server. Used to enforce ticket ownership — a work order owned by a different customer returns 404.
                   example: '13800018888'
       responses:
         '200':

@@ -189,27 +189,28 @@ else
 fi
 echo ""
 
-# 测试10: 预置工单 - 本人可查询 (WO-2026-0001 属于 13800018888)
-echo -e "${YELLOW}测试 10: 预置工单本人查询 (WO-2026-0001)${NC}"
+# 测试10: 预置工单查询 (WO-2026-0001, 任意已核身客户均可查)
+echo -e "${YELLOW}测试 10: 预置工单查询 (WO-2026-0001)${NC}"
 RESPONSE=$(curl -s -X POST "$API_URL/repair/track" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
   --data-raw '{"woNumber":"WO-2026-0001","customerId":"13800018888"}')
 
 if echo "$RESPONSE" | grep -q "Repair ticket found"; then
-    echo -e "${GREEN}✓ 预置工单查询成功（本人）${NC}"
+    echo -e "${GREEN}✓ 预置工单查询成功${NC}"
 else
     echo -e "${RED}✗ 预置工单查询失败${NC}"
     echo "$RESPONSE"
 fi
 echo ""
 
-# 测试11: 工单归属 - 他人查询应返回 404 (不暴露存在)
-echo -e "${YELLOW}测试 11: 工单归属校验 - 他人查询 WO-2026-0001${NC}"
+# 测试11: 工单归属校验 - 他人查询应返回 404 (不暴露存在)
+# WO-2026-0003 属于顺丰(13688881234), 用华创(13800018888)的身份查应返回 not found
+echo -e "${YELLOW}测试 11: 工单归属校验 - 他人查询 WO-2026-0003${NC}"
 RESPONSE=$(curl -s -X POST "$API_URL/repair/track" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  --data-raw '{"woNumber":"WO-2026-0001","customerId":"13688881234"}')
+  --data-raw '{"woNumber":"WO-2026-0003","customerId":"13800018888"}')
 
 if echo "$RESPONSE" | grep -q "not found"; then
     echo -e "${GREEN}✓ 归属校验正确（他人查询返回 not found）${NC}"

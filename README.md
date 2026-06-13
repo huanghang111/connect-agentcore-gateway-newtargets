@@ -29,12 +29,12 @@ chmod +x deploy.sh cleanup.sh test-api.sh
 
 | Tool | 入参 | 功能 | 校验 |
 |------|------|------|------|
-| `verifyCustomer` | `smsToken` (口述手机号后 4 位), `userNumber` (LLM 从 customer_info 取) | 主核身：MCP 比对 `userNumber[-4:] == smsToken` 后签发短期 HMAC token 当作 `customerId` 返回 | 末 4 位本地比对，不一致 → `CUSTOMER_NOT_FOUND` |
-| `verifyCustomerByPhoneAndName` | `phoneNumber`, `fullName` | Fallback 核身（流程 1 失败后才用） | stub：手机号末 4 位 `0000` 时 `CUSTOMER_NOT_FOUND` |
-| `requestRepair` | `productCategory`(机器人品类), `productsubCategory`(对应部件), `description`, `brand`, `customerId` (必填); `productModel`, `serialNumber` (可选) | 创建机器人维修工单，返回 WO-YYYY-NNNN 工单号 | 品类+部件组合校验；必填字段在 Lambda 端校验；`customerId` token HMAC 验签 |
-| `trackRepair` | `woNumber`, `customerId` | 查询工单状态（仅限本人/本公司工单） | woNumber 必须为 WO-YYYY-NNNN；token 验签；后端按 `customerPhone` 做归属校验 |
-| `cancelRepair` | `woNumber`, `customerId` | 取消工单（仅限本人/本公司工单） | 同上；幂等：已 cancelled / completed 返 `409` |
+| `requestRepair` | `productCategory`(机器人品类), `productsubCategory`(对应部件), `description`, `brand`, `callerName`(口述姓名), `callerPhoneTail`(口述手机号后 4 位) (必填); `productModel`, `serialNumber` (可选) | 创建机器人维修工单，返回 WO-YYYY-NNNN 工单号 | 品类+部件组合校验；必填字段在 Lambda 端校验；每次调用用【姓名 + 后 4 位】在客户注册表中重新核身（无状态、不缓存），命中后解析出该客户完整手机号作为工单属主 |
+| `trackRepair` | `woNumber`, `callerName`, `callerPhoneTail` | 查询工单状态（仅能查本公司工单） | woNumber 必须为 WO-YYYY-NNNN；每次重新核身；后端强制归属校验：工单 `customerPhone` ≠ 核身手机号 → `404` |
+| `cancelRepair` | `woNumber`, `callerName`, `callerPhoneTail` | 取消工单（仅能取消本公司工单） | 同上；归属不符 → `404`；幂等：已 cancelled / completed 返 `409` |
 | `faqSearch` | `query` | FAQ 关键字检索 | — |
+
+> **身份模型**：没有独立的核身工具，也没有任何 token / 缓存。每个 repair 工具都自带 `callerName`（公司名或联系人名，宽松匹配）+ `callerPhoneTail`（手机号后 4 位），MCP server 在 **每次调用** 时用这两个值在客户注册表（6 个客户，后 4 位互不相同）中查唯一客户、解析出完整手机号，无状态、不记录核身结果。命中失败 → `CUSTOMER_NOT_FOUND`；`callerName` 为空 → `INVALID_NAME`；`callerPhoneTail` 不是 4 位数字 → `INVALID_SMS_TOKEN`。
 
 详细的 docstring / 错误码 / 归一化规范见 [`mcp-agent/README.md`](mcp-agent/README.md)。
 
@@ -99,7 +99,6 @@ GATEWAY_ID=                         # 留空 → 自动创建一个 NONE auth Ga
 GATEWAY_SERVICE_ROLE=
 REPAIR_API_URL=                     # 由 deploy.sh 自动填
 REPAIR_API_KEY=                     # 由 deploy.sh 自动填
-IDENTITY_TOKEN_SECRET=              # 留空 → 首次部署自动 openssl rand -hex 32 写回
 ```
 
 ### Quick Desktop / Quick Web 接入
@@ -139,12 +138,12 @@ midea/
 ├── deploy.sh                  # 统一部署脚本（API + MCP Agent + Gateway 一条命令）
 ├── deploy_runtime.py          # Steps 10-12 (Runtime + Gateway + Target，被 deploy.sh 调用)
 ├── cleanup.sh                 # 统一清理脚本（reverse order）
-├── test-api.sh                # Backend API 端到端测试（含工单归属校验）
+├── test-api.sh                # Backend API 端到端测试
 ├── connect-api-customer.yaml  # CloudFormation 模板（含 Lambda inline code + 10 张预置工单 seed）
 ├── connect-api-openapi.yaml   # OpenAPI 规范
 └── mcp-agent/                 # MCP Server Agent 源码（被 deploy.sh 打包后送进 CodeBuild）
     ├── README.md              # MCP Server 详细文档（工具签名 / docstring / 错误码 / 归一化）
-    ├── mcp_server.py          # FastMCP server (6 tools)
+    ├── mcp_server.py          # FastMCP server (4 tools)
     ├── Dockerfile             # ARM64 容器
     ├── requirements.txt
     └── buildspec.yml

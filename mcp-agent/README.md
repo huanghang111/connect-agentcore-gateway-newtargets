@@ -1,6 +1,6 @@
 # Connect Repair MCP Server
 
-把 Repair Service 工具封装成 MCP Server，部署到 AgentCore Runtime，通过 AgentCore Gateway 暴露给 Amazon Connect AI Agent。包含两个轻量身份核验工具（`verifyCustomer` + fallback `verifyCustomerByPhoneAndName`）、三个 repair 业务工具和一个 FAQ 检索工具。
+把 Repair Service 工具封装成 MCP Server，部署到 AgentCore Runtime，通过 AgentCore Gateway 暴露给 Amazon Connect AI Agent。共 **4 个工具**：三个 repair 业务工具（`requestRepair` / `trackRepair` / `cancelRepair`）和一个 FAQ 检索工具（`faqSearch`）。身份不再由独立的核身工具处理 —— 三个 repair 工具各自携带 `callerName` + `callerPhoneTail`，**每次调用都在服务端无状态重新核身**（不签发任何 token、不缓存任何核身结果）。
 
 ## 架构
 
@@ -12,123 +12,105 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 
 | Tool | 功能 | 入参（前置校验要求见 docstring） |
 |------|------|----------|
-| `verifyCustomer` | 主核身（流程 1，每通电话必跑）：让客户口述手机号后 4 位（`smsToken`），由 LLM 从 Connect AI Agent 系统上下文的 `<customer_info>` 块里读出 `userNumber`（需要在 Orchestration Prompt 模板里写一行 `- userNumber: {{$.Custom.userNumber}}`，并在 Contact Flow 里通过 `Set contact attributes` 把这次通话的 userNumber 写进 `Custom.userNumber`）一并传给本工具。MCP 校验 `userNumber` 末 4 位 == `smsToken` 一致后**签发一个 HMAC token** 当作 `customerId` 返回（底层真实 customerId 直接复用 `userNumber`） | `smsToken`(4 位数字) 必填；`userNumber`(LLM 从 customer_info 里取) |
-| `verifyCustomerByPhoneAndName` | Fallback 核身（流程 2）：用**完整手机号 + 姓名**查到客户后签发 token；仅在 `verifyCustomer` 返回 `CUSTOMER_NOT_FOUND` 后调用（stub：手机号末 4 位为 `0000` 时返回 `CUSTOMER_NOT_FOUND`，其他底层 customerId 为**完整手机号**本身） | `phoneNumber`(纯数字 6–15 位)、`fullName` 必填 |
-| `requestRepair` | 创建机器人维修工单 | `productCategory`(机器人品类), `productsubCategory`(对应部件), `description`, `brand`, `customerId` 必填；`productModel`, `serialNumber` 可选 |
-| `trackRepair` | 查询工单状态（仅限本人/本公司工单） | `woNumber`(WO-YYYY-NNNN)、`customerId`，工具内强制校验 |
-| `cancelRepair` | 取消工单（仅限本人/本公司工单） | `woNumber`(WO-YYYY-NNNN)、`customerId`，工具内强制校验 |
+| `requestRepair` | 创建机器人维修工单（每次调用内联核身 + 解析工单属主手机号） | `productCategory`(机器人品类), `productsubCategory`(对应部件), `description`, `brand`, `callerName`(姓名), `callerPhoneTail`(后 4 位) 必填；`productModel`, `serialNumber` 可选 |
+| `trackRepair` | 查询工单状态（每次调用内联核身；后端强制归属，仅能查本公司工单） | `woNumber`(WO-YYYY-NNNN), `callerName`, `callerPhoneTail`，工具内强制校验 |
+| `cancelRepair` | 取消工单（每次调用内联核身；后端强制归属，仅能取消本公司工单） | `woNumber`(WO-YYYY-NNNN), `callerName`, `callerPhoneTail`，工具内强制校验 |
 | `faqSearch` | FAQ 知识库自然语言检索（产品使用 / 故障排查 / 保修 / 维修） | `query`(任意自然语言问题) 必填 |
 
-> **设计原则**：所有 tool 的使用方式都写在各自的 docstring 顶部，LLM 通过 `toolConfigurationList` 拿到 description 即可正确使用，**Connect AI Agent 的 Orchestration Prompt 只需要做一处身份相关改动**（在 `<customer_info>` 块里加一行 `- userNumber: {{$.Custom.userNumber}}`，并在 Contact Flow 里把这通电话的 userNumber 写进 `Custom.userNumber` 属性）；其余所有约束（包括"必须先核身"）都内置在 MCP server 的工具签名 + 服务端校验里。
+> **设计原则**：所有 tool 的使用方式都写在各自的 docstring 顶部，LLM 通过 `toolConfigurationList` 拿到 description 即可正确使用。身份相关的约束全部内置在 MCP server 的工具签名 + 服务端校验里 —— **Connect AI Agent 的 Orchestration Prompt 不需要任何身份相关改动**（不再需要 `<customer_info>` / `userNumber` / Contact Flow 属性）。AI Agent 只需在调用任一 repair 工具前问客户要**姓名（公司名或联系人名）+ 手机号后 4 位**，并把它们作为 `callerName` / `callerPhoneTail` 随每次调用一起传入。
 >
-> ⚠️ **不要使用** Connect AI Agent 的 "Function input parameters → Set manually / Set dynamically" 来注入 `userNumber`：经端到端验证（Wisdom transcript + Gateway APPLICATION_LOGS 双向交叉对照），该 UI 配置在 **MCP Gateway 类型工具上不会生效** —— 配置可以保存，但 Connect 在转发 `tools/call` 时不会把它合并进 arguments。必须走"customer_info + LLM 主动取"这条路径。
+> ⚠️ **每次操作都要重新问身份，绝不复用**：每查/取消/创建**一张**工单，LLM 都必须**重新向客户询问**姓名+后 4 位，**不要**沿用上一张工单或上一轮对话里客户给过的身份。原因：不同工单可能属于不同公司（如先查顺丰的 WO-2026-0003 用"李强/1234"，再查中电光伏的 WO-2026-0004 必须改用"王建国/4321"，否则归属校验返回 404）。工具 docstring 已用强指令要求 LLM 每次重新询问；但这依赖 Quick / Connect 端 LLM 的行为 —— 服务端无状态、无法强制 LLM 是否重新提问，只能靠 docstring 引导。若实测 LLM 仍复用上一单身份，需在 Quick 的 AI Agent 指令里补一句"每次工单操作前都要重新确认客户姓名和手机号后 4 位"。
 >
-> **身份核验流程**（每通电话强制执行，由 MCP server 服务端硬性兜底）：
-> 1. **流程 1（主核身，每通电话必跑）**：机器人提示用户口述手机号后 4 位 → LLM 从系统上下文 `<customer_info>` 块里读出 `userNumber`（需要 Orchestration Prompt 里有一行 `- userNumber: {{$.Custom.userNumber}}`，且 Contact Flow 已经把这通电话的 userNumber 写进 `Custom.userNumber` 属性）→ LLM 调 `verifyCustomer(smsToken=4 位数字, userNumber=<从 customer_info 取到的值>)` → MCP 在服务端比较 `userNumber[-4:] == smsToken`，一致才放行并签发 token，真实底层 customerId 复用 `userNumber` 本身 → 成功返回 `{"customerId": "<token>"}`。这里的 `customerId` 是 MCP server 用 HMAC-SHA256 签发的**短期 token**（默认 60 分钟），**不是**真实的 customerId 字符串。⚠️ Connect AI Agent 的 "Function input parameters → Set manually" 在 MCP Gateway 类型工具上经验证不会被注入，因此不要依赖那条路径，必须靠 customer_info + LLM 主动取。
-> 2. **整通电话复用一次核身**：Agent 把这个 token 保存在对话上下文里，后续 `requestRepair` / `trackRepair` / `cancelRepair` 一律把它当作 `customerId` 透传给 MCP server；MCP server 验签后取出真实 customerId 再打到后端。
-> 3. **流程 2（fallback）**：流程 1 返回 `{"error": "CUSTOMER_NOT_FOUND"}`（口述后 4 位与 `userNumber` 末 4 位不一致）或 `{"error": "INVALID_USER_NUMBER"}`（Connect 没透传 `userNumber` 或长度不足 4）时进入此分支。Agent 提示"该手机号查不到客户信息，请提供另一个完整手机号 + 姓名"，收齐两个字段后调 `verifyCustomerByPhoneAndName(phoneNumber, fullName)`。命中同样返回 `{"customerId": "<token>"}`；若再次 `CUSTOMER_NOT_FOUND`，**不要循环**，转人工。
-> 4. **服务端硬性兜底**：三个 repair tool 在入口处对 `customerId` 进行 HMAC 验签 + 过期检查。任何**没跑过 verify**、**篡改 token**、或**幻觉编造 customerId** 的调用一律被拦下：
->    - `MISSING_CUSTOMER_ID`：参数为空
->    - `IDENTITY_INVALID`：不是合法 token / 签名不匹配 / payload 损坏
->    - `IDENTITY_EXPIRED`：token 已过期，需要重新走 verify
+> **身份模型（无状态、每次重新核身、不记录结果）**：
+> 1. **不再有独立的核身工具，也没有任何 token / HMAC / 缓存**。三个 repair 工具各自携带 `callerName` + `callerPhoneTail`，MCP server 在 **每一次调用** 时通过 `_authenticate_caller` 用这两个值在 `CUSTOMER_REGISTRY` 中查唯一客户。核身结果**不被保存**，下一次调用照样重新核一遍。
+> 2. **匹配规则**：`callerName` 匹配为**宽松**（公司名 / 联系人名 / 完整 "公司-联系人" 串任一命中，大小写、空格不敏感）；`callerPhoneTail` 必须是手机号的**后 4 位**（恰好 4 位数字）。6 个注册客户的后 4 位互不相同，故【姓名 + 后 4 位】可唯一定位一个客户。命中后解析出该客户的**完整手机号**，作为工单属主 / 归属校验键。
+> 3. **服务端硬性校验**：repair 工具在入口处先核身，任何**姓名为空**、**后 4 位格式不对**、或**查不到匹配客户**的调用一律被拦下、不打后端：
+>    - `INVALID_NAME`：`callerName` 为空
+>    - `INVALID_SMS_TOKEN`：`callerPhoneTail` 不是恰好 4 位数字
+>    - `CUSTOMER_NOT_FOUND`：注册表里没有同时匹配【姓名 + 后 4 位】的客户
 >
->    无论 LLM 看不看得懂 prompt、有没有被劫持，**只要它没拿到 verify tool 颁发的合法 token，就一行后端接口都打不出去**。
+>    无论 LLM 看不看得懂 prompt、有没有被劫持，**只要 `callerName` + `callerPhoneTail` 不能在注册表里唯一命中一个客户，就一行后端接口都打不出去**。
+> 4. **归属校验（后端强制）**：核身解析出的完整手机号会作为 `customerId` 透传给后端。`requestRepair` 把它写进工单 `customerPhone`（工单属主）；`trackRepair` / `cancelRepair` 在后端只返回 / 取消 `customerPhone === <核身手机号>` 的工单，否则返回 `404`（不泄露工单是否存在）。**一个客户只能看到 / 取消本公司的工单**。
 >
-> **签名密钥配置**：
-> - **首次部署**：`.env` 里 `IDENTITY_TOKEN_SECRET=` 留空即可，`deploy.sh` 会自动跑一次 `openssl rand -hex 32` 生成 32 字节密钥并**回写到 `.env`**，之后每次部署都复用同一份 secret（避免重新部署把所有在线通话的 token 全废掉）
-> - **轮换**：把 `.env` 里那一行清空再 `./deploy.sh` —— 会重新生成并回写；副作用是当前所有在线 token 立即失效，客户需要重新报手机后 4 位
-> - **不要在 `.env` 里直接写 `$(openssl rand -hex 32)`** —— `deploy.sh` 用 `set -a; source .env`，会在每次部署时重新执行子 shell，相当于每次都换密钥，**正在通话中的客户全部 token 失效**
-> - 不设也没回写时（比如 CI 直接跑 `mcp_server.py`）server 会用进程内随机 secret 并打 WARNING，单副本调试可用，但 Runtime 重启或扩成多副本后所有已发 token 立即失效
-> - Token TTL 默认 3600 秒（60 分钟，覆盖典型通话时长），可通过 `IDENTITY_TOKEN_TTL_S` 调整
+> **客户注册表（核身真值源）**：身份校验以 `mcp_server.py` 顶部的 `CUSTOMER_REGISTRY`（手机号 → "公司-联系人"）为准。
 >
-> **Stub 测试触发器**：在真实身份 API 接通前，`verifyCustomer` 的"对得上 / 对不上"完全由 Agent 传进来的 `userNumber` 控制 —— 只要让 `smsToken` 与 `userNumber` 末 4 位不一致就能复现 `CUSTOMER_NOT_FOUND`，把 `userNumber` 留空或不到 4 位即可复现 `INVALID_USER_NUMBER`，两者都会驱动 Agent 走 fallback。`verifyCustomerByPhoneAndName` 仍保留幻数：`phoneNumber` 末 4 位为 `0000` 时返回 `CUSTOMER_NOT_FOUND`，模拟"再次找不到"的人工兜底分支；其余情况底层 customerId 即**完整手机号**本身（与 Flow 1 一致），用于后端按手机号做工单归属校验。
+> | 客户 | 手机号 | 后 4 位 |
+> |------|--------|---------|
+> | 华创智联-张伟 | 13800018888 | 8888 |
+> | 顺丰物流-李强 | 13688881234 | 1234 |
+> | 中电光伏-王建国 | 13755554321 | 4321 |
+> | 京东亚洲一号-赵明 | 13566667890 | 7890 |
+> | 国药集团-陈芳 | 13322223456 | 3456 |
+> | 万达商管-周鹏 | 13177778901 | 8901 |
+>
+> **为什么用"姓名 + 后 4 位"而不是主叫号**：Connect / Quick 环境可能注入错误或占位的主叫号（实测 Quick 填了 `13800138888`，真实是 `13800018888`），所以核身只认客户口述的【姓名 + 后 4 位】，不再有任何 `userNumber` 入参。⚠️ 前提：6 个客户的手机号后 4 位互不相同。
+>
+> **测试触发器**：复现 `CUSTOMER_NOT_FOUND` 的方式 —— 姓名 + 后 4 位查不到任何登记客户（如报"李强"配后 4 位 8888，或后 4 位 9999）；`callerName` 留空得 `INVALID_NAME`；`callerPhoneTail` 非 4 位数字得 `INVALID_SMS_TOKEN`。复现归属 `404`：用一个客户的姓名+后 4 位去 `trackRepair` / `cancelRepair` 另一家公司名下的工单。
 
 每个 tool 的 docstring 顶部都列出了 **PRECONDITIONS**，明确字段在调用前必须满足的约束（机器人品类 + 对应部件的组合校验、型号/SN）。
 
 ### 接口契约速查（MCP tool ↔ 后端 API）
 
-> 三个 repair tool 收到的 `customerId`（核身后即客户手机号）会透传给后端。`requestRepair` 把它写进工单的 `customerPhone`（工单属主）；`trackRepair` / `cancelRepair` 用它做**工单归属校验** —— 后端比对 `ticket.customerPhone === customerId`，不属于本人/本公司的工单一律返回 `404`（不暴露其存在）。
+> 三个 repair tool 在入口处用 `callerName` + `callerPhoneTail` 内联核身（每次调用都重新核，无缓存），解析出客户的**完整手机号**后作为 `customerId` 透传给后端。`requestRepair` 把它写进工单的 `customerPhone`（工单属主）。`trackRepair` / `cancelRepair` 在后端做**归属校验**：只返回 / 取消 `customerPhone === <核身手机号>` 的工单，否则 `404`（不泄露工单是否存在）—— 一个客户只能查 / 取消本公司工单。
 > 全部三个 repair tool 都会在拿到后端响应后过一次 Strands+Bedrock 归一化（详见上面的"响应归一化"章节），表里的"出参"指的就是归一化后的 schema —— 也是 LLM 实际看到的字段。
 
-#### 1. `verifyCustomer` — 主核身（无后端 API，纯本地比对）
+#### 1. `requestRepair` — 创建工单
 
 | 项 | 内容 |
 |----|------|
-| 入参 | `smsToken: str`(4 位数字，客户口述，**LLM 必填**); `userNumber: str`(LLM 从 `<customer_info>` 块的 `- userNumber: <digits>` 行原样读出后传入，digits-only) |
-| 本地校验失败 | `{"error":"INVALID_SMS_TOKEN"}` / `{"error":"INVALID_USER_NUMBER"}` |
-| 比对规则 | `userNumber[-4:] == smsToken` 才算通过；不一致 → `CUSTOMER_NOT_FOUND` |
-| 成功出参 | `{"customerId":"<HMAC token，形如 base64url(payload).base64url(sig)>"}` —— 短期签名 token，token 内嵌的真实 customerId 即 `userNumber` 本身，repair tool 透传后服务端验签后再打到后端 |
-| 失败出参 | `{"error":"CUSTOMER_NOT_FOUND","message":"... fall back to verifyCustomerByPhoneAndName"}` 或 `{"error":"INVALID_USER_NUMBER","message":"..."}` |
-| 后端 API | 无（接入真实身份 API 时改写 `_verify_phone_tail_to_customer_id`，tool 签名不变） |
-
-#### 2. `verifyCustomerByPhoneAndName` — Fallback 核身（无后端 API，纯 stub）
-
-| 项 | 内容 |
-|----|------|
-| 入参 | `phoneNumber: str`(6–15 位纯数字), `fullName: str`(非空) |
-| 本地校验失败 | `{"error":"INVALID_PHONE_NUMBER" \| "INVALID_NAME"}` |
-| Stub 触发 | `phoneNumber` 末 4 位为 `0000` → `CUSTOMER_NOT_FOUND`（**不再循环，提示转人工**）；其余情况底层 customerId 即**完整手机号**本身 |
-| 成功出参 | `{"customerId":"<HMAC token>"}` —— 同 `verifyCustomer`，是签名 token 不是真实 ID |
-| 失败出参 | `{"error":"CUSTOMER_NOT_FOUND","message":"... do NOT loop"}` |
-| 后端 API | 无 |
-
-#### 3. `requestRepair` — 创建工单
-
-| 项 | 内容 |
-|----|------|
-| MCP 入参（必填） | `productCategory`, `productsubCategory`, `description`, `brand`, `customerId` |
+| MCP 入参（必填） | `productCategory`, `productsubCategory`, `description`, `brand`, `callerName`, `callerPhoneTail` |
 | MCP 入参（可选） | `productModel`, `serialNumber` |
-| MCP 本地校验 | `MISSING_CUSTOMER_ID` / `INVALID_CATEGORY` / `INVALID_SUB_CATEGORY`（详见下面的"服务端校验"） |
+| MCP 本地校验 | `INVALID_NAME`(`callerName` 空) / `INVALID_SMS_TOKEN`(`callerPhoneTail` 非 4 位数字) / `CUSTOMER_NOT_FOUND`(姓名+后4位无匹配) / `INVALID_CATEGORY` / `INVALID_SUB_CATEGORY`（详见下面的"服务端校验"） |
+| 核身 | `_authenticate_caller(callerName, callerPhoneTail)` → `CUSTOMER_REGISTRY` 唯一命中后解析出完整手机号，作为下面 body 里的 `customerId` |
 | 后端 endpoint | `POST {REPAIR_API_URL}/repair/request`，header `X-API-Key: <REPAIR_API_KEY>` |
-| 后端 body | `{productCategory, productsubCategory, productModel, serialNumber, description, brand, customerId}`（camelCase） |
+| 后端 body | `{productCategory, productsubCategory, productModel, serialNumber, description, brand, customerId}`（camelCase；`customerId` = 核身解析出的完整手机号，**不是** `callerName`/`callerPhoneTail`） |
 | 后端必填校验 | `productCategory, productsubCategory, description, brand, customerId` 缺任意一个 → `400 {"error":"Missing required fields: ..."}` |
 | 后端写库 | DynamoDB `RepairTicketsTable` PutItem：`ticketNumber`(WO-YYYY-NNNN) + 上面所有字段 + `customerPhone`(=customerId, 工单属主) + `status:"pending"` + `priority:"P2"` + `createdAt` + `updatedAt` |
 | 后端响应（201） | `{"message":"Repair ticket created successfully","ticketNumber":"...","ticket":{...}}` |
 | MCP 归一化出参（`RequestResponse`） | `{woNumber, created(bool), status, scheduledAt, message}` |
 
-#### 4. `trackRepair` — 查询工单
+#### 2. `trackRepair` — 查询工单
 
 | 项 | 内容 |
 |----|------|
-| MCP 入参（必填） | `woNumber`(WO-YYYY-NNNN), `customerId` |
-| MCP 本地校验 | `INVALID_WO_NUMBER` / `MISSING_CUSTOMER_ID` |
+| MCP 入参（必填） | `woNumber`(WO-YYYY-NNNN), `callerName`, `callerPhoneTail` |
+| MCP 本地校验 | `INVALID_WO_NUMBER` / `INVALID_NAME` / `INVALID_SMS_TOKEN` / `CUSTOMER_NOT_FOUND` |
+| 核身 | 同上，解析出完整手机号作为 body 里的 `customerId` |
 | 后端 endpoint | `POST {REPAIR_API_URL}/repair/track`，header `X-API-Key: <REPAIR_API_KEY>` |
-| 后端 body | `{woNumber, customerId}` |
-| 后端必填校验 | `woNumber` 必须 WO-YYYY-NNNN 格式；`customerId` 必填，用于**工单归属校验**（`ticket.customerPhone !== customerId` → `404`） |
-| 后端响应（200） | `{"message":"Repair ticket found","ticket":{ticketNumber,status,priority,productCategory,productsubCategory,productModel,serialNumber,brand,customerName,customerPhone,description,createdAt,updatedAt}}`；找不到/非属主 → `404` |
+| 后端 body | `{woNumber, customerId}`（`customerId` = 核身解析出的完整手机号） |
+| 后端必填校验 | `woNumber` 必须 WO-YYYY-NNNN 格式；**归属强制**：仅当 `ticket.customerPhone === customerId` 才返回，否则（含工单不存在 / 属于别家公司）→ `404` |
+| 后端响应（200） | `{"message":"Repair ticket found","ticket":{ticketNumber,status,priority,productCategory,productsubCategory,productModel,serialNumber,brand,customerName,customerPhone,description,createdAt,updatedAt}}`；不属于本客户或不存在 → `404` |
 | MCP 归一化出参（`TrackResponse`） | `{woNumber, status, statusDescription, scheduledAt, technicianName, technicianPhone, address, lastUpdatedAt, remarks}` |
 
-#### 5. `cancelRepair` — 取消工单
+#### 3. `cancelRepair` — 取消工单
 
 | 项 | 内容 |
 |----|------|
-| MCP 入参（必填） | `woNumber`(WO-YYYY-NNNN), `customerId` |
-| MCP 本地校验 | `INVALID_WO_NUMBER` / `MISSING_CUSTOMER_ID` |
+| MCP 入参（必填） | `woNumber`(WO-YYYY-NNNN), `callerName`, `callerPhoneTail` |
+| MCP 本地校验 | `INVALID_WO_NUMBER` / `INVALID_NAME` / `INVALID_SMS_TOKEN` / `CUSTOMER_NOT_FOUND` |
+| 核身 | 同上，解析出完整手机号作为 body 里的 `customerId` |
 | 后端 endpoint | `POST {REPAIR_API_URL}/repair/cancel`，header `X-API-Key: <REPAIR_API_KEY>` |
-| 后端 body | `{woNumber, customerId}` |
-| 后端必填校验 | `woNumber` 必须 WO-YYYY-NNNN 格式；`customerId` 必填，用于**工单归属校验**（`ticket.customerPhone !== customerId` → `404`） |
-| 后端响应（200） | `{"message":"Repair ticket cancelled","ticketNumber":"...","status":"cancelled"}`；找不到/非属主 → `404`；状态已是 `cancelled`/`completed` → `409 {"error":"Work order is already ...","status":"..."}` |
+| 后端 body | `{woNumber, customerId}`（`customerId` = 核身解析出的完整手机号） |
+| 后端必填校验 | `woNumber` 必须 WO-YYYY-NNNN 格式；**归属强制**：仅当 `ticket.customerPhone === customerId` 才取消，否则（含工单不存在 / 属于别家公司）→ `404` |
+| 后端响应（200） | `{"message":"Repair ticket cancelled","ticketNumber":"...","status":"cancelled"}`；不属于本客户或不存在 → `404`；状态已是 `cancelled`/`completed` → `409 {"error":"Work order is already ...","status":"..."}` |
 | MCP 归一化出参（`CancelResponse`） | `{woNumber, cancelled(bool), status, message}` |
 
 #### 错误码速查（MCP 本地拦截，不会打到后端）
 
 | 错误码 | 触发位置 |
 |--------|---------|
-| `INVALID_SMS_TOKEN` | `verifyCustomer` |
-| `INVALID_USER_NUMBER` | `verifyCustomer`（`userNumber` 缺失或长度不足 4） |
-| `CUSTOMER_NOT_FOUND` | `verifyCustomer` / `verifyCustomerByPhoneAndName` |
-| `INVALID_PHONE_NUMBER` / `INVALID_NAME` | `verifyCustomerByPhoneAndName` |
-| `MISSING_CUSTOMER_ID` | `requestRepair` / `trackRepair` / `cancelRepair`（参数为空） |
-| `IDENTITY_INVALID` | `requestRepair` / `trackRepair` / `cancelRepair`（token 非法 / 篡改 / LLM 幻觉） |
-| `IDENTITY_EXPIRED` | `requestRepair` / `trackRepair` / `cancelRepair`（token 超过 `IDENTITY_TOKEN_TTL_S`） |
+| `INVALID_NAME` | `requestRepair` / `trackRepair` / `cancelRepair`（`callerName` 为空） |
+| `INVALID_SMS_TOKEN` | `requestRepair` / `trackRepair` / `cancelRepair`（`callerPhoneTail` 非恰好 4 位数字） |
+| `CUSTOMER_NOT_FOUND` | `requestRepair` / `trackRepair` / `cancelRepair`（姓名 + 后 4 位在注册表里查不到唯一客户） |
 | `INVALID_CATEGORY` | `requestRepair`（品类不在 4 类机器人内） |
 | `INVALID_SUB_CATEGORY` | `requestRepair`（部件不属于该品类） |
 | `INVALID_WO_NUMBER` | `trackRepair` / `cancelRepair` |
+| `HTTP 404`（归属 / 不存在） | `trackRepair` / `cancelRepair`：工单 `customerPhone` 与核身手机号不符，或工单不存在（不区分，避免泄露存在性） |
 | `HTTP 400/404/409/500` | 后端透传，归一化时直接跳过（错误路径保持确定） |
 
 ### 服务端校验（`requestRepair`）
 
-除了 `customerId` / 工单号格式校验之外，`requestRepair` 在打到后端之前会再做一层本地校验，校验失败立刻返回错误、不发出网络请求：
+除了内联核身（`callerName` + `callerPhoneTail`）之外，`requestRepair` 在打到后端之前会再做一层本地校验，校验失败立刻返回错误、不发出网络请求：
 
 | 字段 | 规则 | 失败时返回 |
 |------|------|------------|
@@ -172,8 +154,6 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 | `NORMALIZE_MODEL_ID` | `us.anthropic.claude-haiku-4-5-20251001-v1:0` | Bedrock inference profile / model ID |
 | `BEDROCK_REGION` | 同 `AWS_REGION`（默认 `us-east-1`） | 哪个 region 调 Bedrock |
 | `NORMALIZE_TIMEOUT_S` | `4` | 单次归一化的 read timeout（秒），超时 fail-soft 退回原始响应 |
-| `IDENTITY_TOKEN_SECRET` | 进程内随机（仅调试可用） | 身份 token HMAC 密钥；首次部署时 `.env` 留空，`deploy.sh` 会自动 `openssl rand -hex 32` 并回写 |
-| `IDENTITY_TOKEN_TTL_S` | `3600` | 身份 token 有效期（秒），过期返回 `IDENTITY_EXPIRED` 强制重新核身 |
 
 部署脚本已经给 Runtime execution role 加了 `bedrock:InvokeModel` 权限（针对 foundation-model + inference-profile 资源），所以重新跑一次 `./deploy.sh` 即可生效；如要换模型，改 `.env` 里的 `NORMALIZE_MODEL_ID` 再重新部署即可。
 
@@ -244,32 +224,20 @@ Gateway target 就绪后，去 Amazon Connect 控制台：
 
 1. **AI Agent Designer** → 选择 AI Agent → **Add tool** → **Add existing AI Tool**
 2. Namespace 选 `gateway_<gateway-name>`
-3. 把这六个 AI Tool 都加进来（每次重复 Add existing AI Tool）：
-   - `connect-repair-mcp-agent___verifyCustomer`
-   - `connect-repair-mcp-agent___verifyCustomerByPhoneAndName`
+3. 把这四个 AI Tool 都加进来（每次重复 Add existing AI Tool）：
    - `connect-repair-mcp-agent___requestRepair`
    - `connect-repair-mcp-agent___trackRepair`
    - `connect-repair-mcp-agent___cancelRepair`
    - `connect-repair-mcp-agent___faqSearch`
-4. 每个 tool 的 **Output Filters** → Select Property Keys 里加 `result`（必须勾选，否则 LLM 读不到 `customerId` 等返回值）
-5. **不要**在 `verifyCustomer` 上配 Function input parameters（已验证不生效，详见上面的设计原则提示）
-6. 编辑 AI Agent 的 **Orchestration Prompt**，在 `<customer_info>` 块里加一行（如已有 `phoneNumber` 等字段可以保留）：
-   ```
-   <customer_info>
-   - userNumber: {{$.Custom.userNumber}}
-   - BU: {{$.Custom.BU}}
-   </customer_info>
-   ```
-   LLM 会把这里的 `userNumber` 当作 `verifyCustomer` 的 `userNumber` 入参原样传给 MCP server。
-7. 在对应的 **Contact Flow** 里加一个 **Set contact attributes** block，destination=*User Defined*，key=`userNumber`，value 来自 lookup（CRM / DynamoDB / Lambda）或对接系统已知字段；Custom attribute 的命名要和上一步 Orchestration Prompt 里的占位符一致。
-8. 点 **Update / Publish** 保存 AI Agent。
+4. 每个 tool 的 **Output Filters** → Select Property Keys 里加 `result`（必须勾选，否则 LLM 读不到工单号等返回值）
+5. 身份核验**无需**任何 Connect 侧配置（不再需要 `userNumber` / `customer_info` / Contact Flow 属性 / token 复用）。AI Agent 会按各 repair 工具 docstring 的要求，在调用前主动问客户要**姓名（公司名或联系人名）+ 手机号后 4 位**，并作为 `callerName` / `callerPhoneTail` 随每次 `requestRepair` / `trackRepair` / `cancelRepair` 调用一起传入。
+6. 点 **Update / Publish** 保存 AI Agent。
 
 > **更新工具签名后必须重做引用**：MCP server 修改 tool 签名（参数名/必填项变化）并重新 deploy 后，AI Agent 持有的是更早部署时的工具描述快照。Gateway target 同步只刷新 Gateway 侧 schema，AI Agent 侧不会自动跟随。需要在 AI Agent Designer 里把这些工具 **Remove → 再 Add 回来**，让它拉到新 schema，否则 LLM 会按旧签名调用。
 
-> **如何快速诊断 verifyCustomer 失败**：
-> - 看 **AgentCore Gateway APPLICATION_LOGS**（log group `/aws/vendedlogs/bedrock-agentcore/gateway/APPLICATION_LOGS/<gateway-name>`）的 `tools/call` 行，确认 `arguments` 里是否有 `userNumber`。没有 → 上下文里取不到。
-> - 看 **Connect Wisdom transcript**（log group `/aws/connect/wisdom/<assistant-id>`）的 `TRANSCRIPT_AGENTIC_MESSAGE` 里 `prompt.system` 中 `<customer_info>` 块是否真有 `- userNumber: <digits>`。空值或字段缺失 → Orchestration Prompt 模板没生效，或 Contact Flow 没写入对应 Custom attribute。
-> - 同一 transcript 里 `TRANSCRIPT_LARGE_LANGUAGE_MODEL_INVOCATION.completion.toolUseList[].toolInput` 是 LLM 实际生成的入参，跟 Gateway 收到的 arguments 对比可以判断"丢字段"是 LLM 端还是 Connect 端发生的。
+> **如何快速诊断核身失败**：
+> - 看 **AgentCore Gateway APPLICATION_LOGS**（log group `/aws/vendedlogs/bedrock-agentcore/gateway/APPLICATION_LOGS/<gateway-name>`，需在 Gateway 上启用日志）的 `tools/call` 行，确认 `arguments` 里的 `callerName` 和 `callerPhoneTail` 是否是客户口述的正确值。
+> - 命中规则：`callerName`（公司/人名/完整串任一）+ `callerPhoneTail`（手机号后 4 位）必须同时匹配 `CUSTOMER_REGISTRY` 里的同一条客户。查询/取消时还要求工单 `customerPhone` 等于核身解析出的手机号，否则后端返回 `404`。
 
 ## 清理
 
@@ -298,7 +266,7 @@ python mcp_server.py
 
 | 文件 | 作用 |
 |------|------|
-| `mcp_server.py` | MCP Server 实现（FastMCP + 6 个 tool：2 核验 + 3 repair + 1 FAQ） |
+| `mcp_server.py` | MCP Server 实现（FastMCP + 4 个 tool：3 repair + 1 FAQ；repair 工具内联无状态核身） |
 | `Dockerfile` | ARM64 容器（Python 3.11，非 root 用户） |
 | `requirements.txt` | Python 依赖 |
 | `buildspec.yml` | CodeBuild 构建脚本 |
