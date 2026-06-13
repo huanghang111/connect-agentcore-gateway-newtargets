@@ -17,27 +17,28 @@ if [ -z "$API_URL" ] || [ -z "$API_KEY" ]; then
     exit 1
 fi
 
-echo -e "${YELLOW}=== Midea Repair Service API 测试 ===${NC}\n"
+echo -e "${YELLOW}=== Industrial Robot Repair Service API 测试 ===${NC}\n"
 echo "API URL: $API_URL"
 echo "API Key: ${API_KEY:0:10}..."
 echo ""
+
+# 核身后的 customerId（即客户手机号），由 MCP server 转发；直连后端测试时手动带上
+CUSTOMER_ID="13800018888"
 
 # 测试1: 创建维修工单
 echo -e "${YELLOW}测试 1: 创建维修工单${NC}"
 RESPONSE=$(curl -s -X POST "$API_URL/repair/request" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{
-    "productCategory": "Refrigerator",
-    "productsubCategory": "French Door",
-    "productModel": "MF200W90BE",
-    "serialNumber": "SN20231015ABC123",
-    "brand": "AnyCompany",
-    "province": "NY",
-    "city": "New York",
-    "district": "Manhattan",
-    "description": "Refrigerator not cooling properly, temperature not going down. Customer already tried unplugging for 10 minutes."
-  }')
+  -d "{
+    \"productCategory\": \"仓储机器人\",
+    \"productsubCategory\": \"导航传感器\",
+    \"productModel\": \"WR-500 #7\",
+    \"serialNumber\": \"SN20231015ABC123\",
+    \"brand\": \"中科机器人\",
+    \"description\": \"导航传感器异常，频繁偏航，需要现场标定。\",
+    \"customerId\": \"$CUSTOMER_ID\"
+  }")
 
 if echo "$RESPONSE" | grep -q "ticketNumber"; then
     TICKET_NUMBER=$(echo "$RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin)['ticketNumber'], end='')")
@@ -55,7 +56,7 @@ sleep 1
 
 # 测试2: 查询工单状态
 echo -e "${YELLOW}测试 2: 查询工单状态${NC}"
-JSON_DATA=$(printf '{"woNumber":"%s"}' "$TICKET_NUMBER")
+JSON_DATA=$(printf '{"woNumber":"%s","customerId":"%s"}' "$TICKET_NUMBER" "$CUSTOMER_ID")
 RESPONSE=$(curl -s -X POST "$API_URL/repair/track" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
@@ -73,12 +74,12 @@ else
 fi
 echo ""
 
-# 测试3: FAQ查询 - 空调重置
-echo -e "${YELLOW}测试 3: FAQ查询 - 空调重置${NC}"
+# 测试3: FAQ查询 - 导航偏航
+echo -e "${YELLOW}测试 3: FAQ查询 - 导航偏航${NC}"
 RESPONSE=$(curl -s -X POST "$API_URL/faq/simple" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"query": "How do I reset my air conditioner?"}')
+  -d '{"query": "仓储机器人频繁偏航怎么办"}')
 
 if echo "$RESPONSE" | grep -q "results"; then
     COUNT=$(echo "$RESPONSE" | grep -o '"count":[0-9]*' | cut -d':' -f2)
@@ -91,12 +92,12 @@ else
 fi
 echo ""
 
-# 测试4: FAQ查询 - 冰箱噪音
-echo -e "${YELLOW}测试 4: FAQ查询 - 冰箱噪音${NC}"
+# 测试4: FAQ查询 - 电池续航
+echo -e "${YELLOW}测试 4: FAQ查询 - 电池续航${NC}"
 RESPONSE=$(curl -s -X POST "$API_URL/faq/simple" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"query": "refrigerator making noise"}')
+  -d '{"query": "机器人电池续航下降"}')
 
 if echo "$RESPONSE" | grep -q "results"; then
     COUNT=$(echo "$RESPONSE" | grep -o '"count":[0-9]*' | cut -d':' -f2)
@@ -114,7 +115,7 @@ echo -e "${YELLOW}测试 5: 错误处理 - 缺少必需参数${NC}"
 RESPONSE=$(curl -s -X POST "$API_URL/repair/request" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"productCategory": "Refrigerator"}')
+  -d '{"productCategory": "仓储机器人"}')
 
 if echo "$RESPONSE" | grep -q "Missing required fields"; then
     echo -e "${GREEN}✓ 错误处理正确${NC}"
@@ -130,7 +131,7 @@ echo -e "${YELLOW}测试 6: 错误处理 - 工单不存在${NC}"
 RESPONSE=$(curl -s -X POST "$API_URL/repair/track" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  --data-raw '{"woNumber":"9999999999"}')
+  --data-raw "{\"woNumber\":\"WO-2026-9999\",\"customerId\":\"$CUSTOMER_ID\"}")
 
 if echo "$RESPONSE" | grep -q "not found"; then
     echo -e "${GREEN}✓ 错误处理正确${NC}"
@@ -146,9 +147,9 @@ echo -e "${YELLOW}测试 7: 错误处理 - 非法 woNumber${NC}"
 RESPONSE=$(curl -s -X POST "$API_URL/repair/track" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  --data-raw '{"woNumber":"abc"}')
+  --data-raw "{\"woNumber\":\"abc\",\"customerId\":\"$CUSTOMER_ID\"}")
 
-if echo "$RESPONSE" | grep -q "10-digit"; then
+if echo "$RESPONSE" | grep -q "WO-YYYY-NNNN"; then
     echo -e "${GREEN}✓ 错误处理正确${NC}"
 else
     echo -e "${RED}✗ 错误处理异常${NC}"
@@ -158,7 +159,7 @@ echo ""
 
 # 测试8: 取消工单
 echo -e "${YELLOW}测试 8: 取消工单${NC}"
-JSON_DATA=$(printf '{"woNumber":"%s"}' "$TICKET_NUMBER")
+JSON_DATA=$(printf '{"woNumber":"%s","customerId":"%s"}' "$TICKET_NUMBER" "$CUSTOMER_ID")
 RESPONSE=$(curl -s -X POST "$API_URL/repair/cancel" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
@@ -184,6 +185,36 @@ if echo "$RESPONSE" | grep -q "already"; then
     echo -e "${GREEN}✓ 错误处理正确${NC}"
 else
     echo -e "${RED}✗ 错误处理异常${NC}"
+    echo "$RESPONSE"
+fi
+echo ""
+
+# 测试10: 预置工单 - 本人可查询 (WO-2026-0001 属于 13800018888)
+echo -e "${YELLOW}测试 10: 预置工单本人查询 (WO-2026-0001)${NC}"
+RESPONSE=$(curl -s -X POST "$API_URL/repair/track" \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  --data-raw '{"woNumber":"WO-2026-0001","customerId":"13800018888"}')
+
+if echo "$RESPONSE" | grep -q "Repair ticket found"; then
+    echo -e "${GREEN}✓ 预置工单查询成功（本人）${NC}"
+else
+    echo -e "${RED}✗ 预置工单查询失败${NC}"
+    echo "$RESPONSE"
+fi
+echo ""
+
+# 测试11: 工单归属 - 他人查询应返回 404 (不暴露存在)
+echo -e "${YELLOW}测试 11: 工单归属校验 - 他人查询 WO-2026-0001${NC}"
+RESPONSE=$(curl -s -X POST "$API_URL/repair/track" \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  --data-raw '{"woNumber":"WO-2026-0001","customerId":"13688881234"}')
+
+if echo "$RESPONSE" | grep -q "not found"; then
+    echo -e "${GREEN}✓ 归属校验正确（他人查询返回 not found）${NC}"
+else
+    echo -e "${RED}✗ 归属校验异常 - 非属主不应看到该工单${NC}"
     echo "$RESPONSE"
 fi
 echo ""

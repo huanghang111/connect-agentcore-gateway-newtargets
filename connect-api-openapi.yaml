@@ -1,7 +1,7 @@
 openapi: 3.0.1
 info:
   title: Repair Service API
-  description: Midea Repair Service REST API
+  description: Industrial Robot Repair Service REST API
   version: 1.0.0
   contact:
     name: AWS Workshop Team
@@ -22,8 +22,9 @@ paths:
       operationId: requestRepair
       summary: Request a repair service
       description: |
-        Create a new repair work order. Records the product, address, and a description
-        built from the dialog, and returns a unique 10-digit work-order number.
+        Create a new industrial-robot repair work order. Records the robot product,
+        the faulty component, and a description built from the dialog, and returns a
+        unique work-order number of the form WO-YYYY-NNNN.
       tags:
         - Repair Service
       security:
@@ -37,48 +38,38 @@ paths:
               required:
                 - productCategory
                 - productsubCategory
-                - province
-                - city
-                - district
                 - description
                 - brand
+                - customerId
               properties:
                 productCategory:
                   type: string
-                  description: Top-level product category. Must be validated via the product category lookup API.
-                  example: 'Refrigerator'
+                  description: 'Top-level robot category. One of: 仓储机器人, 巡检机器人, 协作机械臂, 服务机器人.'
+                  example: '仓储机器人'
                 productsubCategory:
                   type: string
-                  description: Product sub-category. Must be validated via the product category lookup API.
-                  example: 'French Door'
+                  description: Faulty component. Must belong to the chosen productCategory (e.g. 仓储机器人 → 导航传感器/电池/驱动电机/通信模块).
+                  example: '导航传感器'
                 productModel:
                   type: string
-                  description: Product model. Optional. If provided, must be validated via the product model/SN API.
-                  example: 'MF200W90BE'
+                  description: Robot model. Optional.
+                  example: 'WR-500 #7'
                 serialNumber:
                   type: string
-                  description: Product serial number. Optional. If provided, must be validated via the product model/SN API.
+                  description: Unit serial number. Optional.
                   example: 'SN20231015ABC124'
-                province:
-                  type: string
-                  description: Province / state. Must be validated via the address mapping API.
-                  example: 'NY'
-                city:
-                  type: string
-                  description: City. Must be validated via the address mapping API.
-                  example: 'New York'
-                district:
-                  type: string
-                  description: District / street. Must be validated via the address mapping API.
-                  example: 'Manhattan'
                 description:
                   type: string
                   description: Work-order remark — AI summary plus dialog transcript.
-                  example: "Refrigerator stopped cooling overnight. Already tried unplugging for 10 minutes."
+                  example: '导航传感器异常，频繁偏航'
                 brand:
                   type: string
-                  description: Product brand. Extracted from the dialog or product library.
-                  example: 'AnyCompany'
+                  description: Product brand / manufacturer. Extracted from the dialog.
+                  example: '中科机器人'
+                customerId:
+                  type: string
+                  description: Verified caller identity (the customer's phone number) forwarded by the MCP server. Used as the ticket owner.
+                  example: '13800018888'
       responses:
         '201':
           description: Repair ticket created successfully
@@ -92,8 +83,8 @@ paths:
                     example: 'Repair ticket created successfully'
                   ticketNumber:
                     type: string
-                    description: Unique 10-digit repair ticket number
-                    example: '1234567890'
+                    description: Unique work-order number (WO-YYYY-NNNN)
+                    example: 'WO-2026-1234'
                   ticket:
                     $ref: '#/components/schemas/RepairTicket'
         '400':
@@ -122,7 +113,9 @@ paths:
       description: |
         Look up the status and details of an existing repair work order by its
         work-order number. The caller is expected to validate that woNumber is a
-        non-empty 10-digit numeric string before invoking this endpoint.
+        non-empty WO-YYYY-NNNN string before invoking this endpoint. customerId
+        (the verified caller phone number) is required — a customer may only see
+        work orders that belong to their own company.
       tags:
         - Repair Service
       security:
@@ -135,12 +128,17 @@ paths:
               type: object
               required:
                 - woNumber
+                - customerId
               properties:
                 woNumber:
                   type: string
-                  description: The work-order number (10-digit numeric string).
-                  pattern: '^\d{10}$'
-                  example: '1234567890'
+                  description: The work-order number (WO-YYYY-NNNN).
+                  pattern: '^WO-\d{4}-\d{4}$'
+                  example: 'WO-2026-0001'
+                customerId:
+                  type: string
+                  description: Verified caller identity (the customer's phone number) forwarded by the MCP server. Used to enforce ticket ownership.
+                  example: '13800018888'
       responses:
         '200':
           description: Repair work order found and status returned
@@ -157,39 +155,41 @@ paths:
                     properties:
                       ticketNumber:
                         type: string
-                        example: '1234567890'
+                        example: 'WO-2026-0001'
                       status:
                         type: string
                         description: Current status of the work order
                         enum: ['pending', 'scheduled', 'in_progress', 'completed', 'cancelled']
                         example: 'pending'
+                      priority:
+                        type: string
+                        description: Work-order priority
+                        enum: ['P1', 'P2', 'P3']
+                        example: 'P1'
                       productCategory:
                         type: string
-                        example: 'Refrigerator'
+                        example: '仓储机器人'
                       productsubCategory:
                         type: string
-                        example: 'French Door'
+                        example: '导航传感器'
                       productModel:
                         type: string
-                        example: 'MF200W90BE'
+                        example: 'WR-500 #7'
                       serialNumber:
                         type: string
                         example: 'SN20231015ABC124'
                       brand:
                         type: string
-                        example: 'AnyCompany'
-                      province:
+                        example: '中科机器人'
+                      customerName:
                         type: string
-                        example: 'NY'
-                      city:
+                        example: '华创智联-张伟'
+                      customerPhone:
                         type: string
-                        example: 'New York'
-                      district:
-                        type: string
-                        example: 'Manhattan'
+                        example: '13800018888'
                       description:
                         type: string
-                        example: 'Refrigerator stopped cooling overnight'
+                        example: '导航传感器异常，频繁偏航'
                       createdAt:
                         type: string
                         format: date-time
@@ -229,9 +229,11 @@ paths:
       summary: Cancel a repair work order
       description: |
         Cancel an existing repair work order by its work-order number. The caller
-        is expected to validate that woNumber is a non-empty 10-digit numeric
-        string and to obtain explicit user confirmation before invoking this
-        endpoint, since cancellation is destructive.
+        is expected to validate that woNumber is a non-empty WO-YYYY-NNNN string
+        and to obtain explicit user confirmation before invoking this endpoint,
+        since cancellation is destructive. customerId (the verified caller phone
+        number) is required — a customer may only cancel their own company's work
+        orders.
       tags:
         - Repair Service
       security:
@@ -244,12 +246,17 @@ paths:
               type: object
               required:
                 - woNumber
+                - customerId
               properties:
                 woNumber:
                   type: string
-                  description: The work-order number (10-digit numeric string).
-                  pattern: '^\d{10}$'
-                  example: '1234567890'
+                  description: The work-order number (WO-YYYY-NNNN).
+                  pattern: '^WO-\d{4}-\d{4}$'
+                  example: 'WO-2026-0001'
+                customerId:
+                  type: string
+                  description: Verified caller identity (the customer's phone number) forwarded by the MCP server. Used to enforce ticket ownership.
+                  example: '13800018888'
       responses:
         '200':
           description: Work order cancelled
@@ -263,7 +270,7 @@ paths:
                     example: 'Repair ticket cancelled'
                   ticketNumber:
                     type: string
-                    example: '1234567890'
+                    example: 'WO-2026-0001'
                   status:
                     type: string
                     example: 'cancelled'
@@ -322,7 +329,7 @@ paths:
                 query:
                   type: string
                   description: Natural language question or search query
-                  example: 'How do I reset my air conditioner?'
+                  example: '仓储机器人频繁偏航怎么办？'
       responses:
         '200':
           description: Search results from simple FAQ database
@@ -334,7 +341,7 @@ paths:
                   query:
                     type: string
                     description: The original search query
-                    example: 'How do I reset my air conditioner?'
+                    example: '仓储机器人频繁偏航怎么办？'
                   results:
                     type: array
                     description: List of relevant FAQ entries
@@ -348,15 +355,15 @@ paths:
                         category:
                           type: string
                           description: FAQ category
-                          example: 'Air Conditioner'
+                          example: '仓储机器人'
                         question:
                           type: string
                           description: The FAQ question
-                          example: 'How do I reset my air conditioner?'
+                          example: '仓储机器人频繁偏航/导航异常怎么办？'
                         answer:
                           type: string
                           description: The FAQ answer
-                          example: 'To reset your air conditioner: 1) Turn off the unit...'
+                          example: '导航偏航常见原因与处理：1) 清洁导航传感器镜头与反光标识...'
                         score:
                           type: number
                           description: Relevance score (higher is more relevant)
@@ -370,12 +377,12 @@ paths:
                     description: Source of the results
                     example: 'simple_faq_database'
               example:
-                query: 'How do I reset my air conditioner?'
+                query: '仓储机器人频繁偏航怎么办？'
                 results:
                   - id: 'faq-001'
-                    category: 'Air Conditioner'
-                    question: 'How do I reset my air conditioner?'
-                    answer: 'To reset your air conditioner: 1) Turn off the unit using the remote or control panel. 2) Unplug the power cord from the outlet. 3) Wait for 3-5 minutes. 4) Plug the power cord back in. 5) Turn on the unit.'
+                    category: '仓储机器人'
+                    question: '仓储机器人频繁偏航/导航异常怎么办？'
+                    answer: '导航偏航常见原因与处理：1) 清洁导航传感器镜头与反光标识，避免灰尘遮挡。2) 检查地面二维码/反光板是否破损或被遮挡。3) 校准激光雷达与里程计，重新建图。4) 确认轮组无打滑、胎压正常。5) 若持续偏航，请创建维修工单。'
                     score: 15
                 count: 1
                 source: 'simple_faq_database'
@@ -412,46 +419,45 @@ components:
       properties:
         ticketNumber:
           type: string
-          description: Unique 10-digit repair ticket number
-          example: '1234567890'
-        product_model:
+          description: Unique work-order number (WO-YYYY-NNNN)
+          example: 'WO-2026-0001'
+        productCategory:
           type: string
-          description: Product model name or number
-          example: 'AC-2000X'
-        serial_number:
+          description: 'Top-level robot category: 仓储机器人 / 巡检机器人 / 协作机械臂 / 服务机器人'
+          example: '仓储机器人'
+        productsubCategory:
           type: string
-          description: Product serial number
+          description: Faulty component
+          example: '导航传感器'
+        productModel:
+          type: string
+          description: Robot model
+          example: 'WR-500 #7'
+        serialNumber:
+          type: string
+          description: Unit serial number
           example: 'SN123456789'
-        purchase_date:
+        brand:
           type: string
-          format: date
-          description: Product purchase date
-          example: '2023-06-15'
-        issue_description:
+          description: Product brand / manufacturer
+          example: '中科机器人'
+        description:
           type: string
           description: Description of the issue
-          example: 'Air conditioner not cooling properly'
-        full_name:
+          example: '导航传感器异常，频繁偏航'
+        customerName:
           type: string
-          description: Customer name
-          example: 'John Smith'
-        phone:
+          description: Customer (company-contact) name
+          example: '华创智联-张伟'
+        customerPhone:
           type: string
-          description: Customer phone number
-          example: '+1-555-123-4567'
-        service_address:
+          description: Customer phone number (also the ticket owner key)
+          example: '13800018888'
+        priority:
           type: string
-          description: Service address
-          example: '123 Main St, Apt 4B, New York, NY 10001'
-        preferred_time:
-          type: string
-          description: Preferred service time
-          example: '2024-02-15 14:00'
-        warranty_status:
-          type: string
-          description: Warranty status
-          enum: ['yes', 'no', 'unknown']
-          example: 'yes'
+          description: Work-order priority
+          enum: ['P1', 'P2', 'P3']
+          example: 'P1'
         status:
           type: string
           description: Current ticket status

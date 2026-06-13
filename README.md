@@ -31,9 +31,9 @@ chmod +x deploy.sh cleanup.sh test-api.sh
 |------|------|------|------|
 | `verifyCustomer` | `smsToken` (口述手机号后 4 位), `userNumber` (LLM 从 customer_info 取) | 主核身：MCP 比对 `userNumber[-4:] == smsToken` 后签发短期 HMAC token 当作 `customerId` 返回 | 末 4 位本地比对，不一致 → `CUSTOMER_NOT_FOUND` |
 | `verifyCustomerByPhoneAndName` | `phoneNumber`, `fullName` | Fallback 核身（流程 1 失败后才用） | stub：手机号末 4 位 `0000` 时 `CUSTOMER_NOT_FOUND` |
-| `requestRepair` | `productCategory`, `productsubCategory`, `province`, `city`, `district`, `description`, `brand`, `customerId` (必填); `productModel`, `serialNumber` (可选) | 创建维修工单，返回 10 位工单号 | 必填字段在 Lambda 端校验；`customerId` token HMAC 验签 |
-| `trackRepair` | `woNumber`, `customerId` | 查询工单状态 | woNumber 必须为 10 位数字；token 验签 |
-| `cancelRepair` | `woNumber`, `customerId` | 取消工单 | 同上；幂等：已 cancelled / completed 返 `409` |
+| `requestRepair` | `productCategory`(机器人品类), `productsubCategory`(对应部件), `description`, `brand`, `customerId` (必填); `productModel`, `serialNumber` (可选) | 创建机器人维修工单，返回 WO-YYYY-NNNN 工单号 | 品类+部件组合校验；必填字段在 Lambda 端校验；`customerId` token HMAC 验签 |
+| `trackRepair` | `woNumber`, `customerId` | 查询工单状态（仅限本人/本公司工单） | woNumber 必须为 WO-YYYY-NNNN；token 验签；后端按 `customerPhone` 做归属校验 |
+| `cancelRepair` | `woNumber`, `customerId` | 取消工单（仅限本人/本公司工单） | 同上；幂等：已 cancelled / completed 返 `409` |
 | `faqSearch` | `query` | FAQ 关键字检索 | — |
 
 详细的 docstring / 错误码 / 归一化规范见 [`mcp-agent/README.md`](mcp-agent/README.md)。
@@ -42,7 +42,7 @@ chmod +x deploy.sh cleanup.sh test-api.sh
 
 | 端点 | 功能 |
 |------|------|
-| `POST /repair/request` | 创建维修工单，返回 10 位工单号 |
+| `POST /repair/request` | 创建机器人维修工单，返回 WO-YYYY-NNNN 工单号 |
 | `POST /repair/track` | 查询工单状态 |
 | `POST /repair/cancel` | 取消工单 |
 | `POST /faq/simple` | FAQ 关键字检索（无需 Bedrock KB） |
@@ -139,14 +139,13 @@ midea/
 ├── deploy.sh                  # 统一部署脚本（API + MCP Agent + Gateway 一条命令）
 ├── deploy_runtime.py          # Steps 10-12 (Runtime + Gateway + Target，被 deploy.sh 调用)
 ├── cleanup.sh                 # 统一清理脚本（reverse order）
-├── test-api.sh                # Backend API 9 项端到端测试
-├── connect-api-customer.yaml  # CloudFormation 模板（包含 Lambda inline code）
+├── test-api.sh                # Backend API 端到端测试（含工单归属校验）
+├── connect-api-customer.yaml  # CloudFormation 模板（含 Lambda inline code + 10 张预置工单 seed）
 ├── connect-api-openapi.yaml   # OpenAPI 规范
 └── mcp-agent/                 # MCP Server Agent 源码（被 deploy.sh 打包后送进 CodeBuild）
     ├── README.md              # MCP Server 详细文档（工具签名 / docstring / 错误码 / 归一化）
     ├── mcp_server.py          # FastMCP server (6 tools)
     ├── Dockerfile             # ARM64 容器
     ├── requirements.txt
-    ├── buildspec.yml
-    └── china_regions_pinyin.json
+    └── buildspec.yml
 ```

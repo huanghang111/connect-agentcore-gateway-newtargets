@@ -198,6 +198,136 @@ Resources:
       ApiKeyId: !Ref HotelApiKey
     DependsOn: HotelApiKey
 
+  # ========================================
+  # SEED DATA — 10 preset industrial-robot work orders
+  # ========================================
+
+  # Custom Resource Lambda Role for seeding preset tickets
+  SeedTicketsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBSeedAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:PutItem
+                Resource: !GetAtt RepairTicketsTable.Arn
+    DeletionPolicy: Delete
+
+  # Seeds the 10 preset work orders on stack create/update. Idempotent: each
+  # run overwrites the same fixed WO-2026-0001..0010 keys, so re-deploys simply
+  # restore the preset data to its canonical state.
+  SeedTicketsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt SeedTicketsRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          REPAIR_TICKETS_TABLE_NAME: !Ref RepairTicketsTable
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          import cfnresponse
+
+          # status: 待处理->pending, 处理中->in_progress, 已完成->completed
+          SEED_TICKETS = [
+              {'ticketNumber': 'WO-2026-0001', 'customerName': '华创智联-张伟', 'customerPhone': '13800018888',
+               'productCategory': '仓储机器人', 'productsubCategory': '导航传感器', 'productModel': 'WR-500 #7',
+               'description': '导航传感器异常，频繁偏航', 'priority': 'P1', 'status': 'pending'},
+              {'ticketNumber': 'WO-2026-0002', 'customerName': '华创智联-张伟', 'customerPhone': '13800018888',
+               'productCategory': '仓储机器人', 'productsubCategory': '电池', 'productModel': 'WR-500 #12',
+               'description': '电池续航从8h降至4h', 'priority': 'P2', 'status': 'in_progress'},
+              {'ticketNumber': 'WO-2026-0003', 'customerName': '顺丰物流-李强', 'customerPhone': '13688881234',
+               'productCategory': '仓储机器人', 'productsubCategory': '驱动电机', 'productModel': 'WR-500 #23',
+               'description': '驱动电机异响', 'priority': 'P2', 'status': 'pending'},
+              {'ticketNumber': 'WO-2026-0004', 'customerName': '中电光伏-王建国', 'customerPhone': '13755554321',
+               'productCategory': '巡检机器人', 'productsubCategory': '热成像模块', 'productModel': 'IR-400 #3',
+               'description': '热成像模块黑屏', 'priority': 'P1', 'status': 'in_progress'},
+              {'ticketNumber': 'WO-2026-0005', 'customerName': '中电光伏-王建国', 'customerPhone': '13755554321',
+               'productCategory': '巡检机器人', 'productsubCategory': '密封圈', 'productModel': 'IR-400 #5',
+               'description': '户外防水密封圈老化', 'priority': 'P3', 'status': 'pending'},
+              {'ticketNumber': 'WO-2026-0006', 'customerName': '国药集团-陈芳', 'customerPhone': '13322223456',
+               'productCategory': '服务机器人', 'productsubCategory': '导航', 'productModel': 'SR-100 #2',
+               'description': '电梯联动失败', 'priority': 'P2', 'status': 'completed'},
+              {'ticketNumber': 'WO-2026-0007', 'customerName': '万达商管-周鹏', 'customerPhone': '13177778901',
+               'productCategory': '服务机器人', 'productsubCategory': '语音模块', 'productModel': 'SR-50 #8',
+               'description': '语音模块无响应', 'priority': 'P2', 'status': 'completed'},
+              {'ticketNumber': 'WO-2026-0008', 'customerName': '京东亚洲一号-赵明', 'customerPhone': '13566667890',
+               'productCategory': '仓储机器人', 'productsubCategory': '通信模块', 'productModel': 'WR-800 #1',
+               'description': '通信模块断连（5G）', 'priority': 'P1', 'status': 'pending'},
+              {'ticketNumber': 'WO-2026-0009', 'customerName': '华创智联-张伟', 'customerPhone': '13800018888',
+               'productCategory': '协作机械臂', 'productsubCategory': '力矩传感器', 'productModel': 'CA-100 #2',
+               'description': '第3轴力矩传感器漂移', 'priority': 'P2', 'status': 'completed'},
+              {'ticketNumber': 'WO-2026-0010', 'customerName': '顺丰物流-李强', 'customerPhone': '13688881234',
+               'productCategory': '仓储机器人', 'productsubCategory': '电池', 'productModel': 'WR-500 #30',
+               'description': '充电桩对接异常', 'priority': 'P3', 'status': 'pending'},
+          ]
+
+          CREATED_AT = '2026-01-15T08:00:00Z'
+          BRAND = '中科机器人'
+
+          def handler(event, context):
+              try:
+                  print(f"Received event: {json.dumps(event, default=str)}")
+
+                  if event['RequestType'] == 'Delete':
+                      # Leave the data in place on delete; the table itself is
+                      # removed by its own DeletionPolicy when the stack is deleted.
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  table_name = os.environ['REPAIR_TICKETS_TABLE_NAME']
+                  table = boto3.resource('dynamodb').Table(table_name)
+
+                  with table.batch_writer() as batch:
+                      for t in SEED_TICKETS:
+                          item = dict(t)
+                          item['brand'] = BRAND
+                          item['serialNumber'] = None
+                          item['createdAt'] = CREATED_AT
+                          item['updatedAt'] = CREATED_AT
+                          batch.put_item(Item=item)
+
+                  print(f"Seeded {len(SEED_TICKETS)} preset tickets into {table_name}")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                   {'SeededCount': len(SEED_TICKETS)})
+
+              except Exception as e:
+                  error_message = f"Error seeding preset tickets: {str(e)}"
+                  print(error_message)
+                  try:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': error_message})
+                  except Exception as send_error:
+                      print(f"Failed to send error response: {str(send_error)}")
+    DeletionPolicy: Delete
+
+  # Custom Resource to seed preset tickets (re-runs on every stack update)
+  SeedTickets:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt SeedTicketsFunction.Arn
+      # Bump this value to force a re-seed on stack update.
+      SeedVersion: 'robot-v1'
+    DependsOn: RepairTicketsTable
+
   # S3 Bucket for OpenAPI Specification
   OpenApiBucket:
     Type: AWS::S3::Bucket
@@ -466,11 +596,13 @@ Resources:
           const client = new DynamoDBClient({});
           const docClient = DynamoDBDocumentClient.from(client);
 
-          // Generate a random 10-digit ticket number
+          // Generate a work-order number of the form WO-YYYY-NNNN. The 4-digit
+          // suffix is drawn from 1000-9999 so runtime-created tickets never
+          // collide with the preset seed tickets (WO-2026-0001 .. WO-2026-0010).
           function generateTicketNumber() {
-              const min = 1000000000;
-              const max = 9999999999;
-              return randomInt(min, max + 1).toString();
+              const year = new Date().getFullYear();
+              const suffix = randomInt(1000, 10000).toString();
+              return `WO-${year}-${suffix}`;
           }
 
           exports.handler = async (event) => {
@@ -489,22 +621,20 @@ Resources:
                       productsubCategory,
                       productModel,
                       serialNumber,
-                      province,
-                      city,
-                      district,
                       description,
-                      brand
+                      brand,
+                      customerId
                   } = body;
 
-                  // Validate required fields (productModel and serialNumber are optional)
+                  // Validate required fields (productModel and serialNumber are optional).
+                  // customerId is the verified caller phone number forwarded by the MCP
+                  // server; it becomes the ticket owner (customerPhone).
                   const requiredFields = {
                       productCategory,
                       productsubCategory,
-                      province,
-                      city,
-                      district,
                       description,
-                      brand
+                      brand,
+                      customerId
                   };
 
                   const missingFields = Object.entries(requiredFields)
@@ -537,12 +667,11 @@ Resources:
                       productsubCategory,
                       productModel: productModel || null,
                       serialNumber: serialNumber || null,
-                      province,
-                      city,
-                      district,
                       description,
                       brand,
+                      customerPhone: customerId,
                       status: 'pending',
+                      priority: 'P2',
                       createdAt: new Date().toISOString(),
                       updatedAt: new Date().toISOString()
                   };
@@ -631,10 +760,10 @@ Resources:
 
               try {
                   const body = JSON.parse(event.body || '{}');
-                  const { woNumber } = body;
+                  const { woNumber, customerId } = body;
 
-                  // Validate woNumber: required, 10-digit numeric
-                  if (!woNumber || !/^\d{10}$/.test(woNumber)) {
+                  // Validate woNumber: required, WO-YYYY-NNNN format
+                  if (!woNumber || !/^WO-\d{4}-\d{4}$/.test(woNumber)) {
                       console.log(JSON.stringify({
                           level: 'WARN',
                           message: 'Invalid woNumber',
@@ -648,7 +777,22 @@ Resources:
                               'Access-Control-Allow-Origin': '*',
                           },
                           body: JSON.stringify({
-                              error: 'woNumber is required and must be a 10-digit numeric string',
+                              error: 'woNumber is required and must look like WO-YYYY-NNNN',
+                          }),
+                      };
+                  }
+
+                  // customerId is the verified caller phone number forwarded by the
+                  // MCP server. It is required so we can enforce ticket ownership.
+                  if (!customerId) {
+                      return {
+                          statusCode: 400,
+                          headers: {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                          },
+                          body: JSON.stringify({
+                              error: 'customerId is required',
                           }),
                       };
                   }
@@ -668,10 +812,14 @@ Resources:
 
                   const result = await docClient.send(new GetCommand(getParams));
 
-                  if (!result.Item) {
+                  // Ownership enforcement: a customer may only see their own
+                  // company's work orders. If the ticket does not exist OR is not
+                  // owned by this caller, return an identical 404 so we never
+                  // reveal that someone else's work order exists.
+                  if (!result.Item || result.Item.customerPhone !== customerId) {
                       console.log(JSON.stringify({
                           level: 'WARN',
-                          message: 'Repair ticket not found',
+                          message: 'Repair ticket not found or not owned by caller',
                           requestId,
                           ticketNumber: woNumber
                       }));
@@ -695,14 +843,14 @@ Resources:
                   const responseData = {
                       ticketNumber: item.ticketNumber,
                       status: item.status,
+                      priority: item.priority ?? null,
                       productCategory: item.productCategory ?? null,
                       productsubCategory: item.productsubCategory ?? null,
                       productModel: item.productModel ?? item.product_model ?? null,
                       serialNumber: item.serialNumber ?? item.serial_number ?? null,
                       brand: item.brand ?? null,
-                      province: item.province ?? null,
-                      city: item.city ?? null,
-                      district: item.district ?? null,
+                      customerName: item.customerName ?? null,
+                      customerPhone: item.customerPhone ?? null,
                       description: item.description ?? item.issue_description ?? null,
                       createdAt: item.createdAt,
                       updatedAt: item.updatedAt
@@ -784,9 +932,9 @@ Resources:
 
               try {
                   const body = JSON.parse(event.body || '{}');
-                  const { woNumber } = body;
+                  const { woNumber, customerId } = body;
 
-                  if (!woNumber || !/^\d{10}$/.test(woNumber)) {
+                  if (!woNumber || !/^WO-\d{4}-\d{4}$/.test(woNumber)) {
                       console.log(JSON.stringify({
                           level: 'WARN',
                           message: 'Invalid woNumber',
@@ -800,8 +948,21 @@ Resources:
                               'Access-Control-Allow-Origin': '*',
                           },
                           body: JSON.stringify({
-                              error: 'woNumber is required and must be a 10-digit numeric string',
+                              error: 'woNumber is required and must look like WO-YYYY-NNNN',
                           }),
+                      };
+                  }
+
+                  // customerId is the verified caller phone number forwarded by the
+                  // MCP server. Required so we can enforce ticket ownership.
+                  if (!customerId) {
+                      return {
+                          statusCode: 400,
+                          headers: {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                          },
+                          body: JSON.stringify({ error: 'customerId is required' }),
                       };
                   }
 
@@ -811,7 +972,10 @@ Resources:
                       Key: { ticketNumber: woNumber },
                   }));
 
-                  if (!getResult.Item) {
+                  // Ownership enforcement: only the owning company may cancel.
+                  // Missing ticket OR foreign owner → identical 404 (never reveal
+                  // that someone else's work order exists).
+                  if (!getResult.Item || getResult.Item.customerPhone !== customerId) {
                       return {
                           statusCode: 404,
                           headers: {
@@ -910,73 +1074,73 @@ Resources:
           FAQ_DATABASE = [
               {
                   'id': 'faq-001',
-                  'category': 'Air Conditioner',
-                  'question': 'How do I reset my air conditioner?',
-                  'answer': 'To reset your air conditioner: 1) Turn off the unit using the remote or control panel. 2) Unplug the power cord from the outlet. 3) Wait for 3-5 minutes. 4) Plug the power cord back in. 5) Turn on the unit. This will reset the internal electronics.',
-                  'keywords': ['reset', 'air conditioner', 'ac', 'restart', 'reboot']
+                  'category': '仓储机器人',
+                  'question': '仓储机器人频繁偏航/导航异常怎么办？',
+                  'answer': '导航偏航常见原因与处理：1) 清洁导航传感器镜头与反光标识，避免灰尘遮挡。2) 检查地面二维码/反光板是否破损或被遮挡。3) 校准激光雷达与里程计，重新建图。4) 确认轮组无打滑、胎压正常。5) 若持续偏航，请创建维修工单，由工程师现场标定导航传感器。',
+                  'keywords': ['偏航', '导航', '传感器', 'navigation', 'WR-500', 'WR-800', '仓储机器人']
               },
               {
                   'id': 'faq-002',
-                  'category': 'Air Conditioner',
-                  'question': 'Why is my air conditioner not cooling?',
-                  'answer': 'Common reasons for poor cooling: 1) Dirty air filter - clean or replace it. 2) Blocked air vents - ensure nothing is blocking airflow. 3) Incorrect temperature setting - set to a lower temperature. 4) Low refrigerant - contact service for refill. 5) Outdoor unit issues - check if outdoor unit is running.',
-                  'keywords': ['not cooling', 'warm air', 'no cold', 'temperature', 'cooling problem']
+                  'category': '仓储机器人',
+                  'question': '仓储机器人电池续航明显下降怎么处理？',
+                  'answer': '续航下降排查：1) 查看电池健康度(SOH)，低于80%建议更换电芯。2) 避免频繁浅充浅放，使用厂家推荐充电策略。3) 检查充电桩对接是否良好、触点是否氧化。4) 低温环境会降低续航，注意作业温度。5) 续航骤降(如8h降至4h)通常为电池老化，请创建维修工单更换电池。',
+                  'keywords': ['电池', '续航', 'battery', '充电', 'SOH', '仓储机器人']
               },
               {
                   'id': 'faq-003',
-                  'category': 'Air Conditioner',
-                  'question': 'How often should I clean the air filter?',
-                  'answer': 'Clean the air filter every 2 weeks during heavy use (summer months). For moderate use, clean monthly. To clean: 1) Remove the filter from the unit. 2) Vacuum off loose dust. 3) Wash with warm water and mild detergent. 4) Rinse thoroughly. 5) Let it dry completely before reinstalling.',
-                  'keywords': ['clean', 'filter', 'maintenance', 'wash', 'how often']
+                  'category': '巡检机器人',
+                  'question': '巡检机器人热成像模块黑屏怎么办？',
+                  'answer': '热成像黑屏处理：1) 重启机器人，观察模块是否重新出图。2) 检查热成像模块排线是否松动。3) 确认镜头未被遮挡或结露。4) 升级到最新固件，修复已知出图异常。5) 若重启后仍黑屏，多为模块硬件故障，请创建维修工单更换热成像模块。',
+                  'keywords': ['热成像', '黑屏', 'thermal', '巡检机器人', 'IR-200', 'IR-400', '模块']
               },
               {
                   'id': 'faq-004',
-                  'category': 'Refrigerator',
-                  'question': 'Why is my refrigerator making loud noises?',
-                  'answer': 'Common causes of refrigerator noise: 1) Compressor running - normal humming sound. 2) Ice maker filling - gurgling or hissing is normal. 3) Fan hitting something - check for ice buildup or loose items. 4) Uneven floor - level the refrigerator. 5) Loose parts - tighten any loose screws or panels.',
-                  'keywords': ['noise', 'loud', 'sound', 'refrigerator', 'fridge', 'humming', 'buzzing']
+                  'category': '巡检机器人',
+                  'question': '巡检机器人户外使用如何防水防尘？',
+                  'answer': '户外防护建议：1) 确认机器人防护等级满足现场环境(建议IP65及以上)。2) 定期检查密封圈是否老化、开裂，及时更换。3) 雨后清理机身积水，避免接插件进水。4) 气体传感器探头注意防尘网清洁。5) 密封圈老化属易损件，可创建维修工单更换。',
+                  'keywords': ['防水', '防尘', '密封圈', 'IP65', '户外', '巡检机器人']
               },
               {
                   'id': 'faq-005',
-                  'category': 'Refrigerator',
-                  'question': 'What temperature should I set my refrigerator?',
-                  'answer': 'Recommended temperatures: Refrigerator compartment: 37-40°F (3-4°C). Freezer compartment: 0°F (-18°C). These temperatures keep food fresh and safe while maximizing energy efficiency. Use a refrigerator thermometer to verify actual temperature.',
-                  'keywords': ['temperature', 'setting', 'cold', 'freezer', 'refrigerator', 'degrees']
+                  'category': '协作机械臂',
+                  'question': '协作机械臂某一轴力矩传感器漂移怎么办？',
+                  'answer': '力矩传感器漂移处理：1) 在无负载状态下执行零点标定。2) 检查该轴线缆与接插件是否松动。3) 确认环境温度稳定，避免温漂。4) 升级控制器固件修复标定算法。5) 多次标定后仍漂移，多为传感器硬件问题，请创建维修工单更换对应轴力矩传感器。',
+                  'keywords': ['力矩传感器', '漂移', '标定', '协作机械臂', 'CA-100', 'CA-300', '关节']
               },
               {
                   'id': 'faq-006',
-                  'category': 'Washing Machine',
-                  'question': 'Why is my washing machine not draining?',
-                  'answer': 'Steps to fix drainage issues: 1) Check drain hose for kinks or clogs. 2) Clean the drain pump filter (usually at front bottom). 3) Ensure drain hose is not inserted too far into standpipe. 4) Check for blockage in standpipe or drain. 5) If problem persists, the drain pump may need service.',
-                  'keywords': ['not draining', 'water', 'drain', 'washing machine', 'washer', 'pump']
+                  'category': '协作机械臂',
+                  'question': '协作机械臂关节电机报警/异响怎么处理？',
+                  'answer': '关节电机异常处理：1) 记录报警码，对照手册定位故障。2) 检查负载是否超过额定值。3) 确认减速机润滑与无异物卡涩。4) 检查电机线缆与编码器反馈是否正常。5) 持续异响或报警，请创建维修工单检修关节电机。',
+                  'keywords': ['关节电机', '异响', '报警', 'motor', '协作机械臂', '减速机']
               },
               {
                   'id': 'faq-007',
-                  'category': 'Washing Machine',
-                  'question': 'How do I clean my washing machine?',
-                  'answer': 'Monthly cleaning routine: 1) Run empty hot water cycle with 2 cups white vinegar. 2) Wipe door seal and remove any debris. 3) Clean detergent dispenser drawer. 4) Leave door open after use to prevent mold. 5) For deep cleaning, use washing machine cleaner tablet monthly.',
-                  'keywords': ['clean', 'washing machine', 'maintenance', 'smell', 'odor', 'mold']
+                  'category': '服务机器人',
+                  'question': '服务机器人语音模块无响应怎么办？',
+                  'answer': '语音无响应排查：1) 确认麦克风未静音、音量正常。2) 重启机器人，观察语音模块是否恢复。3) 检查网络连接，云端语音服务需要联网。4) 查看语音模块排线与供电。5) 重启后仍无响应，多为语音模块故障，请创建维修工单更换。',
+                  'keywords': ['语音', '语音模块', '无响应', 'voice', '服务机器人', 'SR-50', 'SR-100']
               },
               {
                   'id': 'faq-008',
-                  'category': 'General',
-                  'question': 'How do I schedule a repair service?',
-                  'answer': 'To schedule repair service: 1) Use the /repair/request API endpoint with your product details. 2) Provide product model, serial number, and issue description. 3) You will receive a 10-digit ticket number. 4) A service technician will contact you within 24-48 hours. 5) Track your repair status using /repair/track endpoint.',
-                  'keywords': ['repair', 'service', 'schedule', 'appointment', 'technician', 'fix']
+                  'category': '服务机器人',
+                  'question': '服务机器人电梯联动失败怎么处理？',
+                  'answer': '电梯联动失败排查：1) 确认机器人与电梯物联网关均在线。2) 检查联动协议与楼层映射配置。3) 确认电梯端联动模块供电与通信正常。4) 重新触发一次联动并观察日志。5) 配置正确仍失败，请创建维修工单，联系工程师检查联动模块与网关。',
+                  'keywords': ['电梯', '联动', '失败', '网关', '服务机器人', '通信']
               },
               {
                   'id': 'faq-009',
-                  'category': 'General',
-                  'question': 'What is covered under warranty?',
-                  'answer': 'Standard warranty coverage: 1) Manufacturing defects - 1 year parts and labor. 2) Compressor - 5 years parts, 1 year labor (refrigerators/AC). 3) Not covered: Normal wear, misuse, unauthorized repairs, cosmetic damage. 4) Extended warranty available for purchase. 5) Keep purchase receipt for warranty claims.',
-                  'keywords': ['warranty', 'coverage', 'guarantee', 'protection', 'claim']
+                  'category': '通用',
+                  'question': '如何创建一张机器人维修工单？',
+                  'answer': '创建维修工单流程：1) 先完成身份核验(提供手机号后4位)。2) 告知机器人品类(仓储/巡检/协作机械臂/服务机器人)与故障部件。3) 描述故障现象，并尽量提供型号(如WR-500 #7)。4) 系统会返回一个 WO-YYYY-NNNN 格式的工单号。5) 工程师将在24-48小时内联系您，可凭工单号查询进度。',
+                  'keywords': ['维修', '工单', '创建', '报修', 'service', 'repair']
               },
               {
                   'id': 'faq-010',
-                  'category': 'General',
-                  'question': 'Where can I find my product serial number?',
-                  'answer': 'Serial number locations: Air Conditioner: Inside front panel or on side of unit. Refrigerator: Inside fresh food compartment on side wall or ceiling. Washing Machine: Inside door rim or on back panel. Format: Usually starts with letters followed by numbers (e.g., SN123456789). Take a photo for future reference.',
-                  'keywords': ['serial number', 'model number', 'identification', 'locate', 'find']
+                  'category': '通用',
+                  'question': '如何查询或取消我的工单？',
+                  'answer': '查询/取消工单：1) 完成身份核验后，提供完整工单号(WO-YYYY-NNNN)即可查询状态。2) 仅能查询/取消属于本公司名下的工单。3) 已完成或已取消的工单无法再次取消。4) 状态包含：待处理(pending)、处理中(in_progress)、已完成(completed)、已取消(cancelled)。5) 如需加急，请在工单中备注优先级。',
+                  'keywords': ['查询', '取消', '工单', 'track', 'cancel', '状态', '进度']
               }
           ]
 
@@ -1272,11 +1436,9 @@ Resources:
               required:
                 - productCategory
                 - productsubCategory
-                - province
-                - city
-                - district
                 - description
                 - brand
+                - customerId
               properties:
                 productCategory:
                   type: 'string'
@@ -1286,32 +1448,34 @@ Resources:
                   type: 'string'
                 serialNumber:
                   type: 'string'
-                province:
-                  type: 'string'
-                city:
-                  type: 'string'
-                district:
-                  type: 'string'
                 description:
                   type: 'string'
                 brand:
+                  type: 'string'
+                customerId:
                   type: 'string'
             TrackRepairRequest:
               type: 'object'
               required:
                 - woNumber
+                - customerId
               properties:
                 woNumber:
                   type: 'string'
-                  pattern: '^\d{10}$'
+                  pattern: '^WO-\d{4}-\d{4}$'
+                customerId:
+                  type: 'string'
             CancelRepairRequest:
               type: 'object'
               required:
                 - woNumber
+                - customerId
               properties:
                 woNumber:
                   type: 'string'
-                  pattern: '^\d{10}$'
+                  pattern: '^WO-\d{4}-\d{4}$'
+                customerId:
+                  type: 'string'
           securitySchemes:
             api_key:
               type: 'apiKey'

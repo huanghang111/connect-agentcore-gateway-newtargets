@@ -9,7 +9,6 @@ import secrets
 import time
 import urllib.request
 import urllib.error
-from pathlib import Path
 from typing import Optional, Tuple
 
 from botocore.config import Config as BotoConfig
@@ -20,13 +19,19 @@ from starlette.responses import JSONResponse
 from strands import Agent
 from strands.models import BedrockModel
 
-WO_NUMBER_PATTERN = re.compile(r"^\d{10}$")
+WO_NUMBER_PATTERN = re.compile(r"^WO-\d{4}-\d{4}$")
 SMS_TOKEN_PATTERN = re.compile(r"^\d{4}$")
 PHONE_NUMBER_PATTERN = re.compile(r"^\d{6,15}$")
 
-SUBCATEGORY_ENUM = ("smart version", "premium version", "elite version")
-
-REGIONS_FILE = Path(__file__).with_name("china_regions_pinyin.json")
+# Industrial-robot product taxonomy. Each top-level category maps to its set of
+# valid component-level sub-categories. requestRepair validates that the
+# (productCategory, productsubCategory) pair is mutually consistent.
+ROBOT_CATEGORIES = {
+    "仓储机器人": ("导航传感器", "电池", "驱动电机", "通信模块"),   # WR-500, WR-800
+    "巡检机器人": ("热成像模块", "轮组", "气体传感器", "通信"),      # IR-200, IR-400
+    "协作机械臂": ("关节电机", "力矩传感器", "控制器", "线缆"),      # CA-100, CA-300
+    "服务机器人": ("语音模块", "屏幕", "导航", "电池"),            # SR-50, SR-100
+}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("mcp_server")
@@ -309,7 +314,7 @@ def _validate_wo_number(wo_number: str) -> Optional[dict]:
     if not wo_number or not wo_number.strip():
         return {"error": "INVALID_WO_NUMBER", "message": "woNumber must not be empty"}
     if not WO_NUMBER_PATTERN.match(wo_number.strip()):
-        return {"error": "INVALID_WO_NUMBER", "message": "woNumber must be a 10-digit number"}
+        return {"error": "INVALID_WO_NUMBER", "message": "woNumber must look like WO-YYYY-NNNN (e.g. WO-2026-0001)"}
     return None
 
 
@@ -328,119 +333,36 @@ def _validate_sms_token(sms_token: str) -> Optional[dict]:
 
 
 def _norm(s: str) -> str:
-    """Normalize a region/enum input: strip + lowercase + collapse internal whitespace."""
+    """Normalize a category/enum input: strip + lowercase + collapse internal whitespace."""
     return re.sub(r"\s+", "", (s or "").strip().lower())
 
 
-def _load_regions() -> dict:
-    """Build a province-level lookup table.
+# Pre-normalized lookup: norm(category) -> (canonical_category, {norm(sub): canonical_sub})
+_CATEGORY_INDEX = {
+    _norm(cat): (cat, {_norm(sub): sub for sub in subs})
+    for cat, subs in ROBOT_CATEGORIES.items()
+}
 
-    Schema:
-      {
-        norm(province_variant): {
-          "self": frozenset(norm(province_variant), ...),   # to detect city==province
-          "cities": { norm(city_variant): frozenset(norm(district), ...) },
-          "all_districts": frozenset(norm(district), ...),  # union across cities
-        }
-      }
+
+def _validate_category_pair(category: str, sub_category: str) -> Optional[dict]:
+    """Validate that productCategory is a known robot category AND productsubCategory
+    is a component that belongs to that category (case/space insensitive).
+
+    Returns an error dict pinpointing the offending level, else None.
     """
-    with open(REGIONS_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    index: dict = {}
-    for prov in data["regions"]:
-        cities_idx: dict = {}
-        all_dists: set = set()
-        for city in prov["cities"]:
-            dist_set = set()
-            for dist in city["districts"]:
-                for v in dist["d"]:
-                    dist_set.add(_norm(v))
-            dist_fset = frozenset(dist_set)
-            for v in city["c"]:
-                cities_idx[_norm(v)] = dist_fset
-            all_dists |= dist_set
-        prov_self = frozenset(_norm(v) for v in prov["p"])
-        prov_entry = {
-            "self": prov_self,
-            "cities": cities_idx,
-            "all_districts": frozenset(all_dists),
+    entry = _CATEGORY_INDEX.get(_norm(category))
+    if entry is None:
+        return {
+            "error": "INVALID_CATEGORY",
+            "message": f"productCategory must be one of: {', '.join(ROBOT_CATEGORIES.keys())}.",
+            "allowed": list(ROBOT_CATEGORIES.keys()),
         }
-        for v in prov["p"]:
-            index[_norm(v)] = prov_entry
-    log.info("loaded china regions: %d provinces", len(index))
-    return index
-
-
-_REGION_INDEX: dict = _load_regions()
-
-# Virtual "市辖区" city layer that the official dataset interposes between
-# direct-administered municipalities (Beijing/Shanghai/Tianjin/Chongqing) and
-# their districts. Customers/LLMs never actually say this — they say
-# "Beijing, Chaoyang" — so we accept either pattern.
-_MUNICIPALITY_PROXY_CITY = frozenset({"shixiaqu", "shixia", "市辖区", "市辖"})
-
-# Direct-administered municipalities (直辖市). For these provinces only, we
-# also accept city == province name (the way users/LLMs naturally phrase it).
-_MUNICIPALITY_PROVINCES = frozenset({
-    "beijingshi", "beijing", "北京市", "北京",
-    "shanghaishi", "shanghai", "上海市", "上海",
-    "tianjinshi", "tianjin", "天津市", "天津",
-    "chongqingshi", "chongqing", "重庆市", "重庆",
-})
-
-
-_SUBCATEGORY_NORMALIZED = {_norm(s) for s in SUBCATEGORY_ENUM}
-
-
-def _validate_subcategory(value: str) -> Optional[dict]:
-    """Reject sub-category values outside the fixed enum (case/space insensitive)."""
-    if _norm(value) not in _SUBCATEGORY_NORMALIZED:
+    canonical_cat, sub_index = entry
+    if _norm(sub_category) not in sub_index:
         return {
             "error": "INVALID_SUB_CATEGORY",
-            "message": f"productsubCategory must be one of: {', '.join(SUBCATEGORY_ENUM)}.",
-            "allowed": list(SUBCATEGORY_ENUM),
-        }
-    return None
-
-
-def _validate_region(province: str, city: str, district: str) -> Optional[dict]:
-    """Validate the (province, city, district) triple against the China admin-division pinyin list.
-
-    Accepts either Chinese names or pinyin (with/without administrative suffix), case-insensitive.
-
-    Special case for direct-administered municipalities (Beijing/Shanghai/
-    Tianjin/Chongqing): the official dataset puts a virtual "市辖区" city between
-    the municipality and its districts; users say "Beijing, Chaoyang" instead.
-    We accept three city patterns for these provinces:
-      - city == province name (e.g., province=Beijing, city=Beijing)
-      - city == "市辖区" / "shixiaqu"
-      - the literal city in the dataset
-
-    Returns an error dict pinpointing the first level that fails, else None.
-    """
-    p, c, d = _norm(province), _norm(city), _norm(district)
-    prov = _REGION_INDEX.get(p)
-    if prov is None:
-        return {
-            "error": "INVALID_PROVINCE",
-            "message": f"Unknown province '{province}'. Please ask the customer for the Chinese-administrative province name (in Chinese or pinyin).",
-        }
-
-    is_municipality = p in _MUNICIPALITY_PROVINCES
-    if is_municipality and (c in prov["self"] or c in _MUNICIPALITY_PROXY_CITY):
-        districts = prov["all_districts"]
-    else:
-        districts = prov["cities"].get(c)
-        if districts is None:
-            return {
-                "error": "INVALID_CITY",
-                "message": f"City '{city}' is not part of province '{province}'. Please ask the customer to confirm the city.",
-            }
-
-    if d not in districts:
-        return {
-            "error": "INVALID_DISTRICT",
-            "message": f"District '{district}' is not part of city '{city}'. Please ask the customer to confirm the district.",
+            "message": f"For productCategory '{canonical_cat}', productsubCategory must be one of: {', '.join(ROBOT_CATEGORIES[canonical_cat])}.",
+            "allowed": list(ROBOT_CATEGORIES[canonical_cat]),
         }
     return None
 
@@ -485,16 +407,22 @@ def _verify_phone_tail_to_customer_id(phone_tail: str, user_number: str) -> Opti
 def _verify_phone_and_name_to_customer_id(phone_number: str, full_name: str) -> Optional[str]:
     """Resolve a (full phone number, full name) pair into a customerId, or ``None``.
 
-    STUB: Until the real identity API is live, return ``"PHN" + last 4 digits
-    of phone_number`` for any input where the phone number does NOT end in
-    ``0000``. A phone number ending in ``0000`` simulates a still-not-found
-    outcome so the agent can fall back to a human handoff during testing.
+    STUB: Until the real identity API is live, return the FULL phone number
+    (digits only) as the customerId for any input where the phone number does
+    NOT end in ``0000``. A phone number ending in ``0000`` simulates a
+    still-not-found outcome so the agent can fall back to a human handoff
+    during testing.
+
+    The customerId MUST be the full phone number (not a derived "PHN…" value)
+    so that it matches the ``customerPhone`` stored on each work order — the
+    backend enforces ticket ownership by comparing customerId against the
+    ticket's customerPhone, so a customer can only track/cancel work orders
+    that belong to their own phone number.
     """
     _ = full_name  # reserved for the real identity API; stub keys only on phone tail
-    tail = phone_number[-4:]
-    if tail == "0000":
+    if phone_number[-4:] == "0000":
         return None
-    return f"PHN{tail}"
+    return phone_number
 
 
 @mcp.tool(structured_output=False)
@@ -651,16 +579,13 @@ def verifyCustomerByPhoneAndName(phoneNumber: str, fullName: str) -> str:
 def requestRepair(
     productCategory: str,
     productsubCategory: str,
-    province: str,
-    city: str,
-    district: str,
     description: str,
     brand: str,
     customerId: str,
     productModel: str = "",
     serialNumber: str = "",
 ) -> str:
-    """Create a new repair work order.
+    """Create a new industrial-robot repair work order.
 
     IDENTITY — read this BEFORE doing anything else:
       `customerId` authorizes this call and MUST come from a verifyCustomer
@@ -689,62 +614,48 @@ def requestRepair(
       retry with the same bad value.
 
     PRECONDITIONS (the caller MUST satisfy before invoking this tool):
-      - productCategory: validated via the product category lookup API
-        (interface 7); only values returned by that API are accepted.
-      - productsubCategory: MUST be one of the fixed enum values
-        "smart version", "premium version", or "elite version"
-        (case-insensitive). Any other value is rejected with
-        {"error": "INVALID_SUB_CATEGORY"}.
-      - province / city / district: validated server-side against the official
-        China administrative-division list (Chinese name or pinyin accepted,
-        case-insensitive, suffix optional). The triple must be hierarchically
-        consistent — district must belong to city, city must belong to
-        province. Failures return {"error": "INVALID_PROVINCE" |
-        "INVALID_CITY" | "INVALID_DISTRICT"}; ask the customer to clarify the
-        offending level and retry — do NOT retry with the same bad value.
-
-        DIRECT-ADMINISTERED MUNICIPALITIES — Beijing, Shanghai, Tianjin,
-        Chongqing have NO real city layer. When the customer mentions one of
-        these four, do NOT ask which city — pass the municipality name as
-        BOTH `province` and `city`, e.g. province="Beijing", city="Beijing",
-        district="Chaoyang". This is accepted by the validator. Same for
-        北京/上海/天津/重庆.
-      - productModel / serialNumber (optional): if provided, validated via the
-        product model/SN API (interface 9).
-      - brand: extracted from the dialog or the product library (recommended to
-        reuse the extended response of interface 9).
+      - productCategory: MUST be one of the robot categories: 仓储机器人,
+        巡检机器人, 协作机械臂, 服务机器人. Any other value is rejected with
+        {"error": "INVALID_CATEGORY"} (the response lists the allowed values).
+      - productsubCategory: MUST be a component that belongs to the chosen
+        productCategory (the pair is validated together, case-insensitive):
+          • 仓储机器人 → 导航传感器 / 电池 / 驱动电机 / 通信模块
+          • 巡检机器人 → 热成像模块 / 轮组 / 气体传感器 / 通信
+          • 协作机械臂 → 关节电机 / 力矩传感器 / 控制器 / 线缆
+          • 服务机器人 → 语音模块 / 屏幕 / 导航 / 电池
+        A component that does not belong to the category is rejected with
+        {"error": "INVALID_SUB_CATEGORY"} (the response lists the components
+        allowed for that category). Ask the customer to clarify — do NOT
+        retry with the same bad value.
+      - productModel / serialNumber (optional): the robot model (e.g. "WR-500",
+        "IR-400 #3") and/or unit serial number, if the customer can provide them.
+      - brand: product brand / manufacturer. Required. Extracted from the dialog.
       - description: AI-generated summary plus the dialog transcript, produced
         from the conversation context.
 
     RETURNS — canonical schema (upstream field names like `wono` / `ticketId` /
     `orderNumber` are normalized onto `woNumber`):
-      - woNumber:    Newly created work-order number (string, "" on failure).
+      - woNumber:    Newly created work-order number (string like "WO-2026-1234", "" on failure).
       - created:     Boolean — true iff upstream confirms the work order was created.
-      - status:      Initial work-order status (string, e.g. "open" / "pending").
+      - status:      Initial work-order status (string, e.g. "pending").
       - scheduledAt: Initial scheduled service time (ISO 8601 string, "" if unknown).
       - message:     Human-readable confirmation or failure reason (string).
     Empty strings mean "unknown" — phrase them to the customer accordingly.
     Error envelopes ({"error": "..."}) are returned unchanged.
 
     Args:
-        productCategory: Top-level product category (e.g., "Refrigerator"). Required. Must be validated via interface 7.
-        productsubCategory: Product sub-category. Required. MUST be one of: "smart version", "premium version", "elite version" (case-insensitive).
-        province: Province / state. Required. Chinese name or pinyin; validated against China admin divisions.
-        city: City. Required. Chinese name or pinyin; must belong to the given province.
-        district: District / street. Required. Chinese name or pinyin; must belong to the given city.
+        productCategory: Top-level robot category. Required. One of: 仓储机器人, 巡检机器人, 协作机械臂, 服务机器人.
+        productsubCategory: Faulty component. Required. Must belong to the chosen productCategory (see PRECONDITIONS).
         description: Work-order remark — AI summary plus dialog transcript. Required.
-        brand: Product brand. Required. Extracted from dialog or product library (interface 9 extension recommended).
+        brand: Product brand / manufacturer. Required. Extracted from the dialog.
         customerId: Opaque short-lived identity token returned by verifyCustomer (Flow 1) or verifyCustomerByPhoneAndName (Flow 2) earlier in THIS conversation. Required. Pass the token verbatim — it is signed and validated server-side. Do NOT invent, edit, summarise, or substitute any value (including any customerId from the agent's customer_info context); the server will reject it with {"error": "IDENTITY_INVALID"}. If the token has expired the server returns {"error": "IDENTITY_EXPIRED"} — call verifyCustomer again to mint a fresh one.
-        productModel: Product model. Optional. If provided, must be validated via interface 9.
-        serialNumber: Product serial number. Optional. If provided, must be validated via interface 9.
+        productModel: Robot model, e.g. "WR-500" / "IR-400 #3". Optional.
+        serialNumber: Unit serial number. Optional.
     """
     real_customer_id, err = _resolve_customer_id(customerId)
     if err:
         return json.dumps(err)
-    err = _validate_subcategory(productsubCategory)
-    if err:
-        return json.dumps(err)
-    err = _validate_region(province, city, district)
+    err = _validate_category_pair(productCategory, productsubCategory)
     if err:
         return json.dumps(err)
     result = _call_api("/repair/request", {
@@ -752,9 +663,6 @@ def requestRepair(
         "productsubCategory": productsubCategory,
         "productModel": productModel,
         "serialNumber": serialNumber,
-        "province": province,
-        "city": city,
-        "district": district,
         "description": description,
         "brand": brand,
         "customerId": real_customer_id,
@@ -795,7 +703,7 @@ def trackRepair(woNumber: str, customerId: str) -> str:
 
     PRECONDITIONS (the caller MUST satisfy before invoking this tool):
       - woNumber must be non-empty and match the work-order number format
-        (10-digit numeric string).
+        (a WO-YYYY-NNNN string, e.g. WO-2026-0001).
 
     RETURNS — canonical schema (the upstream API may use different field names
     such as `ticketstatus`, `tstatus`, `statusName`; this tool normalizes them
@@ -814,7 +722,7 @@ def trackRepair(woNumber: str, customerId: str) -> str:
     Error envelopes ({"error": "..."}) are returned unchanged.
 
     Args:
-        woNumber: Work-order number. Required, non-empty, 10-digit numeric.
+        woNumber: Work-order number. Required, non-empty, a WO-YYYY-NNNN string (e.g. WO-2026-0001).
         customerId: Opaque short-lived identity token returned by verifyCustomer (Flow 1) or verifyCustomerByPhoneAndName (Flow 2) earlier in THIS conversation. Required. Pass the token verbatim — it is signed and validated server-side. Do NOT invent, edit, summarise, or substitute any value (including any customerId from the agent's customer_info context); the server will reject it with {"error": "IDENTITY_INVALID"}. If the token has expired the server returns {"error": "IDENTITY_EXPIRED"} — call verifyCustomer again to mint a fresh one.
     """
     err = _validate_wo_number(woNumber)
@@ -863,7 +771,7 @@ def cancelRepair(woNumber: str, customerId: str) -> str:
 
     PRECONDITIONS (the caller MUST satisfy before invoking this tool):
       - woNumber must be non-empty and match the work-order number format
-        (10-digit numeric string).
+        (a WO-YYYY-NNNN string, e.g. WO-2026-0001).
 
     RETURNS — canonical schema (upstream field names are normalized):
       - woNumber:   Work-order number (string).
@@ -873,7 +781,7 @@ def cancelRepair(woNumber: str, customerId: str) -> str:
     Error envelopes ({"error": "..."}) are returned unchanged.
 
     Args:
-        woNumber: Work-order number. Required, non-empty, 10-digit numeric.
+        woNumber: Work-order number. Required, non-empty, a WO-YYYY-NNNN string (e.g. WO-2026-0001).
         customerId: Opaque short-lived identity token returned by verifyCustomer (Flow 1) or verifyCustomerByPhoneAndName (Flow 2) earlier in THIS conversation. Required. Pass the token verbatim — it is signed and validated server-side. Do NOT invent, edit, summarise, or substitute any value (including any customerId from the agent's customer_info context); the server will reject it with {"error": "IDENTITY_INVALID"}. If the token has expired the server returns {"error": "IDENTITY_EXPIRED"} — call verifyCustomer again to mint a fresh one.
     """
     err = _validate_wo_number(woNumber)

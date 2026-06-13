@@ -13,10 +13,10 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 | Tool | 功能 | 入参（前置校验要求见 docstring） |
 |------|------|----------|
 | `verifyCustomer` | 主核身（流程 1，每通电话必跑）：让客户口述手机号后 4 位（`smsToken`），由 LLM 从 Connect AI Agent 系统上下文的 `<customer_info>` 块里读出 `userNumber`（需要在 Orchestration Prompt 模板里写一行 `- userNumber: {{$.Custom.userNumber}}`，并在 Contact Flow 里通过 `Set contact attributes` 把这次通话的 userNumber 写进 `Custom.userNumber`）一并传给本工具。MCP 校验 `userNumber` 末 4 位 == `smsToken` 一致后**签发一个 HMAC token** 当作 `customerId` 返回（底层真实 customerId 直接复用 `userNumber`） | `smsToken`(4 位数字) 必填；`userNumber`(LLM 从 customer_info 里取) |
-| `verifyCustomerByPhoneAndName` | Fallback 核身（流程 2）：用**完整手机号 + 姓名**查到客户后签发 token；仅在 `verifyCustomer` 返回 `CUSTOMER_NOT_FOUND` 后调用（stub：手机号末 4 位为 `0000` 时返回 `CUSTOMER_NOT_FOUND`，其他底层 customerId 为 `"PHN" + 末 4 位`） | `phoneNumber`(纯数字 6–15 位)、`fullName` 必填 |
-| `requestRepair` | 创建维修工单 | `productCategory`, `productsubCategory`, `province`, `city`, `district`, `description`, `brand`, `customerId` 必填；`productModel`, `serialNumber` 可选 |
-| `trackRepair` | 查询工单状态 | `woNumber`(10 位数字)、`customerId`，工具内强制校验 |
-| `cancelRepair` | 取消工单 | `woNumber`(10 位数字)、`customerId`，工具内强制校验 |
+| `verifyCustomerByPhoneAndName` | Fallback 核身（流程 2）：用**完整手机号 + 姓名**查到客户后签发 token；仅在 `verifyCustomer` 返回 `CUSTOMER_NOT_FOUND` 后调用（stub：手机号末 4 位为 `0000` 时返回 `CUSTOMER_NOT_FOUND`，其他底层 customerId 为**完整手机号**本身） | `phoneNumber`(纯数字 6–15 位)、`fullName` 必填 |
+| `requestRepair` | 创建机器人维修工单 | `productCategory`(机器人品类), `productsubCategory`(对应部件), `description`, `brand`, `customerId` 必填；`productModel`, `serialNumber` 可选 |
+| `trackRepair` | 查询工单状态（仅限本人/本公司工单） | `woNumber`(WO-YYYY-NNNN)、`customerId`，工具内强制校验 |
+| `cancelRepair` | 取消工单（仅限本人/本公司工单） | `woNumber`(WO-YYYY-NNNN)、`customerId`，工具内强制校验 |
 | `faqSearch` | FAQ 知识库自然语言检索（产品使用 / 故障排查 / 保修 / 维修） | `query`(任意自然语言问题) 必填 |
 
 > **设计原则**：所有 tool 的使用方式都写在各自的 docstring 顶部，LLM 通过 `toolConfigurationList` 拿到 description 即可正确使用，**Connect AI Agent 的 Orchestration Prompt 只需要做一处身份相关改动**（在 `<customer_info>` 块里加一行 `- userNumber: {{$.Custom.userNumber}}`，并在 Contact Flow 里把这通电话的 userNumber 写进 `Custom.userNumber` 属性）；其余所有约束（包括"必须先核身"）都内置在 MCP server 的工具签名 + 服务端校验里。
@@ -41,13 +41,13 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 > - 不设也没回写时（比如 CI 直接跑 `mcp_server.py`）server 会用进程内随机 secret 并打 WARNING，单副本调试可用，但 Runtime 重启或扩成多副本后所有已发 token 立即失效
 > - Token TTL 默认 3600 秒（60 分钟，覆盖典型通话时长），可通过 `IDENTITY_TOKEN_TTL_S` 调整
 >
-> **Stub 测试触发器**：在真实身份 API 接通前，`verifyCustomer` 的"对得上 / 对不上"完全由 Agent 传进来的 `userNumber` 控制 —— 只要让 `smsToken` 与 `userNumber` 末 4 位不一致就能复现 `CUSTOMER_NOT_FOUND`，把 `userNumber` 留空或不到 4 位即可复现 `INVALID_USER_NUMBER`，两者都会驱动 Agent 走 fallback。`verifyCustomerByPhoneAndName` 仍保留幻数：`phoneNumber` 末 4 位为 `0000` 时返回 `CUSTOMER_NOT_FOUND`，模拟"再次找不到"的人工兜底分支。
+> **Stub 测试触发器**：在真实身份 API 接通前，`verifyCustomer` 的"对得上 / 对不上"完全由 Agent 传进来的 `userNumber` 控制 —— 只要让 `smsToken` 与 `userNumber` 末 4 位不一致就能复现 `CUSTOMER_NOT_FOUND`，把 `userNumber` 留空或不到 4 位即可复现 `INVALID_USER_NUMBER`，两者都会驱动 Agent 走 fallback。`verifyCustomerByPhoneAndName` 仍保留幻数：`phoneNumber` 末 4 位为 `0000` 时返回 `CUSTOMER_NOT_FOUND`，模拟"再次找不到"的人工兜底分支；其余情况底层 customerId 即**完整手机号**本身（与 Flow 1 一致），用于后端按手机号做工单归属校验。
 
-每个 tool 的 docstring 顶部都列出了 **PRECONDITIONS**，明确字段在调用前必须经过哪些上游校验接口（产品大/小类、地址映射、型号/SN）。
+每个 tool 的 docstring 顶部都列出了 **PRECONDITIONS**，明确字段在调用前必须满足的约束（机器人品类 + 对应部件的组合校验、型号/SN）。
 
 ### 接口契约速查（MCP tool ↔ 后端 API）
 
-> 三个 repair tool 收到的 `customerId` 已经透传给后端，但当前部署的 Lambda（`midea/connect-api-customer.yaml`）**还没读这个字段**，等真实身份系统接入后再加上 `customerId` 校验/查询；MCP 这层先把字段对齐，避免上线时再改 tool schema。
+> 三个 repair tool 收到的 `customerId`（核身后即客户手机号）会透传给后端。`requestRepair` 把它写进工单的 `customerPhone`（工单属主）；`trackRepair` / `cancelRepair` 用它做**工单归属校验** —— 后端比对 `ticket.customerPhone === customerId`，不属于本人/本公司的工单一律返回 `404`（不暴露其存在）。
 > 全部三个 repair tool 都会在拿到后端响应后过一次 Strands+Bedrock 归一化（详见上面的"响应归一化"章节），表里的"出参"指的就是归一化后的 schema —— 也是 LLM 实际看到的字段。
 
 #### 1. `verifyCustomer` — 主核身（无后端 API，纯本地比对）
@@ -67,7 +67,7 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 |----|------|
 | 入参 | `phoneNumber: str`(6–15 位纯数字), `fullName: str`(非空) |
 | 本地校验失败 | `{"error":"INVALID_PHONE_NUMBER" \| "INVALID_NAME"}` |
-| Stub 触发 | `phoneNumber` 末 4 位为 `0000` → `CUSTOMER_NOT_FOUND`（**不再循环，提示转人工**） |
+| Stub 触发 | `phoneNumber` 末 4 位为 `0000` → `CUSTOMER_NOT_FOUND`（**不再循环，提示转人工**）；其余情况底层 customerId 即**完整手机号**本身 |
 | 成功出参 | `{"customerId":"<HMAC token>"}` —— 同 `verifyCustomer`，是签名 token 不是真实 ID |
 | 失败出参 | `{"error":"CUSTOMER_NOT_FOUND","message":"... do NOT loop"}` |
 | 后端 API | 无 |
@@ -76,13 +76,13 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 
 | 项 | 内容 |
 |----|------|
-| MCP 入参（必填） | `productCategory`, `productsubCategory`, `province`, `city`, `district`, `description`, `brand`, `customerId` |
+| MCP 入参（必填） | `productCategory`, `productsubCategory`, `description`, `brand`, `customerId` |
 | MCP 入参（可选） | `productModel`, `serialNumber` |
-| MCP 本地校验 | `MISSING_CUSTOMER_ID` / `INVALID_SUB_CATEGORY` / `INVALID_PROVINCE` / `INVALID_CITY` / `INVALID_DISTRICT`（详见下面的"服务端校验"） |
+| MCP 本地校验 | `MISSING_CUSTOMER_ID` / `INVALID_CATEGORY` / `INVALID_SUB_CATEGORY`（详见下面的"服务端校验"） |
 | 后端 endpoint | `POST {REPAIR_API_URL}/repair/request`，header `X-API-Key: <REPAIR_API_KEY>` |
-| 后端 body | `{productCategory, productsubCategory, productModel, serialNumber, province, city, district, description, brand, customerId}`（camelCase） |
-| 后端必填校验 | `productCategory, productsubCategory, province, city, district, description, brand` 缺任意一个 → `400 {"error":"Missing required fields: ..."}` |
-| 后端写库 | DynamoDB `RepairTicketsTable` PutItem：`ticketNumber`(随机 10 位) + 上面所有字段 + `status:"pending"` + `createdAt` + `updatedAt` |
+| 后端 body | `{productCategory, productsubCategory, productModel, serialNumber, description, brand, customerId}`（camelCase） |
+| 后端必填校验 | `productCategory, productsubCategory, description, brand, customerId` 缺任意一个 → `400 {"error":"Missing required fields: ..."}` |
+| 后端写库 | DynamoDB `RepairTicketsTable` PutItem：`ticketNumber`(WO-YYYY-NNNN) + 上面所有字段 + `customerPhone`(=customerId, 工单属主) + `status:"pending"` + `priority:"P2"` + `createdAt` + `updatedAt` |
 | 后端响应（201） | `{"message":"Repair ticket created successfully","ticketNumber":"...","ticket":{...}}` |
 | MCP 归一化出参（`RequestResponse`） | `{woNumber, created(bool), status, scheduledAt, message}` |
 
@@ -90,24 +90,24 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 
 | 项 | 内容 |
 |----|------|
-| MCP 入参（必填） | `woNumber`(10 位数字), `customerId` |
+| MCP 入参（必填） | `woNumber`(WO-YYYY-NNNN), `customerId` |
 | MCP 本地校验 | `INVALID_WO_NUMBER` / `MISSING_CUSTOMER_ID` |
 | 后端 endpoint | `POST {REPAIR_API_URL}/repair/track`，header `X-API-Key: <REPAIR_API_KEY>` |
 | 后端 body | `{woNumber, customerId}` |
-| 后端必填校验 | `woNumber` 必须 10 位数字；`customerId` 当前 Lambda 暂未读 |
-| 后端响应（200） | `{"message":"Repair ticket found","ticket":{ticketNumber,status,productCategory,productsubCategory,productModel,serialNumber,brand,province,city,district,description,createdAt,updatedAt}}`；找不到 → `404` |
+| 后端必填校验 | `woNumber` 必须 WO-YYYY-NNNN 格式；`customerId` 必填，用于**工单归属校验**（`ticket.customerPhone !== customerId` → `404`） |
+| 后端响应（200） | `{"message":"Repair ticket found","ticket":{ticketNumber,status,priority,productCategory,productsubCategory,productModel,serialNumber,brand,customerName,customerPhone,description,createdAt,updatedAt}}`；找不到/非属主 → `404` |
 | MCP 归一化出参（`TrackResponse`） | `{woNumber, status, statusDescription, scheduledAt, technicianName, technicianPhone, address, lastUpdatedAt, remarks}` |
 
 #### 5. `cancelRepair` — 取消工单
 
 | 项 | 内容 |
 |----|------|
-| MCP 入参（必填） | `woNumber`(10 位数字), `customerId` |
+| MCP 入参（必填） | `woNumber`(WO-YYYY-NNNN), `customerId` |
 | MCP 本地校验 | `INVALID_WO_NUMBER` / `MISSING_CUSTOMER_ID` |
 | 后端 endpoint | `POST {REPAIR_API_URL}/repair/cancel`，header `X-API-Key: <REPAIR_API_KEY>` |
 | 后端 body | `{woNumber, customerId}` |
-| 后端必填校验 | `woNumber` 必须 10 位数字；`customerId` 当前 Lambda 暂未读 |
-| 后端响应（200） | `{"message":"Repair ticket cancelled","ticketNumber":"...","status":"cancelled"}`；找不到 → `404`；状态已是 `cancelled`/`completed` → `409 {"error":"Work order is already ...","status":"..."}` |
+| 后端必填校验 | `woNumber` 必须 WO-YYYY-NNNN 格式；`customerId` 必填，用于**工单归属校验**（`ticket.customerPhone !== customerId` → `404`） |
+| 后端响应（200） | `{"message":"Repair ticket cancelled","ticketNumber":"...","status":"cancelled"}`；找不到/非属主 → `404`；状态已是 `cancelled`/`completed` → `409 {"error":"Work order is already ...","status":"..."}` |
 | MCP 归一化出参（`CancelResponse`） | `{woNumber, cancelled(bool), status, message}` |
 
 #### 错误码速查（MCP 本地拦截，不会打到后端）
@@ -121,21 +121,27 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 | `MISSING_CUSTOMER_ID` | `requestRepair` / `trackRepair` / `cancelRepair`（参数为空） |
 | `IDENTITY_INVALID` | `requestRepair` / `trackRepair` / `cancelRepair`（token 非法 / 篡改 / LLM 幻觉） |
 | `IDENTITY_EXPIRED` | `requestRepair` / `trackRepair` / `cancelRepair`（token 超过 `IDENTITY_TOKEN_TTL_S`） |
-| `INVALID_SUB_CATEGORY` | `requestRepair` |
-| `INVALID_PROVINCE` / `INVALID_CITY` / `INVALID_DISTRICT` | `requestRepair` |
+| `INVALID_CATEGORY` | `requestRepair`（品类不在 4 类机器人内） |
+| `INVALID_SUB_CATEGORY` | `requestRepair`（部件不属于该品类） |
 | `INVALID_WO_NUMBER` | `trackRepair` / `cancelRepair` |
 | `HTTP 400/404/409/500` | 后端透传，归一化时直接跳过（错误路径保持确定） |
 
 ### 服务端校验（`requestRepair`）
 
-除了 `customerId` / 工单号格式校验之外，`requestRepair` 在打到后端之前会再做两层本地校验，校验失败立刻返回错误、不发出网络请求：
+除了 `customerId` / 工单号格式校验之外，`requestRepair` 在打到后端之前会再做一层本地校验，校验失败立刻返回错误、不发出网络请求：
 
 | 字段 | 规则 | 失败时返回 |
 |------|------|------------|
-| `productsubCategory` | 必须是 `smart version` / `premium version` / `elite version` 三个枚举值之一（大小写、内部空格不敏感） | `{"error": "INVALID_SUB_CATEGORY", "allowed": [...]}` |
-| `province` / `city` / `district` | 用 `china_regions_pinyin.json` 校验，接受**中文**或**拼音**（带不带行政后缀都行）；三者必须层级一致。**直辖市特例**：北京/上海/天津/重庆没有真正的 city 层，允许 `city == province`（如 `province="Beijing", city="Beijing", district="Chaoyang"`）；docstring 已显式提示 LLM 不要追问 city | `{"error": "INVALID_PROVINCE" \| "INVALID_CITY" \| "INVALID_DISTRICT"}` |
+| `productCategory` + `productsubCategory` | **组合校验**：`productCategory` 必须是 4 类机器人之一，且 `productsubCategory` 必须是该品类下的合法部件（大小写、空格不敏感）。映射见下表 | `{"error": "INVALID_CATEGORY", "allowed": [...]}`（品类不对）或 `{"error": "INVALID_SUB_CATEGORY", "allowed": [...]}`（部件不属于该品类，`allowed` 列出该品类的合法部件） |
 
-数据来源：[modood/Administrative-divisions-of-China](https://github.com/modood/Administrative-divisions-of-China)（WTFPL）。当行政区划数据需要刷新时跑一次 `gen_regions.py` 重新生成 `china_regions_pinyin.json`（依赖 `pypinyin`，仅在生成时需要，运行时不依赖）。
+机器人品类 → 部件映射（`mcp_server.py` 中的 `ROBOT_CATEGORIES`）：
+
+| 品类 | 合法部件 | 型号示例 |
+|------|----------|----------|
+| 仓储机器人 | 导航传感器 / 电池 / 驱动电机 / 通信模块 | WR-500, WR-800 |
+| 巡检机器人 | 热成像模块 / 轮组 / 气体传感器 / 通信 | IR-200, IR-400 |
+| 协作机械臂 | 关节电机 / 力矩传感器 / 控制器 / 线缆 | CA-100, CA-300 |
+| 服务机器人 | 语音模块 / 屏幕 / 导航 / 电池 | SR-50, SR-100 |
 
 ### 响应归一化（`requestRepair` / `trackRepair` / `cancelRepair`）
 
@@ -203,7 +209,7 @@ cp .env.example .env
 ./deploy.sh
 ```
 
-`./deploy.sh` 把这个目录里的源码 (`mcp_server.py`、`Dockerfile`、`requirements.txt`、`buildspec.yml`、`china_regions_pinyin.json`) 打包送进 CodeBuild 构建 ARM64 镜像、创建 Runtime、并自动创建一个 `authorizerType=NONE` 的 Gateway（仅适用于测试 / Quick Desktop & Quick Web 演示）。
+`./deploy.sh` 把这个目录里的源码 (`mcp_server.py`、`Dockerfile`、`requirements.txt`、`buildspec.yml`) 打包送进 CodeBuild 构建 ARM64 镜像、创建 Runtime、并自动创建一个 `authorizerType=NONE` 的 Gateway（仅适用于测试 / Quick Desktop & Quick Web 演示）。
 
 > ⚠️ Inbound auth 是 `NONE` —— 任何拿到 MCP URL 的人都能调你的工具。生产环境请通过 `.env` 的 `GATEWAY_ID` + `GATEWAY_SERVICE_ROLE` 复用一个已经配好 `CUSTOM_JWT` 或 `AWS_IAM` 的 Gateway。
 
@@ -296,8 +302,6 @@ python mcp_server.py
 | `Dockerfile` | ARM64 容器（Python 3.11，非 root 用户） |
 | `requirements.txt` | Python 依赖 |
 | `buildspec.yml` | CodeBuild 构建脚本 |
-| `china_regions_pinyin.json` | 中国省/市/区拼音清单（运行时用于地址校验） |
-| `gen_regions.py` | 一次性生成上面 JSON 的脚本（数据源变更时再跑） |
 
 > 部署/清理脚本和 `.env` 模板都在仓库根目录 `midea/`，详见 [`../README.md`](../README.md)。
 
@@ -307,7 +311,7 @@ python mcp_server.py
 - Dockerfile 遵循官方示例：Python 3.11 基础镜像、非 root 用户 `bedrock_agentcore`、启动命令 `opentelemetry-instrument python -m mcp_server`（ADOT 自动加载 OTEL，详见上面的"可观测性"章节）
 - 所有 tool 都使用 `@mcp.tool(structured_output=False)` —— 返回体只含 `content[]`，没有 `structuredContent` 字段，避免 Connect AI Agent 解析路径上的兼容问题
 - Tool 函数体内手工 `json.dumps(dict)`（字符串），Connect Output Filter 必须勾选 `result`，否则 LLM 拿不到返回值
-- `trackRepair` / `cancelRepair` 在工具内部就会校验 `woNumber` 非空且为 10 位数字，校验失败直接返回 `{"error": "INVALID_WO_NUMBER"}`，不会发出网络请求
+- `trackRepair` / `cancelRepair` 在工具内部就会校验 `woNumber` 非空且为 WO-YYYY-NNNN 格式，校验失败直接返回 `{"error": "INVALID_WO_NUMBER"}`，不会发出网络请求
 - Gateway name 受 AWS 限制：仅允许 `[0-9a-zA-Z-]`，最长 48 字符。脚本自动用 `${AGENT_NAME}-gw` 拼接并裁剪
 - Gateway audience 必须等于 Gateway 自身的 ID。一旦看到 Gateway 日志报 `insufficient_scope - The request requires higher privileges than provided by the access token.`，多半就是 audience 配错了
 - API Key 通过环境变量注入到 Runtime（生产环境建议改用 Secrets Manager）

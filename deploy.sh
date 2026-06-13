@@ -248,7 +248,7 @@ if ! aws s3 ls "s3://${S3_BUCKET}" --region "${REGION}" >/dev/null 2>&1; then
     aws s3 mb "s3://${S3_BUCKET}" --region "${REGION}" >/dev/null
 fi
 ( cd mcp-agent && \
-  zip -j /tmp/mcp-agent-source.zip mcp_server.py china_regions_pinyin.json Dockerfile requirements.txt buildspec.yml .dockerignore >/dev/null )
+  zip -j /tmp/mcp-agent-source.zip mcp_server.py Dockerfile requirements.txt buildspec.yml .dockerignore >/dev/null )
 aws s3 cp /tmp/mcp-agent-source.zip "s3://${S3_BUCKET}/source.zip" --region "${REGION}" >/dev/null
 rm -f /tmp/mcp-agent-source.zip
 echo -e "${GREEN}✓ Source uploaded${NC}"
