@@ -53,6 +53,46 @@ chmod +x deploy.sh cleanup.sh test-api.sh
 - **Outbound (Gateway → AgentCore Runtime)**: `GATEWAY_IAM_ROLE`
 - **MCP Agent → Backend API**: API Key（注入到 Runtime 环境变量；生产建议改 Secrets Manager）
 
+## 在 Amazon Quick 中直连 MCP server（OAuth / Keycloak）
+
+除了 `Quick → Gateway(NONE)` 这条链路，还可以让 **Quick 直连一个带 Keycloak JWT 入站鉴权的独立 AgentCore Runtime**（不经过 Gateway）。这条路由由独立脚本 `deploy_runtime_oauth.py` 创建，与默认 `deploy.sh`（Gateway + SigV4 runtime）完全隔离、互不影响，可随时切换。
+
+```bash
+# .env 里配置（非密；client secret 绝不入库）：
+#   OAUTH_DISCOVERY_URL=https://<keycloak>/realms/<realm>/.well-known/openid-configuration
+#   OAUTH_ALLOWED_AUDIENCE=account          # 必须用 account（见下方踩坑）
+#   OAUTH_CLIENT_ID=<quick 用的 client id>  # 仅展示用
+./.venv/bin/python deploy_runtime_oauth.py   # 或 venv/bin/python，复用现有 ECR 镜像
+```
+
+脚本跑完会打印 Quick 需要填写的 **MCP server URL**。在 Quick → **Connectors / Integrations → Model Context Protocol** 里新建，选 **Custom user based OAuth**（即 User authentication / 3LO），填写：
+
+```
+MCP server URL    = <脚本输出的 runtime invocations URL，含 ?qualifier=DEFAULT>
+Auth type         = OAuth 2.0 (User authentication / 3LO)
+Client id         = <你的 OAuth client id>
+Client Secret     = <你持有的 secret —— 不写入仓库任何文件>
+Token URL         = https://<keycloak>/realms/<realm>/protocol/openid-connect/token
+Authorization URL = https://<keycloak>/realms/<realm>/protocol/openid-connect/auth
+Redirect URL      = https://us-east-1.quicksight.aws.amazon.com/sn/oauthcallback
+```
+
+> Keycloak client 需要：开启 Standard flow（授权码）、PKCE=S256、把上面的 Redirect URL 加进 **Valid Redirect URIs**。
+
+### ⚠️ 踩坑记录（Quick 连 Runtime 时 "Creation failed" 的两个根因）
+
+Quick 的 OAuth 流程会成功（Keycloak 日志可见 LOGIN + CODE_TO_TOKEN 无错），但 connector 在 **publish 阶段** 仍报 `Creation failed`。逐字段对照一个能成功的 runtime 后定位到两个**必须满足**的条件：
+
+1. **runtime 的 JWT authorizer 必须用 `allowedAudience: ["account"]`**，**不能**用 `allowedClients`。
+   Quick 拿到的 token `aud=["<client_id>","account"]`；用 `allowedClients` 校验会导致 publish 失败，用共享的 `account` audience 才能过。`deploy_runtime_oauth.py` 已默认 `allowedAudience=account`。
+
+2. **每个 MCP 工具必须暴露 `outputSchema`**。
+   工具若用 `@mcp.tool(structured_output=False)` 就不会生成 `outputSchema`，Quick 注册 action 时校验失败。改回 `@mcp.tool()`（FastMCP 自动按返回类型生成 outputSchema）即可。本仓库 4 个工具已全部改回。
+
+   > 副作用：去掉 `structured_output=False` 后，工具返回体除 `content[]` 外还会带 `structuredContent`。对老的 Connect/Gateway 路径无影响（只是多一个字段）。
+
+诊断时还排除了若干**非根因**：OAuth 本身、JWT 验签、MCP `initialize`/`tools/list`（均 HTTP 200）、`inputSchema` 合法性（合法 Draft-7）、description 长度（压缩后仍失败）。真正卡点就是上面两条。
+
 ## 部署
 
 > 推荐在 **AWS CloudShell** 中执行：脚本会自动通过 `aws sts get-caller-identity` 解析当前账号 ID,并在 boto3 schema 不够新时(CloudShell 自带 1.42.x)自动创建 venv 升级到 `boto3>=1.43`。
@@ -137,6 +177,7 @@ midea/
 ├── .env.example               # 配置模板（fresh clone 复制为 .env）
 ├── deploy.sh                  # 统一部署脚本（API + MCP Agent + Gateway 一条命令）
 ├── deploy_runtime.py          # Steps 10-12 (Runtime + Gateway + Target，被 deploy.sh 调用)
+├── deploy_runtime_oauth.py    # 独立脚本：建带 Keycloak JWT 鉴权的第 2 个 Runtime，供 Quick 直连（见“在 Amazon Quick 中直连 MCP server”）
 ├── cleanup.sh                 # 统一清理脚本（reverse order）
 ├── test-api.sh                # Backend API 端到端测试
 ├── connect-api-customer.yaml  # CloudFormation 模板（含 Lambda inline code + 10 张预置工单 seed）

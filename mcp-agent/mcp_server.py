@@ -335,7 +335,7 @@ def _authenticate_caller(caller_name: str, caller_phone_tail: str) -> Tuple[Opti
     }
 
 
-@mcp.tool(structured_output=False)
+@mcp.tool()
 def requestRepair(
     productCategory: str,
     productsubCategory: str,
@@ -348,68 +348,24 @@ def requestRepair(
 ) -> str:
     """Create a new industrial-robot repair work order.
 
-    IDENTITY — read this BEFORE doing anything else:
-      Identity is RE-VERIFIED on EVERY call. You MUST ASK THE CUSTOMER for
-      their identity EVERY SINGLE TIME you call this tool — once per work
-      order, on every track / cancel / create. Do NOT reuse the name or
-      digits the customer gave for a PREVIOUS work order or an earlier turn
-      in this conversation, even if it was seconds ago: ask again, fresh,
-      and pass exactly what they say THIS time. (Each work order may belong
-      to a different company, so the previous caller's identity is usually
-      wrong for the next request.) The two arguments you collect each time:
-        - callerName: the customer's name — their company name OR the
-          contact person's name (either works).
-        - callerPhoneTail: the last 4 digits of the customer's phone number.
-      The server matches this (name, last-4) pair against the registered
-      customer list. If it matches, the work order is created and owned by
-      that customer. If not, the server returns:
-        - {"error": "INVALID_NAME"}      → callerName was empty; ask for it.
-        - {"error": "INVALID_SMS_TOKEN"} → callerPhoneTail wasn't 4 digits;
-                                            ask the customer to repeat them.
-        - {"error": "CUSTOMER_NOT_FOUND"}→ no customer matches that name +
-                                            last-4; ask the customer to
-                                            confirm both, then retry.
-      There is NO separate verify step and NO saved verification — always
-      pass callerName + callerPhoneTail on every call.
+    Identity is re-verified on EVERY call: ask for callerName + callerPhoneTail
+    each time; never reuse values from a previous work order.
 
-    PRECONDITIONS (the caller MUST satisfy before invoking this tool):
-      - productCategory: MUST be one of the robot categories: 仓储机器人,
-        巡检机器人, 协作机械臂, 服务机器人. Any other value is rejected with
-        {"error": "INVALID_CATEGORY"} (the response lists the allowed values).
-      - productsubCategory: MUST be a component that belongs to the chosen
-        productCategory (the pair is validated together, case-insensitive):
-          • 仓储机器人 → 导航传感器 / 电池 / 驱动电机 / 通信模块
-          • 巡检机器人 → 热成像模块 / 轮组 / 气体传感器 / 通信
-          • 协作机械臂 → 关节电机 / 力矩传感器 / 控制器 / 线缆
-          • 服务机器人 → 语音模块 / 屏幕 / 导航 / 电池
-        A component that does not belong to the category is rejected with
-        {"error": "INVALID_SUB_CATEGORY"} (the response lists the components
-        allowed for that category). Ask the customer to clarify — do NOT
-        retry with the same bad value.
-      - productModel / serialNumber (optional): the robot model (e.g. "WR-500",
-        "IR-400 #3") and/or unit serial number, if the customer can provide them.
-      - brand: product brand / manufacturer. Required. Extracted from the dialog.
-      - description: AI-generated summary plus the dialog transcript, produced
-        from the conversation context.
+    productCategory must be 仓储机器人 / 巡检机器人 / 协作机械臂 / 服务机器人, and
+    productsubCategory a component of it (e.g. 仓储机器人: 导航传感器/电池/驱动电机/
+    通信模块), else INVALID_CATEGORY / INVALID_SUB_CATEGORY.
 
-    RETURNS — canonical schema (upstream field names like `wono` / `ticketId` /
-    `orderNumber` are normalized onto `woNumber`):
-      - woNumber:    Newly created work-order number (string like "WO-2026-1234", "" on failure).
-      - created:     Boolean — true iff upstream confirms the work order was created.
-      - status:      Initial work-order status (string, e.g. "pending").
-      - scheduledAt: Initial scheduled service time (ISO 8601 string, "" if unknown).
-      - message:     Human-readable confirmation or failure reason (string).
-    Empty strings mean "unknown" — phrase them to the customer accordingly.
-    Error envelopes ({"error": "..."}) are returned unchanged.
+    Returns {woNumber, created, status, scheduledAt, message}. Identity errors:
+    INVALID_NAME / INVALID_SMS_TOKEN / CUSTOMER_NOT_FOUND.
 
     Args:
-        productCategory: Top-level robot category. Required. One of: 仓储机器人, 巡检机器人, 协作机械臂, 服务机器人.
-        productsubCategory: Faulty component. Required. Must belong to the chosen productCategory (see PRECONDITIONS).
-        description: Work-order remark — AI summary plus dialog transcript. Required.
-        brand: Product brand / manufacturer. Required. Extracted from the dialog.
-        callerName: The customer's name for identity verification — company name OR contact person's name. Required, non-empty. ASK THE CUSTOMER FOR THIS EVERY TIME — never reuse a name from a previous work order or earlier turn.
-        callerPhoneTail: The last 4 digits of the customer's phone number, for identity verification. Required, exactly 4 digits. ASK THE CUSTOMER FOR THIS EVERY TIME — never reuse digits from a previous work order or earlier turn.
-        productModel: Robot model, e.g. "WR-500" / "IR-400 #3". Optional.
+        productCategory: 仓储机器人, 巡检机器人, 协作机械臂, or 服务机器人.
+        productsubCategory: Faulty component of productCategory.
+        description: AI summary plus dialog transcript.
+        brand: Product brand / manufacturer.
+        callerName: Company or contact name. Ask each call; never reuse.
+        callerPhoneTail: Last 4 phone digits. Ask each call; never reuse.
+        productModel: Robot model, e.g. WR-500. Optional.
         serialNumber: Unit serial number. Optional.
     """
     customer_phone, err = _authenticate_caller(callerName, callerPhoneTail)
@@ -431,60 +387,24 @@ def requestRepair(
     return json.dumps(result)
 
 
-@mcp.tool(structured_output=False)
+@mcp.tool()
 def trackRepair(woNumber: str, callerName: str, callerPhoneTail: str) -> str:
     """Query the status of an existing repair work order by its work-order number.
 
-    IDENTITY — read this BEFORE doing anything else:
-      Identity is RE-VERIFIED on EVERY call. You MUST ASK THE CUSTOMER for
-      their identity EVERY SINGLE TIME you call this tool — once per work
-      order, on every track / cancel / create. Do NOT reuse the name or
-      digits the customer gave for a PREVIOUS work order or an earlier turn
-      in this conversation, even if it was seconds ago: ask again, fresh,
-      and pass exactly what they say THIS time. (Each work order may belong
-      to a different company, so the previous caller's identity is usually
-      wrong for the next request.) The two arguments you collect each time:
-        - callerName: the customer's name — their company name OR the
-          contact person's name (either works).
-        - callerPhoneTail: the last 4 digits of the customer's phone number.
-      The server matches this (name, last-4) pair against the registered
-      customer list, then returns the work order ONLY if it belongs to that
-      customer (a customer may only see their OWN company's work orders).
-      Possible errors:
-        - {"error": "INVALID_NAME"}      → callerName was empty; ask for it.
-        - {"error": "INVALID_SMS_TOKEN"} → callerPhoneTail wasn't 4 digits;
-                                            ask the customer to repeat them.
-        - {"error": "CUSTOMER_NOT_FOUND"}→ no customer matches that name +
-                                            last-4; ask the customer to
-                                            confirm both, then retry.
-      There is NO separate verify step and NO saved verification — always
-      pass callerName + callerPhoneTail on every call.
+    Identity is re-verified on EVERY call: ask the customer for callerName +
+    callerPhoneTail each time and never reuse values from a previous work order.
+    A customer may only see their OWN company's work orders — a work order owned
+    by a different customer (or one that does not exist) returns HTTP 404.
 
-    PRECONDITIONS (the caller MUST satisfy before invoking this tool):
-      - woNumber must be non-empty and match the work-order number format
-        (a WO-YYYY-NNNN string, e.g. WO-2026-0001).
-
-    RETURNS — canonical schema (the upstream API may use different field names
-    such as `ticketstatus`, `tstatus`, `statusName`; this tool normalizes them
-    so you can rely on these exact keys):
-      - woNumber:           Work-order number (string).
-      - status:             Current work-order status (string).
-      - statusDescription:  Human-readable status explanation (string).
-      - scheduledAt:        Scheduled service time (ISO 8601 string, "" if unknown).
-      - technicianName:     Technician's full name (string, "" if unassigned).
-      - technicianPhone:    Technician's contact phone (string, "" if unknown).
-      - address:            Service address (string).
-      - lastUpdatedAt:      Last update timestamp (ISO 8601 string, "" if unknown).
-      - remarks:            Additional notes (string).
-    Empty strings mean "unknown" — phrase them to the customer accordingly
-    (e.g. "no technician has been assigned yet"), do NOT invent values.
-    A work order that does not exist OR does not belong to this customer
-    returns the upstream {"error": "..."} envelope (e.g. HTTP 404) unchanged.
+    Returns {woNumber, status, statusDescription, scheduledAt, technicianName,
+    technicianPhone, address, lastUpdatedAt, remarks}; empty strings mean
+    "unknown" — do not invent values. Errors: INVALID_WO_NUMBER (bad format),
+    INVALID_NAME / INVALID_SMS_TOKEN / CUSTOMER_NOT_FOUND (identity).
 
     Args:
-        woNumber: Work-order number. Required, non-empty, a WO-YYYY-NNNN string (e.g. WO-2026-0001).
-        callerName: The customer's name for identity verification — company name OR contact person's name. Required, non-empty. ASK THE CUSTOMER FOR THIS EVERY TIME — never reuse a name from a previous work order or earlier turn.
-        callerPhoneTail: The last 4 digits of the customer's phone number, for identity verification. Required, exactly 4 digits. ASK THE CUSTOMER FOR THIS EVERY TIME — never reuse digits from a previous work order or earlier turn.
+        woNumber: Work-order number, a WO-YYYY-NNNN string (e.g. WO-2026-0001).
+        callerName: Customer's company name OR contact person's name. Ask every call; never reuse.
+        callerPhoneTail: Last 4 digits of the customer's phone number. Ask every call; never reuse.
     """
     err = _validate_wo_number(woNumber)
     if err:
@@ -500,52 +420,24 @@ def trackRepair(woNumber: str, callerName: str, callerPhoneTail: str) -> str:
     return json.dumps(result)
 
 
-@mcp.tool(structured_output=False)
+@mcp.tool()
 def cancelRepair(woNumber: str, callerName: str, callerPhoneTail: str) -> str:
     """Cancel an existing repair work order by its work-order number.
 
-    IDENTITY — read this BEFORE doing anything else:
-      Identity is RE-VERIFIED on EVERY call. You MUST ASK THE CUSTOMER for
-      their identity EVERY SINGLE TIME you call this tool — once per work
-      order, on every track / cancel / create. Do NOT reuse the name or
-      digits the customer gave for a PREVIOUS work order or an earlier turn
-      in this conversation, even if it was seconds ago: ask again, fresh,
-      and pass exactly what they say THIS time. (Each work order may belong
-      to a different company, so the previous caller's identity is usually
-      wrong for the next request.) The two arguments you collect each time:
-        - callerName: the customer's name — their company name OR the
-          contact person's name (either works).
-        - callerPhoneTail: the last 4 digits of the customer's phone number.
-      The server matches this (name, last-4) pair against the registered
-      customer list, then cancels the work order ONLY if it belongs to that
-      customer (a customer may only cancel their OWN company's work orders).
-      Possible errors:
-        - {"error": "INVALID_NAME"}      → callerName was empty; ask for it.
-        - {"error": "INVALID_SMS_TOKEN"} → callerPhoneTail wasn't 4 digits;
-                                            ask the customer to repeat them.
-        - {"error": "CUSTOMER_NOT_FOUND"}→ no customer matches that name +
-                                            last-4; ask the customer to
-                                            confirm both, then retry.
-      There is NO separate verify step and NO saved verification — always
-      pass callerName + callerPhoneTail on every call. Cancellation is
-      destructive: obtain explicit customer confirmation first.
+    Cancellation is destructive: obtain explicit customer confirmation first.
+    Identity is re-verified on EVERY call: ask the customer for callerName +
+    callerPhoneTail each time and never reuse values from a previous work order.
+    A customer may only cancel their OWN company's work orders — a work order
+    owned by a different customer (or one that does not exist) returns HTTP 404.
 
-    PRECONDITIONS (the caller MUST satisfy before invoking this tool):
-      - woNumber must be non-empty and match the work-order number format
-        (a WO-YYYY-NNNN string, e.g. WO-2026-0001).
-
-    RETURNS — canonical schema (upstream field names are normalized):
-      - woNumber:   Work-order number (string).
-      - cancelled:  Boolean — true if the cancellation succeeded.
-      - status:     Resulting work-order status after the cancel call (string).
-      - message:    Human-readable confirmation or failure reason (string).
-    A work order that does not exist OR does not belong to this customer
-    returns the upstream {"error": "..."} envelope (e.g. HTTP 404) unchanged.
+    Returns {woNumber, cancelled, status, message}. Already cancelled/completed
+    orders return HTTP 409. Errors: INVALID_WO_NUMBER (bad format),
+    INVALID_NAME / INVALID_SMS_TOKEN / CUSTOMER_NOT_FOUND (identity).
 
     Args:
-        woNumber: Work-order number. Required, non-empty, a WO-YYYY-NNNN string (e.g. WO-2026-0001).
-        callerName: The customer's name for identity verification — company name OR contact person's name. Required, non-empty. ASK THE CUSTOMER FOR THIS EVERY TIME — never reuse a name from a previous work order or earlier turn.
-        callerPhoneTail: The last 4 digits of the customer's phone number, for identity verification. Required, exactly 4 digits. ASK THE CUSTOMER FOR THIS EVERY TIME — never reuse digits from a previous work order or earlier turn.
+        woNumber: Work-order number, a WO-YYYY-NNNN string (e.g. WO-2026-0001).
+        callerName: Customer's company name OR contact person's name. Ask every call; never reuse.
+        callerPhoneTail: Last 4 digits of the customer's phone number. Ask every call; never reuse.
     """
     err = _validate_wo_number(woNumber)
     if err:
@@ -561,7 +453,7 @@ def cancelRepair(woNumber: str, callerName: str, callerPhoneTail: str) -> str:
     return json.dumps(result)
 
 
-@mcp.tool(structured_output=False)
+@mcp.tool()
 def faqSearch(query: str) -> str:
     """Search the FAQ knowledge base using natural language queries. Returns relevant FAQ entries about product usage, troubleshooting, warranty, and repair services.
 
