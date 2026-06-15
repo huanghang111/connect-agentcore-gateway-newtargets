@@ -1053,6 +1053,149 @@ Resources:
               }
           };
 
+  UpdateRepairFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt RepairLambdaExecutionRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref RepairLambdaLogGroup
+        LogFormat: JSON
+      Environment:
+        Variables:
+          REPAIR_TICKETS_TABLE_NAME: !Ref RepairTicketsTable
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, GetCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
+
+          const client = new DynamoDBClient({});
+          const docClient = DynamoDBDocumentClient.from(client);
+
+          // status here intentionally EXCLUDES 'cancelled' — cancelling a work
+          // order is done via /repair/cancel, not this update endpoint.
+          const ALLOWED_STATUS = ['pending', 'scheduled', 'in_progress', 'completed'];
+          const ALLOWED_PRIORITY = ['P0', 'P1', 'P2', 'P3'];
+
+          const resp = (statusCode, obj) => ({
+              statusCode,
+              headers: {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+              },
+              body: JSON.stringify(obj),
+          });
+
+          exports.handler = async (event) => {
+              const requestId = event.requestContext?.requestId || 'unknown';
+              console.log(JSON.stringify({
+                  level: 'INFO',
+                  message: 'Update repair request received',
+                  requestId,
+                  event: event
+              }));
+
+              try {
+                  const body = JSON.parse(event.body || '{}');
+                  const { woNumber, customerId, description, priority, status } = body;
+
+                  if (!woNumber || !/^WO-\d{4}-\d{4}$/.test(woNumber)) {
+                      return resp(400, { error: 'woNumber is required and must look like WO-YYYY-NNNN' });
+                  }
+                  // customerId is the verified caller phone number forwarded by the
+                  // MCP server. Required so we can enforce ticket ownership.
+                  if (!customerId) {
+                      return resp(400, { error: 'customerId is required' });
+                  }
+
+                  // At least one mutable field must be provided.
+                  const hasDescription = description !== undefined && description !== null && description !== '';
+                  const hasPriority = priority !== undefined && priority !== null && priority !== '';
+                  const hasStatus = status !== undefined && status !== null && status !== '';
+                  if (!hasDescription && !hasPriority && !hasStatus) {
+                      return resp(400, { error: 'Provide at least one of: description, priority, status' });
+                  }
+                  if (hasPriority && !ALLOWED_PRIORITY.includes(priority)) {
+                      return resp(400, { error: `priority must be one of: ${ALLOWED_PRIORITY.join(', ')}` });
+                  }
+                  if (hasStatus && !ALLOWED_STATUS.includes(status)) {
+                      return resp(400, { error: `status must be one of: ${ALLOWED_STATUS.join(', ')}` });
+                  }
+
+                  // Look up the ticket first so we can return precise 404/409.
+                  const getResult = await docClient.send(new GetCommand({
+                      TableName: process.env.REPAIR_TICKETS_TABLE_NAME,
+                      Key: { ticketNumber: woNumber },
+                  }));
+
+                  // Ownership enforcement: only the owning company may update.
+                  // Missing ticket OR foreign owner → identical 404 (never reveal
+                  // that someone else's work order exists).
+                  if (!getResult.Item || getResult.Item.customerPhone !== customerId) {
+                      return resp(404, { error: 'Repair ticket not found' });
+                  }
+
+                  const currentStatus = getResult.Item.status;
+                  if (currentStatus === 'cancelled' || currentStatus === 'completed') {
+                      return resp(409, {
+                          error: `Work order is already ${currentStatus} and cannot be modified`,
+                          status: currentStatus,
+                      });
+                  }
+
+                  // Build a dynamic SET expression from only the provided fields.
+                  const sets = ['updatedAt = :u'];
+                  const names = {};
+                  const values = { ':u': new Date().toISOString() };
+                  if (hasDescription) { sets.push('description = :d'); values[':d'] = description; }
+                  if (hasPriority) { sets.push('priority = :p'); values[':p'] = priority; }
+                  if (hasStatus) { sets.push('#s = :s'); names['#s'] = 'status'; values[':s'] = status; }
+
+                  const updateParams = {
+                      TableName: process.env.REPAIR_TICKETS_TABLE_NAME,
+                      Key: { ticketNumber: woNumber },
+                      UpdateExpression: 'SET ' + sets.join(', '),
+                      ExpressionAttributeValues: values,
+                      ReturnValues: 'ALL_NEW',
+                  };
+                  if (Object.keys(names).length > 0) {
+                      updateParams.ExpressionAttributeNames = names;
+                  }
+
+                  const updated = await docClient.send(new UpdateCommand(updateParams));
+                  const item = updated.Attributes || {};
+
+                  console.log(JSON.stringify({
+                      level: 'INFO',
+                      message: 'Repair ticket updated',
+                      requestId,
+                      ticketNumber: woNumber,
+                      updatedFields: sets.filter(s => s !== 'updatedAt = :u'),
+                  }));
+
+                  return resp(200, {
+                      message: 'Repair ticket updated',
+                      ticketNumber: woNumber,
+                      status: item.status ?? null,
+                      priority: item.priority ?? null,
+                      description: item.description ?? null,
+                      updatedAt: item.updatedAt ?? null,
+                  });
+              } catch (error) {
+                  console.log(JSON.stringify({
+                      level: 'ERROR',
+                      message: 'Error updating repair ticket',
+                      requestId,
+                      error: error.message,
+                      stack: error.stack
+                  }));
+                  return resp(500, { error: 'Internal server error', message: error.message });
+              }
+          };
+
   FaqSimpleFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -1306,6 +1449,14 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HotelApi}/*/*'
 
+  UpdateRepairPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UpdateRepairFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HotelApi}/*/*'
+
   FaqSimplePermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -1402,6 +1553,32 @@ Resources:
                 type: 'aws_proxy'
                 httpMethod: 'POST'
                 uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CancelRepairFunction.Arn}/invocations'
+          /repair/update:
+            post:
+              operationId: 'updateRepair'
+              security:
+                - api_key: []
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      $ref: '#/components/schemas/UpdateRepairRequest'
+              responses:
+                '401':
+                  description: 'Unauthorized - API key required'
+                '400':
+                  description: '400 response'
+                '404':
+                  description: '404 response'
+                '409':
+                  description: '409 response'
+                '200':
+                  description: '200 response'
+              x-amazon-apigateway-integration:
+                type: 'aws_proxy'
+                httpMethod: 'POST'
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UpdateRepairFunction.Arn}/invocations'
           /faq/simple:
             post:
               operationId: 'faqSimple'
@@ -1476,6 +1653,25 @@ Resources:
                   pattern: '^WO-\d{4}-\d{4}$'
                 customerId:
                   type: 'string'
+            UpdateRepairRequest:
+              type: 'object'
+              required:
+                - woNumber
+                - customerId
+              properties:
+                woNumber:
+                  type: 'string'
+                  pattern: '^WO-\d{4}-\d{4}$'
+                customerId:
+                  type: 'string'
+                description:
+                  type: 'string'
+                priority:
+                  type: 'string'
+                  enum: ['P0', 'P1', 'P2', 'P3']
+                status:
+                  type: 'string'
+                  enum: ['pending', 'scheduled', 'in_progress', 'completed']
           securitySchemes:
             api_key:
               type: 'apiKey'
@@ -1547,4 +1743,5 @@ Outputs:
       Request Repair: https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/repair/request
       Track Repair:   https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/repair/track
       Cancel Repair:  https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/repair/cancel
+      Update Repair:  https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/repair/update
       FAQ Simple:     https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/faq/simple

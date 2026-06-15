@@ -220,6 +220,58 @@ else
 fi
 echo ""
 
+# 测试12: 更新工单 - 本人改优先级+状态 (WO-2026-0003 属于顺丰 13688881234)
+echo -e "${YELLOW}测试 12: 更新工单 (优先级+状态)${NC}"
+RESPONSE=$(curl -s -X POST "$API_URL/repair/update" \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  --data-raw '{"woNumber":"WO-2026-0003","customerId":"13688881234","priority":"P1","status":"in_progress"}')
+
+if echo "$RESPONSE" | grep -q "Repair ticket updated"; then
+    echo -e "${GREEN}✓ 工单更新成功${NC}"
+else
+    echo -e "${RED}✗ 工单更新失败${NC}"
+    echo "$RESPONSE"
+fi
+echo ""
+
+# 测试13: 非法优先级应返回 400
+echo -e "${YELLOW}测试 13: 错误处理 - 非法优先级${NC}"
+RESPONSE=$(curl -s -X POST "$API_URL/repair/update" \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  --data-raw '{"woNumber":"WO-2026-0003","customerId":"13688881234","priority":"P9"}')
+
+if echo "$RESPONSE" | grep -q "priority must be one of"; then
+    echo -e "${GREEN}✓ 错误处理正确（拒绝非法优先级）${NC}"
+else
+    echo -e "${RED}✗ 错误处理异常${NC}"
+    echo "$RESPONSE"
+fi
+echo ""
+
+# 测试14: 更新工单归属校验 - 他人改应返回 404
+echo -e "${YELLOW}测试 14: 更新归属校验 - 他人改 WO-2026-0003${NC}"
+RESPONSE=$(curl -s -X POST "$API_URL/repair/update" \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  --data-raw '{"woNumber":"WO-2026-0003","customerId":"13800018888","status":"completed"}')
+
+if echo "$RESPONSE" | grep -q "not found"; then
+    echo -e "${GREEN}✓ 归属校验正确（非属主无法修改）${NC}"
+else
+    echo -e "${RED}✗ 归属校验异常 - 非属主不应能改该工单${NC}"
+    echo "$RESPONSE"
+fi
+echo ""
+
+# 还原 WO-2026-0003 到预置状态 (顺丰本人)
+curl -s -X POST "$API_URL/repair/update" \
+  -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
+  --data-raw '{"woNumber":"WO-2026-0003","customerId":"13688881234","priority":"P2","status":"pending"}' >/dev/null
+echo "（已还原 WO-2026-0003 到预置状态 P2/pending）"
+echo ""
+
 echo -e "${GREEN}=== 所有测试完成 ===${NC}"
 echo ""
 echo "测试工单号: $TICKET_NUMBER"

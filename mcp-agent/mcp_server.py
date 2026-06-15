@@ -122,6 +122,19 @@ class RequestResponse(BaseModel):
     message: str = Field(default="", description="Human-readable confirmation or failure reason.")
 
 
+class UpdateResponse(BaseModel):
+    """Canonical update-repair response. Pull values from semantically equivalent
+    upstream keys; use empty strings for unknown text fields. `updated` is true
+    only when the upstream confirms the work order was modified."""
+
+    woNumber: str = Field(default="", description="Work-order number.")
+    updated: bool = Field(default=False, description="True iff the upstream confirms the work order was updated.")
+    status: str = Field(default="", description="Work-order status after the update.")
+    priority: str = Field(default="", description="Work-order priority after the update (P0=urgent, P1=high, P2=medium, P3=low).")
+    description: str = Field(default="", description="Fault description after the update.")
+    message: str = Field(default="", description="Human-readable confirmation or failure reason.")
+
+
 _normalize_agent = None
 
 
@@ -450,6 +463,80 @@ def cancelRepair(woNumber: str, callerName: str, callerPhoneTail: str) -> str:
         "customerId": customer_phone,
     })
     result = _normalize_with_llm(result, CancelResponse, "cancelRepair")
+    return json.dumps(result)
+
+
+# Mutable-field value ranges for updateRepair. status EXCLUDES "cancelled":
+# cancelling is done via cancelRepair, not this tool.
+UPDATE_PRIORITY_ENUM = ("P0", "P1", "P2", "P3")
+UPDATE_STATUS_ENUM = ("pending", "scheduled", "in_progress", "completed")
+
+
+@mcp.tool()
+def updateRepair(
+    woNumber: str,
+    callerName: str,
+    callerPhoneTail: str,
+    description: str = "",
+    priority: str = "",
+    status: str = "",
+) -> str:
+    """Update a repair work order's fault description, priority, and/or status.
+
+    Identity is re-verified on EVERY call: ask for callerName + callerPhoneTail
+    each time; never reuse values from a previous work order. A customer may only
+    update their OWN company's orders (else HTTP 404).
+
+    Provide at least one of description / priority / status. priority: P0/P1/P2/P3.
+    status: pending/scheduled/in_progress/completed (to CANCEL use cancelRepair).
+    Returns {woNumber, updated, status, priority, description, message}.
+    Already cancelled/completed orders return HTTP 409. Errors: INVALID_WO_NUMBER,
+    INVALID_PRIORITY, INVALID_STATUS, NOTHING_TO_UPDATE, INVALID_NAME /
+    INVALID_SMS_TOKEN / CUSTOMER_NOT_FOUND.
+
+    Args:
+        woNumber: Work-order number, a WO-YYYY-NNNN string (e.g. WO-2026-0001).
+        callerName: Customer's company OR contact name. Ask every call; never reuse.
+        callerPhoneTail: Last 4 phone digits. Ask every call; never reuse.
+        description: New fault description. Optional.
+        priority: New priority P0/P1/P2/P3 (P0=urgent/紧急, P1=high/高, P2=medium/中, P3=low/低). Optional.
+        status: New status pending/scheduled/in_progress/completed. Optional.
+    """
+    err = _validate_wo_number(woNumber)
+    if err:
+        return json.dumps(err)
+    desc = (description or "").strip()
+    prio = (priority or "").strip()
+    stat = (status or "").strip()
+    if not desc and not prio and not stat:
+        return json.dumps({
+            "error": "NOTHING_TO_UPDATE",
+            "message": "Provide at least one field to change: description, priority, or status.",
+        })
+    if prio and prio not in UPDATE_PRIORITY_ENUM:
+        return json.dumps({
+            "error": "INVALID_PRIORITY",
+            "message": f"priority must be one of: {', '.join(UPDATE_PRIORITY_ENUM)}.",
+            "allowed": list(UPDATE_PRIORITY_ENUM),
+        })
+    if stat and stat not in UPDATE_STATUS_ENUM:
+        return json.dumps({
+            "error": "INVALID_STATUS",
+            "message": f"status must be one of: {', '.join(UPDATE_STATUS_ENUM)} (to cancel, use cancelRepair).",
+            "allowed": list(UPDATE_STATUS_ENUM),
+        })
+    customer_phone, err = _authenticate_caller(callerName, callerPhoneTail)
+    if err:
+        return json.dumps(err)
+    payload = {"woNumber": woNumber.strip(), "customerId": customer_phone}
+    if desc:
+        payload["description"] = desc
+    if prio:
+        payload["priority"] = prio
+    if stat:
+        payload["status"] = stat
+    result = _call_api("/repair/update", payload)
+    result = _normalize_with_llm(result, UpdateResponse, "updateRepair")
     return json.dumps(result)
 
 

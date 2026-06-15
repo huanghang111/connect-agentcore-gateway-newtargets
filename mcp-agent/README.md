@@ -1,6 +1,6 @@
 # Connect Repair MCP Server
 
-把 Repair Service 工具封装成 MCP Server，部署到 AgentCore Runtime，通过 AgentCore Gateway 暴露给 Amazon Connect AI Agent。共 **4 个工具**：三个 repair 业务工具（`requestRepair` / `trackRepair` / `cancelRepair`）和一个 FAQ 检索工具（`faqSearch`）。身份不再由独立的核身工具处理 —— 三个 repair 工具各自携带 `callerName` + `callerPhoneTail`，**每次调用都在服务端无状态重新核身**（不签发任何 token、不缓存任何核身结果）。
+把 Repair Service 工具封装成 MCP Server，部署到 AgentCore Runtime，通过 AgentCore Gateway 暴露给 Amazon Connect AI Agent。共 **5 个工具**：四个 repair 业务工具（`requestRepair` / `trackRepair` / `cancelRepair` / `updateRepair`）和一个 FAQ 检索工具（`faqSearch`）。身份不再由独立的核身工具处理 —— 四个 repair 工具各自携带 `callerName` + `callerPhoneTail`，**每次调用都在服务端无状态重新核身**（不签发任何 token、不缓存任何核身结果）。
 
 ## 架构
 
@@ -15,6 +15,7 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 | `requestRepair` | 创建机器人维修工单（每次调用内联核身 + 解析工单属主手机号） | `productCategory`(机器人品类), `productsubCategory`(对应部件), `description`, `brand`, `callerName`(姓名), `callerPhoneTail`(后 4 位) 必填；`productModel`, `serialNumber` 可选 |
 | `trackRepair` | 查询工单状态（每次调用内联核身；后端强制归属，仅能查本公司工单） | `woNumber`(WO-YYYY-NNNN), `callerName`, `callerPhoneTail`，工具内强制校验 |
 | `cancelRepair` | 取消工单（每次调用内联核身；后端强制归属，仅能取消本公司工单） | `woNumber`(WO-YYYY-NNNN), `callerName`, `callerPhoneTail`，工具内强制校验 |
+| `updateRepair` | 修改工单的故障描述/优先级/状态（每次调用内联核身；后端强制归属，仅能改本公司工单） | `woNumber`, `callerName`, `callerPhoneTail` 必填；`description`/`priority`(P0 紧急/P1 高/P2 中/P3 低)/`status`(pending/scheduled/in_progress/completed) 至少传一个 |
 | `faqSearch` | FAQ 知识库自然语言检索（产品使用 / 故障排查 / 保修 / 维修） | `query`(任意自然语言问题) 必填 |
 
 > **设计原则**：所有 tool 的使用方式都写在各自的 docstring 顶部，LLM 通过 `toolConfigurationList` 拿到 description 即可正确使用。身份相关的约束全部内置在 MCP server 的工具签名 + 服务端校验里 —— **Connect AI Agent 的 Orchestration Prompt 不需要任何身份相关改动**（不再需要 `<customer_info>` / `userNumber` / Contact Flow 属性）。AI Agent 只需在调用任一 repair 工具前问客户要**姓名（公司名或联系人名）+ 手机号后 4 位**，并把它们作为 `callerName` / `callerPhoneTail` 随每次调用一起传入。
@@ -30,7 +31,7 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 >    - `CUSTOMER_NOT_FOUND`：注册表里没有同时匹配【姓名 + 后 4 位】的客户
 >
 >    无论 LLM 看不看得懂 prompt、有没有被劫持，**只要 `callerName` + `callerPhoneTail` 不能在注册表里唯一命中一个客户，就一行后端接口都打不出去**。
-> 4. **归属校验（后端强制）**：核身解析出的完整手机号会作为 `customerId` 透传给后端。`requestRepair` 把它写进工单 `customerPhone`（工单属主）；`trackRepair` / `cancelRepair` 在后端只返回 / 取消 `customerPhone === <核身手机号>` 的工单，否则返回 `404`（不泄露工单是否存在）。**一个客户只能看到 / 取消本公司的工单**。
+> 4. **归属校验（后端强制）**：核身解析出的完整手机号会作为 `customerId` 透传给后端。`requestRepair` 把它写进工单 `customerPhone`（工单属主）；`trackRepair` / `cancelRepair` / `updateRepair` 在后端只对 `customerPhone === <核身手机号>` 的工单生效，否则返回 `404`（不泄露工单是否存在）。**一个客户只能查 / 取消 / 修改本公司的工单**。
 >
 > **客户注册表（核身真值源）**：身份校验以 `mcp_server.py` 顶部的 `CUSTOMER_REGISTRY`（手机号 → "公司-联系人"）为准。
 >
@@ -51,7 +52,7 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 
 ### 接口契约速查（MCP tool ↔ 后端 API）
 
-> 三个 repair tool 在入口处用 `callerName` + `callerPhoneTail` 内联核身（每次调用都重新核，无缓存），解析出客户的**完整手机号**后作为 `customerId` 透传给后端。`requestRepair` 把它写进工单的 `customerPhone`（工单属主）。`trackRepair` / `cancelRepair` 在后端做**归属校验**：只返回 / 取消 `customerPhone === <核身手机号>` 的工单，否则 `404`（不泄露工单是否存在）—— 一个客户只能查 / 取消本公司工单。
+> 四个 repair tool 在入口处用 `callerName` + `callerPhoneTail` 内联核身（每次调用都重新核，无缓存），解析出客户的**完整手机号**后作为 `customerId` 透传给后端。`requestRepair` 把它写进工单的 `customerPhone`（工单属主）。`trackRepair` / `cancelRepair` / `updateRepair` 在后端做**归属校验**：只对 `customerPhone === <核身手机号>` 的工单生效，否则 `404`（不泄露工单是否存在）—— 一个客户只能查 / 取消 / 修改本公司工单。
 > 全部三个 repair tool 都会在拿到后端响应后过一次 Strands+Bedrock 归一化（详见上面的"响应归一化"章节），表里的"出参"指的就是归一化后的 schema —— 也是 LLM 实际看到的字段。
 
 #### 1. `requestRepair` — 创建工单
@@ -95,17 +96,34 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 | 后端响应（200） | `{"message":"Repair ticket cancelled","ticketNumber":"...","status":"cancelled"}`；不属于本客户或不存在 → `404`；状态已是 `cancelled`/`completed` → `409 {"error":"Work order is already ...","status":"..."}` |
 | MCP 归一化出参（`CancelResponse`） | `{woNumber, cancelled(bool), status, message}` |
 
+#### 4. `updateRepair` — 修改工单（故障描述 / 优先级 / 状态）
+
+| 项 | 内容 |
+|----|------|
+| MCP 入参（必填） | `woNumber`(WO-YYYY-NNNN), `callerName`, `callerPhoneTail` |
+| MCP 入参（可选，至少一个） | `description`、`priority`(P0 紧急/P1 高/P2 中/P3 低)、`status`(pending/scheduled/in_progress/completed) |
+| MCP 本地校验 | `INVALID_WO_NUMBER` / `NOTHING_TO_UPDATE` / `INVALID_PRIORITY` / `INVALID_STATUS` / `INVALID_NAME` / `INVALID_SMS_TOKEN` / `CUSTOMER_NOT_FOUND` |
+| 核身 | 同上，解析出完整手机号作为 body 里的 `customerId` |
+| 后端 endpoint | `POST {REPAIR_API_URL}/repair/update`，header `X-API-Key: <REPAIR_API_KEY>` |
+| 后端 body | `{woNumber, customerId, description?, priority?, status?}`（只带传了的字段） |
+| 后端必填校验 | `woNumber` 格式；至少一个可改字段；priority/status 枚举校验；**归属强制**：仅当 `ticket.customerPhone === customerId` 才改，否则 → `404`。`status` 不接受 `cancelled`（取消用 cancelRepair） |
+| 后端响应（200） | `{"message":"Repair ticket updated","ticketNumber":"...","status":"...","priority":"...","description":"...","updatedAt":"..."}`；不属于本客户或不存在 → `404`；状态已是 `cancelled`/`completed` → `409` |
+| MCP 归一化出参（`UpdateResponse`） | `{woNumber, updated(bool), status, priority, description, message}` |
+
 #### 错误码速查（MCP 本地拦截，不会打到后端）
 
 | 错误码 | 触发位置 |
 |--------|---------|
-| `INVALID_NAME` | `requestRepair` / `trackRepair` / `cancelRepair`（`callerName` 为空） |
-| `INVALID_SMS_TOKEN` | `requestRepair` / `trackRepair` / `cancelRepair`（`callerPhoneTail` 非恰好 4 位数字） |
-| `CUSTOMER_NOT_FOUND` | `requestRepair` / `trackRepair` / `cancelRepair`（姓名 + 后 4 位在注册表里查不到唯一客户） |
+| `INVALID_NAME` | `requestRepair` / `trackRepair` / `cancelRepair` / `updateRepair`（`callerName` 为空） |
+| `INVALID_SMS_TOKEN` | `requestRepair` / `trackRepair` / `cancelRepair` / `updateRepair`（`callerPhoneTail` 非恰好 4 位数字） |
+| `CUSTOMER_NOT_FOUND` | `requestRepair` / `trackRepair` / `cancelRepair` / `updateRepair`（姓名 + 后 4 位在注册表里查不到唯一客户） |
 | `INVALID_CATEGORY` | `requestRepair`（品类不在 4 类机器人内） |
 | `INVALID_SUB_CATEGORY` | `requestRepair`（部件不属于该品类） |
-| `INVALID_WO_NUMBER` | `trackRepair` / `cancelRepair` |
-| `HTTP 404`（归属 / 不存在） | `trackRepair` / `cancelRepair`：工单 `customerPhone` 与核身手机号不符，或工单不存在（不区分，避免泄露存在性） |
+| `INVALID_WO_NUMBER` | `trackRepair` / `cancelRepair` / `updateRepair` |
+| `NOTHING_TO_UPDATE` | `updateRepair`（description/priority/status 一个都没传） |
+| `INVALID_PRIORITY` | `updateRepair`（priority 不在 P0/P1/P2/P3 内） |
+| `INVALID_STATUS` | `updateRepair`（status 不在 pending/scheduled/in_progress/completed 内；取消请用 cancelRepair） |
+| `HTTP 404`（归属 / 不存在） | `trackRepair` / `cancelRepair` / `updateRepair`：工单 `customerPhone` 与核身手机号不符，或工单不存在（不区分，避免泄露存在性） |
 | `HTTP 400/404/409/500` | 后端透传，归一化时直接跳过（错误路径保持确定） |
 
 ### 服务端校验（`requestRepair`）

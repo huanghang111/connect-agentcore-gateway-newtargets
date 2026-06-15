@@ -164,8 +164,8 @@ paths:
                         example: 'pending'
                       priority:
                         type: string
-                        description: Work-order priority
-                        enum: ['P1', 'P2', 'P3']
+                        description: 'Work-order priority (P0=urgent, P1=high, P2=medium, P3=low)'
+                        enum: ['P0', 'P1', 'P2', 'P3']
                         example: 'P1'
                       productCategory:
                         type: string
@@ -296,6 +296,109 @@ paths:
                 $ref: '#/components/schemas/Error'
         '409':
           description: Work order already cancelled or completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /repair/update:
+    post:
+      operationId: updateRepair
+      summary: Update a repair work order
+      description: |
+        Update an existing repair work order's fault description, priority,
+        and/or status by its work-order number. At least one of description /
+        priority / status must be supplied; only the supplied fields change.
+        customerId (the verified caller phone number) is required — a customer
+        may only update work orders that belong to their own company; a work
+        order owned by a different customer returns 404 (its existence is not
+        revealed). To cancel a work order use /repair/cancel, not this endpoint.
+      tags:
+        - Repair Service
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - woNumber
+                - customerId
+              properties:
+                woNumber:
+                  type: string
+                  description: The work-order number (WO-YYYY-NNNN).
+                  pattern: '^WO-\d{4}-\d{4}$'
+                  example: 'WO-2026-0001'
+                customerId:
+                  type: string
+                  description: Verified caller identity (the customer's phone number) forwarded by the MCP server. Used to enforce ticket ownership — a work order owned by a different customer returns 404.
+                  example: '13800018888'
+                description:
+                  type: string
+                  description: New fault description. Optional.
+                  example: '导航传感器异常，已更换反光板仍偏航'
+                priority:
+                  type: string
+                  description: 'New priority (P0=urgent, P1=high, P2=medium, P3=low). Optional.'
+                  enum: ['P0', 'P1', 'P2', 'P3']
+                  example: 'P1'
+                status:
+                  type: string
+                  description: New status. Optional. To cancel a work order use /repair/cancel.
+                  enum: ['pending', 'scheduled', 'in_progress', 'completed']
+                  example: 'in_progress'
+      responses:
+        '200':
+          description: Work order updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: 'Repair ticket updated'
+                  ticketNumber:
+                    type: string
+                    example: 'WO-2026-0001'
+                  status:
+                    type: string
+                    example: 'in_progress'
+                  priority:
+                    type: string
+                    example: 'P1'
+                  description:
+                    type: string
+                    example: '导航传感器异常，已更换反光板仍偏航'
+        '400':
+          description: Bad request - missing/invalid fields or nothing to update
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Unauthorized - API key required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Repair work order not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Work order already cancelled or completed (cannot be modified)
           content:
             application/json:
               schema:
@@ -457,8 +560,8 @@ components:
           example: '13800018888'
         priority:
           type: string
-          description: Work-order priority
-          enum: ['P1', 'P2', 'P3']
+          description: 'Work-order priority (P0=urgent, P1=high, P2=medium, P3=low)'
+          enum: ['P0', 'P1', 'P2', 'P3']
           example: 'P1'
         status:
           type: string

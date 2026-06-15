@@ -32,6 +32,7 @@ chmod +x deploy.sh cleanup.sh test-api.sh
 | `requestRepair` | `productCategory`(机器人品类), `productsubCategory`(对应部件), `description`, `brand`, `callerName`(口述姓名), `callerPhoneTail`(口述手机号后 4 位) (必填); `productModel`, `serialNumber` (可选) | 创建机器人维修工单，返回 WO-YYYY-NNNN 工单号 | 品类+部件组合校验；必填字段在 Lambda 端校验；每次调用用【姓名 + 后 4 位】在客户注册表中重新核身（无状态、不缓存），命中后解析出该客户完整手机号作为工单属主 |
 | `trackRepair` | `woNumber`, `callerName`, `callerPhoneTail` | 查询工单状态（仅能查本公司工单） | woNumber 必须为 WO-YYYY-NNNN；每次重新核身；后端强制归属校验：工单 `customerPhone` ≠ 核身手机号 → `404` |
 | `cancelRepair` | `woNumber`, `callerName`, `callerPhoneTail` | 取消工单（仅能取消本公司工单） | 同上；归属不符 → `404`；幂等：已 cancelled / completed 返 `409` |
+| `updateRepair` | `woNumber`, `callerName`, `callerPhoneTail` (必填); `description`, `priority`, `status` (至少传一个) | 修改工单的故障描述/优先级/状态（仅能改本公司工单） | 同上；归属不符 → `404`；`priority`∈`P0/P1/P2/P3`（P0 紧急/P1 高/P2 中/P3 低）；`status`∈`pending/scheduled/in_progress/completed`（取消走 cancelRepair）；已 cancelled/completed 返 `409` |
 | `faqSearch` | `query` | FAQ 关键字检索 | — |
 
 > **身份模型**：没有独立的核身工具，也没有任何 token / 缓存。每个 repair 工具都自带 `callerName`（公司名或联系人名，宽松匹配）+ `callerPhoneTail`（手机号后 4 位），MCP server 在 **每次调用** 时用这两个值在客户注册表（6 个客户，后 4 位互不相同）中查唯一客户、解析出完整手机号，无状态、不记录核身结果。命中失败 → `CUSTOMER_NOT_FOUND`；`callerName` 为空 → `INVALID_NAME`；`callerPhoneTail` 不是 4 位数字 → `INVALID_SMS_TOKEN`。
@@ -45,6 +46,7 @@ chmod +x deploy.sh cleanup.sh test-api.sh
 | `POST /repair/request` | 创建机器人维修工单，返回 WO-YYYY-NNNN 工单号 |
 | `POST /repair/track` | 查询工单状态 |
 | `POST /repair/cancel` | 取消工单 |
+| `POST /repair/update` | 修改工单的故障描述/优先级/状态 |
 | `POST /faq/simple` | FAQ 关键字检索（无需 Bedrock KB） |
 
 ## 鉴权
@@ -87,7 +89,7 @@ Quick 的 OAuth 流程会成功（Keycloak 日志可见 LOGIN + CODE_TO_TOKEN �
    Quick 拿到的 token `aud=["<client_id>","account"]`；用 `allowedClients` 校验会导致 publish 失败，用共享的 `account` audience 才能过。`deploy_runtime_oauth.py` 已默认 `allowedAudience=account`。
 
 2. **每个 MCP 工具必须暴露 `outputSchema`**。
-   工具若用 `@mcp.tool(structured_output=False)` 就不会生成 `outputSchema`，Quick 注册 action 时校验失败。改回 `@mcp.tool()`（FastMCP 自动按返回类型生成 outputSchema）即可。本仓库 4 个工具已全部改回。
+   工具若用 `@mcp.tool(structured_output=False)` 就不会生成 `outputSchema`，Quick 注册 action 时校验失败。改回 `@mcp.tool()`（FastMCP 自动按返回类型生成 outputSchema）即可。本仓库所有工具已全部改回。
 
    > 副作用：去掉 `structured_output=False` 后，工具返回体除 `content[]` 外还会带 `structuredContent`。对老的 Connect/Gateway 路径无影响（只是多一个字段）。
 
@@ -184,7 +186,7 @@ midea/
 ├── connect-api-openapi.yaml   # OpenAPI 规范
 └── mcp-agent/                 # MCP Server Agent 源码（被 deploy.sh 打包后送进 CodeBuild）
     ├── README.md              # MCP Server 详细文档（工具签名 / docstring / 错误码 / 归一化）
-    ├── mcp_server.py          # FastMCP server (4 tools)
+    ├── mcp_server.py          # FastMCP server (5 tools)
     ├── Dockerfile             # ARM64 容器
     ├── requirements.txt
     └── buildspec.yml
