@@ -29,13 +29,13 @@ chmod +x deploy.sh cleanup.sh test-api.sh
 
 | Tool | 入参 | 功能 | 校验 |
 |------|------|------|------|
-| `requestRepair` | `productCategory`(机器人品类), `productsubCategory`(对应部件), `description`, `brand`, `callerName`(口述姓名), `callerPhoneTail`(口述手机号后 4 位) (必填); `productModel`, `serialNumber` (可选) | 创建机器人维修工单，返回 WO-YYYY-NNNN 工单号 | 品类+部件组合校验；必填字段在 Lambda 端校验；每次调用用【姓名 + 后 4 位】在客户注册表中重新核身（无状态、不缓存），命中后解析出该客户完整手机号作为工单属主 |
-| `trackRepair` | `woNumber`, `callerName`, `callerPhoneTail` | 查询工单状态（仅能查本公司工单） | woNumber 必须为 WO-YYYY-NNNN；每次重新核身；后端强制归属校验：工单 `customerPhone` ≠ 核身手机号 → `404` |
-| `cancelRepair` | `woNumber`, `callerName`, `callerPhoneTail` | 取消工单（仅能取消本公司工单） | 同上；归属不符 → `404`；幂等：已 cancelled / completed 返 `409` |
-| `updateRepair` | `woNumber`, `callerName`, `callerPhoneTail` (必填); `description`, `priority`, `status` (至少传一个) | 修改工单的故障描述/优先级/状态（仅能改本公司工单） | 同上；归属不符 → `404`；`priority`∈`P0/P1/P2/P3`（P0 紧急/P1 高/P2 中/P3 低）；`status`∈`pending/scheduled/in_progress/completed`（取消走 cancelRepair）；已 cancelled/completed 返 `409` |
+| `requestRepair` | `productCategory`(机器人品类), `productsubCategory`(对应部件), `description`, `brand` (必填); `callerName`, `callerPhoneTail`, `productModel`, `serialNumber` (可选) | 创建机器人维修工单，返回 WO-YYYY-NNNN 工单号 | 品类+部件组合校验（INVALID_CATEGORY / INVALID_SUB_CATEGORY）；必填字段在 Lambda 端校验。`callerName` / `callerPhoneTail` 仅为向后兼容保留，**不做核身、不校验** |
+| `trackRepair` | `woNumber` (必填); `callerName`, `callerPhoneTail` (可选) | 查询工单状态 | woNumber 必须为 WO-YYYY-NNNN（INVALID_WO_NUMBER）。**无身份/归属校验**，任意调用方可查任意工单；工单不存在 → `404` |
+| `cancelRepair` | `woNumber` (必填); `callerName`, `callerPhoneTail` (可选) | 取消工单 | 同上；任意调用方可取消任意工单；工单不存在 → `404`；幂等：已 cancelled / completed 返 `409` |
+| `updateRepair` | `woNumber` (必填); `description`, `priority`, `status` (至少传一个); `callerName`, `callerPhoneTail` (可选) | 修改工单的故障描述/优先级/状态 | 同上；任意调用方可修改任意工单；工单不存在 → `404`；`priority`∈`P0/P1/P2/P3`（P0 紧急/P1 高/P2 中/P3 低）；`status`∈`pending/scheduled/in_progress/completed`（取消走 cancelRepair）；NOTHING_TO_UPDATE / INVALID_PRIORITY / INVALID_STATUS；已 cancelled/completed 返 `409` |
 | `faqSearch` | `query` | FAQ 关键字检索 | — |
 
-> **身份模型**：没有独立的核身工具，也没有任何 token / 缓存。每个 repair 工具都自带 `callerName`（公司名或联系人名，宽松匹配）+ `callerPhoneTail`（手机号后 4 位），MCP server 在 **每次调用** 时用这两个值在客户注册表（6 个客户，后 4 位互不相同）中查唯一客户、解析出完整手机号，无状态、不记录核身结果。命中失败 → `CUSTOMER_NOT_FOUND`；`callerName` 为空 → `INVALID_NAME`；`callerPhoneTail` 不是 4 位数字 → `INVALID_SMS_TOKEN`。
+> **身份模型**：身份核验已**完全停用**。没有核身工具、没有客户注册表、没有 token / 缓存，也不做工单归属校验。`requestRepair` / `trackRepair` / `cancelRepair` / `updateRepair` 仍接受 `callerName`（口述姓名）与 `callerPhoneTail`（手机号后 4 位）两个参数，但它们仅为向后兼容保留，**既不校验也不使用**，因此都是**可选**的。任意调用方都可以创建 / 查询 / 修改 / 取消**任意**工单；`404` 现在只表示「工单不存在」，绝不再表示「归属于他人」。
 
 详细的 docstring / 错误码 / 归一化规范见 [`mcp-agent/README.md`](mcp-agent/README.md)。
 

@@ -626,15 +626,14 @@ Resources:
                       customerId
                   } = body;
 
-                  // Validate required fields (productModel and serialNumber are optional).
-                  // customerId is the verified caller phone number forwarded by the MCP
-                  // server; it becomes the ticket owner (customerPhone).
+                  // Validate required fields (productModel/serialNumber optional).
+                  // customerId is optional (identity disabled); if provided it is
+                  // stored as the ticket owner (customerPhone), else null.
                   const requiredFields = {
                       productCategory,
                       productsubCategory,
                       description,
-                      brand,
-                      customerId
+                      brand
                   };
 
                   const missingFields = Object.entries(requiredFields)
@@ -669,7 +668,7 @@ Resources:
                       serialNumber: serialNumber || null,
                       description,
                       brand,
-                      customerPhone: customerId,
+                      customerPhone: customerId || null,
                       status: 'pending',
                       priority: 'P2',
                       createdAt: new Date().toISOString(),
@@ -760,7 +759,7 @@ Resources:
 
               try {
                   const body = JSON.parse(event.body || '{}');
-                  const { woNumber, customerId } = body;
+                  const { woNumber } = body;
 
                   // Validate woNumber: required, WO-YYYY-NNNN format
                   if (!woNumber || !/^WO-\d{4}-\d{4}$/.test(woNumber)) {
@@ -782,21 +781,6 @@ Resources:
                       };
                   }
 
-                  // customerId is the verified caller phone number forwarded by the
-                  // MCP server. It is required so we can enforce ticket ownership.
-                  if (!customerId) {
-                      return {
-                          statusCode: 400,
-                          headers: {
-                              'Content-Type': 'application/json',
-                              'Access-Control-Allow-Origin': '*',
-                          },
-                          body: JSON.stringify({
-                              error: 'customerId is required',
-                          }),
-                      };
-                  }
-
                   console.log(JSON.stringify({
                       level: 'INFO',
                       message: 'Fetching repair ticket',
@@ -812,14 +796,12 @@ Resources:
 
                   const result = await docClient.send(new GetCommand(getParams));
 
-                  // Ownership enforcement: a customer may only see their own
-                  // company's work orders. If the ticket does not exist OR is not
-                  // owned by this caller, return an identical 404 so we never
-                  // reveal that someone else's work order exists.
-                  if (!result.Item || result.Item.customerPhone !== customerId) {
+                  // Identity/ownership checks are DISABLED — any caller may read
+                  // any work order. 404 only when the work order does not exist.
+                  if (!result.Item) {
                       console.log(JSON.stringify({
                           level: 'WARN',
-                          message: 'Repair ticket not found or not owned by caller',
+                          message: 'Repair ticket not found',
                           requestId,
                           ticketNumber: woNumber
                       }));
@@ -932,7 +914,7 @@ Resources:
 
               try {
                   const body = JSON.parse(event.body || '{}');
-                  const { woNumber, customerId } = body;
+                  const { woNumber } = body;
 
                   if (!woNumber || !/^WO-\d{4}-\d{4}$/.test(woNumber)) {
                       console.log(JSON.stringify({
@@ -953,29 +935,15 @@ Resources:
                       };
                   }
 
-                  // customerId is the verified caller phone number forwarded by the
-                  // MCP server. Required so we can enforce ticket ownership.
-                  if (!customerId) {
-                      return {
-                          statusCode: 400,
-                          headers: {
-                              'Content-Type': 'application/json',
-                              'Access-Control-Allow-Origin': '*',
-                          },
-                          body: JSON.stringify({ error: 'customerId is required' }),
-                      };
-                  }
-
                   // Look up the ticket first so we can return precise 404/409.
                   const getResult = await docClient.send(new GetCommand({
                       TableName: process.env.REPAIR_TICKETS_TABLE_NAME,
                       Key: { ticketNumber: woNumber },
                   }));
 
-                  // Ownership enforcement: only the owning company may cancel.
-                  // Missing ticket OR foreign owner → identical 404 (never reveal
-                  // that someone else's work order exists).
-                  if (!getResult.Item || getResult.Item.customerPhone !== customerId) {
+                  // Identity/ownership checks are DISABLED — any caller may cancel
+                  // any work order. 404 only when the work order does not exist.
+                  if (!getResult.Item) {
                       return {
                           statusCode: 404,
                           headers: {
@@ -1100,15 +1068,10 @@ Resources:
 
               try {
                   const body = JSON.parse(event.body || '{}');
-                  const { woNumber, customerId, description, priority, status } = body;
+                  const { woNumber, description, priority, status } = body;
 
                   if (!woNumber || !/^WO-\d{4}-\d{4}$/.test(woNumber)) {
                       return resp(400, { error: 'woNumber is required and must look like WO-YYYY-NNNN' });
-                  }
-                  // customerId is the verified caller phone number forwarded by the
-                  // MCP server. Required so we can enforce ticket ownership.
-                  if (!customerId) {
-                      return resp(400, { error: 'customerId is required' });
                   }
 
                   // At least one mutable field must be provided.
@@ -1131,10 +1094,9 @@ Resources:
                       Key: { ticketNumber: woNumber },
                   }));
 
-                  // Ownership enforcement: only the owning company may update.
-                  // Missing ticket OR foreign owner → identical 404 (never reveal
-                  // that someone else's work order exists).
-                  if (!getResult.Item || getResult.Item.customerPhone !== customerId) {
+                  // Identity/ownership checks are DISABLED — any caller may update
+                  // any work order. 404 only when the work order does not exist.
+                  if (!getResult.Item) {
                       return resp(404, { error: 'Repair ticket not found' });
                   }
 
@@ -1615,7 +1577,6 @@ Resources:
                 - productsubCategory
                 - description
                 - brand
-                - customerId
               properties:
                 productCategory:
                   type: 'string'
@@ -1635,35 +1596,26 @@ Resources:
               type: 'object'
               required:
                 - woNumber
-                - customerId
               properties:
                 woNumber:
                   type: 'string'
                   pattern: '^WO-\d{4}-\d{4}$'
-                customerId:
-                  type: 'string'
             CancelRepairRequest:
               type: 'object'
               required:
                 - woNumber
-                - customerId
               properties:
                 woNumber:
                   type: 'string'
                   pattern: '^WO-\d{4}-\d{4}$'
-                customerId:
-                  type: 'string'
             UpdateRepairRequest:
               type: 'object'
               required:
                 - woNumber
-                - customerId
               properties:
                 woNumber:
                   type: 'string'
                   pattern: '^WO-\d{4}-\d{4}$'
-                customerId:
-                  type: 'string'
                 description:
                   type: 'string'
                 priority:

@@ -40,7 +40,6 @@ paths:
                 - productsubCategory
                 - description
                 - brand
-                - customerId
               properties:
                 productCategory:
                   type: string
@@ -66,10 +65,6 @@ paths:
                   type: string
                   description: Product brand / manufacturer. Extracted from the dialog.
                   example: '中科机器人'
-                customerId:
-                  type: string
-                  description: Verified caller identity (the customer's phone number) forwarded by the MCP server. Used as the ticket owner.
-                  example: '13800018888'
       responses:
         '201':
           description: Repair ticket created successfully
@@ -113,10 +108,9 @@ paths:
       description: |
         Look up the status and details of an existing repair work order by its
         work-order number. The caller is expected to validate that woNumber is a
-        non-empty WO-YYYY-NNNN string before invoking this endpoint. customerId
-        (the verified caller phone number) is required — a customer may only see
-        work orders that belong to their own company; a work order owned by a
-        different customer returns 404 (its existence is not revealed).
+        non-empty WO-YYYY-NNNN string before invoking this endpoint. Identity
+        verification is disabled — any caller may look up any work order. 404
+        means the work order does not exist.
       tags:
         - Repair Service
       security:
@@ -129,17 +123,12 @@ paths:
               type: object
               required:
                 - woNumber
-                - customerId
               properties:
                 woNumber:
                   type: string
                   description: The work-order number (WO-YYYY-NNNN).
                   pattern: '^WO-\d{4}-\d{4}$'
                   example: 'WO-2026-0001'
-                customerId:
-                  type: string
-                  description: Verified caller identity (the customer's phone number) forwarded by the MCP server. Used to enforce ticket ownership — a work order owned by a different customer returns 404.
-                  example: '13800018888'
       responses:
         '200':
           description: Repair work order found and status returned
@@ -229,13 +218,10 @@ paths:
       operationId: cancelRepair
       summary: Cancel a repair work order
       description: |
-        Cancel an existing repair work order by its work-order number. The caller
-        is expected to validate that woNumber is a non-empty WO-YYYY-NNNN string
-        and to obtain explicit user confirmation before invoking this endpoint,
-        since cancellation is destructive. customerId (the verified caller phone
-        number) is required — a customer may only cancel work orders that belong
-        to their own company; a work order owned by a different customer returns
-        404 (its existence is not revealed).
+        Cancel an existing repair work order by its work-order number (WO-YYYY-NNNN).
+        Identity verification is disabled — any caller may cancel any work order.
+        404 means the work order does not exist. Cancellation is destructive;
+        obtain explicit user confirmation first.
       tags:
         - Repair Service
       security:
@@ -248,17 +234,12 @@ paths:
               type: object
               required:
                 - woNumber
-                - customerId
               properties:
                 woNumber:
                   type: string
                   description: The work-order number (WO-YYYY-NNNN).
                   pattern: '^WO-\d{4}-\d{4}$'
                   example: 'WO-2026-0001'
-                customerId:
-                  type: string
-                  description: Verified caller identity (the customer's phone number) forwarded by the MCP server. Used to enforce ticket ownership — a work order owned by a different customer returns 404.
-                  example: '13800018888'
       responses:
         '200':
           description: Work order cancelled
@@ -315,10 +296,9 @@ paths:
         Update an existing repair work order's fault description, priority,
         and/or status by its work-order number. At least one of description /
         priority / status must be supplied; only the supplied fields change.
-        customerId (the verified caller phone number) is required — a customer
-        may only update work orders that belong to their own company; a work
-        order owned by a different customer returns 404 (its existence is not
-        revealed). To cancel a work order use /repair/cancel, not this endpoint.
+        Identity verification is disabled — any caller may update any work order.
+        404 means the work order does not exist. To cancel a work order use
+        /repair/cancel, not this endpoint.
       tags:
         - Repair Service
       security:
@@ -331,17 +311,12 @@ paths:
               type: object
               required:
                 - woNumber
-                - customerId
               properties:
                 woNumber:
                   type: string
                   description: The work-order number (WO-YYYY-NNNN).
                   pattern: '^WO-\d{4}-\d{4}$'
                   example: 'WO-2026-0001'
-                customerId:
-                  type: string
-                  description: Verified caller identity (the customer's phone number) forwarded by the MCP server. Used to enforce ticket ownership — a work order owned by a different customer returns 404.
-                  example: '13800018888'
                 description:
                   type: string
                   description: New fault description. Optional.

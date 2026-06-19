@@ -21,24 +21,22 @@ echo -e "${YELLOW}=== Industrial Robot Repair Service API 测试 ===${NC}\n"
 echo "API URL: $API_URL"
 echo "API Key: ${API_KEY:0:10}..."
 echo ""
+echo "注: 身份核验已关闭 —— 任意调用方可创建/查询/修改/取消任意工单，无需 customerId。"
+echo ""
 
-# 核身后的 customerId（即客户手机号），由 MCP server 转发；直连后端测试时手动带上
-CUSTOMER_ID="13800018888"
-
-# 测试1: 创建维修工单
+# 测试1: 创建维修工单 (无需 customerId)
 echo -e "${YELLOW}测试 1: 创建维修工单${NC}"
 RESPONSE=$(curl -s -X POST "$API_URL/repair/request" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  -d "{
-    \"productCategory\": \"仓储机器人\",
-    \"productsubCategory\": \"导航传感器\",
-    \"productModel\": \"WR-500 #7\",
-    \"serialNumber\": \"SN20231015ABC123\",
-    \"brand\": \"中科机器人\",
-    \"description\": \"导航传感器异常，频繁偏航，需要现场标定。\",
-    \"customerId\": \"$CUSTOMER_ID\"
-  }")
+  -d '{
+    "productCategory": "仓储机器人",
+    "productsubCategory": "导航传感器",
+    "productModel": "WR-500 #7",
+    "serialNumber": "SN20231015ABC123",
+    "brand": "中科机器人",
+    "description": "导航传感器异常，频繁偏航，需要现场标定。"
+  }')
 
 if echo "$RESPONSE" | grep -q "ticketNumber"; then
     TICKET_NUMBER=$(echo "$RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin)['ticketNumber'], end='')")
@@ -54,9 +52,9 @@ echo ""
 # 等待1秒
 sleep 1
 
-# 测试2: 查询工单状态
+# 测试2: 查询工单状态 (无需 customerId)
 echo -e "${YELLOW}测试 2: 查询工单状态${NC}"
-JSON_DATA=$(printf '{"woNumber":"%s","customerId":"%s"}' "$TICKET_NUMBER" "$CUSTOMER_ID")
+JSON_DATA=$(printf '{"woNumber":"%s"}' "$TICKET_NUMBER")
 RESPONSE=$(curl -s -X POST "$API_URL/repair/track" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
@@ -131,7 +129,7 @@ echo -e "${YELLOW}测试 6: 错误处理 - 工单不存在${NC}"
 RESPONSE=$(curl -s -X POST "$API_URL/repair/track" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  --data-raw "{\"woNumber\":\"WO-2026-9999\",\"customerId\":\"$CUSTOMER_ID\"}")
+  --data-raw '{"woNumber":"WO-2026-9999"}')
 
 if echo "$RESPONSE" | grep -q "not found"; then
     echo -e "${GREEN}✓ 错误处理正确${NC}"
@@ -147,7 +145,7 @@ echo -e "${YELLOW}测试 7: 错误处理 - 非法 woNumber${NC}"
 RESPONSE=$(curl -s -X POST "$API_URL/repair/track" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  --data-raw "{\"woNumber\":\"abc\",\"customerId\":\"$CUSTOMER_ID\"}")
+  --data-raw '{"woNumber":"abc"}')
 
 if echo "$RESPONSE" | grep -q "WO-YYYY-NNNN"; then
     echo -e "${GREEN}✓ 错误处理正确${NC}"
@@ -157,9 +155,9 @@ else
 fi
 echo ""
 
-# 测试8: 取消工单
+# 测试8: 取消工单 (无需 customerId)
 echo -e "${YELLOW}测试 8: 取消工单${NC}"
-JSON_DATA=$(printf '{"woNumber":"%s","customerId":"%s"}' "$TICKET_NUMBER" "$CUSTOMER_ID")
+JSON_DATA=$(printf '{"woNumber":"%s"}' "$TICKET_NUMBER")
 RESPONSE=$(curl -s -X POST "$API_URL/repair/cancel" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
@@ -189,12 +187,12 @@ else
 fi
 echo ""
 
-# 测试10: 预置工单查询 (WO-2026-0001, 任意已核身客户均可查)
+# 测试10: 预置工单查询 (WO-2026-0001, 任意调用方均可查)
 echo -e "${YELLOW}测试 10: 预置工单查询 (WO-2026-0001)${NC}"
 RESPONSE=$(curl -s -X POST "$API_URL/repair/track" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  --data-raw '{"woNumber":"WO-2026-0001","customerId":"13800018888"}')
+  --data-raw '{"woNumber":"WO-2026-0001"}')
 
 if echo "$RESPONSE" | grep -q "Repair ticket found"; then
     echo -e "${GREEN}✓ 预置工单查询成功${NC}"
@@ -204,28 +202,12 @@ else
 fi
 echo ""
 
-# 测试11: 工单归属校验 - 他人查询应返回 404 (不暴露存在)
-# WO-2026-0003 属于顺丰(13688881234), 用华创(13800018888)的身份查应返回 not found
-echo -e "${YELLOW}测试 11: 工单归属校验 - 他人查询 WO-2026-0003${NC}"
-RESPONSE=$(curl -s -X POST "$API_URL/repair/track" \
-  -H "X-API-Key: $API_KEY" \
-  -H "Content-Type: application/json" \
-  --data-raw '{"woNumber":"WO-2026-0003","customerId":"13800018888"}')
-
-if echo "$RESPONSE" | grep -q "not found"; then
-    echo -e "${GREEN}✓ 归属校验正确（他人查询返回 not found）${NC}"
-else
-    echo -e "${RED}✗ 归属校验异常 - 非属主不应看到该工单${NC}"
-    echo "$RESPONSE"
-fi
-echo ""
-
-# 测试12: 更新工单 - 本人改优先级+状态 (WO-2026-0003 属于顺丰 13688881234)
-echo -e "${YELLOW}测试 12: 更新工单 (优先级+状态)${NC}"
+# 测试11: 更新工单 - 改优先级+状态 (无需 customerId, 任意调用方均可改)
+echo -e "${YELLOW}测试 11: 更新工单 (优先级+状态)${NC}"
 RESPONSE=$(curl -s -X POST "$API_URL/repair/update" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  --data-raw '{"woNumber":"WO-2026-0003","customerId":"13688881234","priority":"P1","status":"in_progress"}')
+  --data-raw '{"woNumber":"WO-2026-0003","priority":"P0","status":"in_progress"}')
 
 if echo "$RESPONSE" | grep -q "Repair ticket updated"; then
     echo -e "${GREEN}✓ 工单更新成功${NC}"
@@ -235,12 +217,12 @@ else
 fi
 echo ""
 
-# 测试13: 非法优先级应返回 400
-echo -e "${YELLOW}测试 13: 错误处理 - 非法优先级${NC}"
+# 测试12: 非法优先级应返回 400
+echo -e "${YELLOW}测试 12: 错误处理 - 非法优先级${NC}"
 RESPONSE=$(curl -s -X POST "$API_URL/repair/update" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  --data-raw '{"woNumber":"WO-2026-0003","customerId":"13688881234","priority":"P9"}')
+  --data-raw '{"woNumber":"WO-2026-0003","priority":"P9"}')
 
 if echo "$RESPONSE" | grep -q "priority must be one of"; then
     echo -e "${GREEN}✓ 错误处理正确（拒绝非法优先级）${NC}"
@@ -250,25 +232,25 @@ else
 fi
 echo ""
 
-# 测试14: 更新工单归属校验 - 他人改应返回 404
-echo -e "${YELLOW}测试 14: 更新归属校验 - 他人改 WO-2026-0003${NC}"
+# 测试13: 更新不存在的工单应返回 404
+echo -e "${YELLOW}测试 13: 错误处理 - 更新不存在的工单${NC}"
 RESPONSE=$(curl -s -X POST "$API_URL/repair/update" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  --data-raw '{"woNumber":"WO-2026-0003","customerId":"13800018888","status":"completed"}')
+  --data-raw '{"woNumber":"WO-2026-9999","status":"completed"}')
 
 if echo "$RESPONSE" | grep -q "not found"; then
-    echo -e "${GREEN}✓ 归属校验正确（非属主无法修改）${NC}"
+    echo -e "${GREEN}✓ 错误处理正确（工单不存在）${NC}"
 else
-    echo -e "${RED}✗ 归属校验异常 - 非属主不应能改该工单${NC}"
+    echo -e "${RED}✗ 错误处理异常${NC}"
     echo "$RESPONSE"
 fi
 echo ""
 
-# 还原 WO-2026-0003 到预置状态 (顺丰本人)
+# 还原 WO-2026-0003 到预置状态
 curl -s -X POST "$API_URL/repair/update" \
   -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \
-  --data-raw '{"woNumber":"WO-2026-0003","customerId":"13688881234","priority":"P2","status":"pending"}' >/dev/null
+  --data-raw '{"woNumber":"WO-2026-0003","priority":"P2","status":"pending"}' >/dev/null
 echo "（已还原 WO-2026-0003 到预置状态 P2/pending）"
 echo ""
 

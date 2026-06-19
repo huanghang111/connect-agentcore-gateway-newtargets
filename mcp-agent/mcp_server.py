@@ -5,7 +5,7 @@ import re
 import time
 import urllib.request
 import urllib.error
-from typing import Optional, Tuple
+from typing import Optional
 
 from botocore.config import Config as BotoConfig
 from mcp.server.fastmcp import FastMCP
@@ -16,7 +16,6 @@ from strands import Agent
 from strands.models import BedrockModel
 
 WO_NUMBER_PATTERN = re.compile(r"^WO-\d{4}-\d{4}$")
-SMS_TOKEN_PATTERN = re.compile(r"^\d{4}$")
 
 # Industrial-robot product taxonomy. Each top-level category maps to its set of
 # valid component-level sub-categories. requestRepair validates that the
@@ -26,20 +25,6 @@ ROBOT_CATEGORIES = {
     "巡检机器人": ("热成像模块", "轮组", "气体传感器", "通信"),      # IR-200, IR-400
     "协作机械臂": ("关节电机", "力矩传感器", "控制器", "线缆"),      # CA-100, CA-300
     "服务机器人": ("语音模块", "屏幕", "导航", "电池"),            # SR-50, SR-100
-}
-
-# Registered customers: phone number → "公司-联系人". Identity verification
-# requires that the caller's phone number is on this list AND the spoken name
-# matches the registered customer (company name OR contact person OR the full
-# "公司-联系人" string, case/space-insensitive). Until a real CRM is wired in,
-# this fixed table is the source of truth for both Flow 1 and Flow 2.
-CUSTOMER_REGISTRY = {
-    "13800018888": "华创智联-张伟",
-    "13688881234": "顺丰物流-李强",
-    "13755554321": "中电光伏-王建国",
-    "13566667890": "京东亚洲一号-赵明",
-    "13322223456": "国药集团-陈芳",
-    "13177778901": "万达商管-周鹏",
 }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -65,15 +50,12 @@ NORMALIZE_MODEL_ID = os.environ.get(
 )
 NORMALIZE_TIMEOUT_S = float(os.environ.get("NORMALIZE_TIMEOUT_S", "4"))
 
-# --- Per-call identity verification (stateless) --------------------------------
-# Every repair tool (requestRepair / trackRepair / cancelRepair) re-verifies the
-# caller on EVERY call from two inline arguments — the caller's spoken name
-# (callerName) and the last 4 digits of their phone number (callerPhoneTail) —
-# against CUSTOMER_REGISTRY. There is NO token and NO server-side memory of
-# previous verifications: identity is established fresh each call, so a caller
-# who cannot produce a matching (name, last-4) pair cannot touch any work order.
-# The resolved full phone number is the caller's identity, used both as the
-# ticket owner on create and as the ownership key on track/cancel.
+# --- Identity / ownership ------------------------------------------------------
+# Identity verification is DISABLED: the repair tools accept callerName /
+# callerPhoneTail for backward compatibility but do NOT verify them, and the
+# backend no longer enforces ticket ownership. Any caller may create, query,
+# update, or cancel any work order. (Re-enable by restoring the caller lookup
+# here and the customerPhone === customerId check in the backend Lambdas.)
 
 # Canonical schemas. Every query tool advertises these fields verbatim in its
 # docstring so the orchestrator LLM sees one shape regardless of the upstream
@@ -266,25 +248,6 @@ _CATEGORY_INDEX = {
 }
 
 
-def _name_matches_registered(spoken: str, registered: str) -> bool:
-    """Loose name match for identity verification.
-
-    The registered name is "公司-联系人" (e.g. "华创智联-张伟"). A spoken name
-    counts as a match when it equals the company part, the contact-person part,
-    or the whole "公司-联系人" string — all compared case/space-insensitively.
-    This tolerates customers who say only their company, only the contact name,
-    or the full combined form.
-    """
-    s = _norm(spoken)
-    if not s:
-        return False
-    candidates = {_norm(registered)}
-    for part in registered.split("-"):
-        if part.strip():
-            candidates.add(_norm(part))
-    return s in candidates
-
-
 def _validate_category_pair(category: str, sub_category: str) -> Optional[dict]:
     """Validate that productCategory is a known robot category AND productsubCategory
     is a component that belongs to that category (case/space insensitive).
@@ -308,82 +271,35 @@ def _validate_category_pair(category: str, sub_category: str) -> Optional[dict]:
     return None
 
 
-def _authenticate_caller(caller_name: str, caller_phone_tail: str) -> Tuple[Optional[str], Optional[dict]]:
-    """Verify the caller from an inline (name, last-4-digits) pair on EVERY call.
-
-    Looks up CUSTOMER_REGISTRY for the unique customer whose phone number ends in
-    ``caller_phone_tail`` AND whose registered name matches ``caller_name``
-    (company OR contact person OR full "公司-联系人" string, case/space
-    insensitive). No token, no cached state — this runs fresh for every repair
-    tool invocation.
-
-    Returns ``(full_phone_number, None)`` on success (the caller's verified
-    identity, used as the ticket-owner / ownership key), or
-    ``(None, error_dict)`` on any failure so the tool returns it verbatim:
-      - INVALID_NAME           : caller_name empty
-      - INVALID_SMS_TOKEN      : caller_phone_tail not exactly 4 digits
-      - CUSTOMER_NOT_FOUND     : no registered customer matches (name, last-4)
-
-    The 6 registered customers all have distinct last-4 digits, so a matching
-    (name, last-4) pair identifies exactly one customer.
-    """
-    name = (caller_name or "").strip()
-    if not name:
-        return None, {
-            "error": "INVALID_NAME",
-            "message": "callerName must not be empty. Ask the customer for their name (company name or contact person) and call again.",
-        }
-    tail = (caller_phone_tail or "").strip()
-    if not SMS_TOKEN_PATTERN.match(tail):
-        return None, {
-            "error": "INVALID_SMS_TOKEN",
-            "message": "callerPhoneTail must be exactly the last 4 digits of the customer's phone number. Ask the customer to repeat them.",
-        }
-    for phone, registered in CUSTOMER_REGISTRY.items():
-        if phone[-4:] == tail and _name_matches_registered(name, registered):
-            return phone, None
-    return None, {
-        "error": "CUSTOMER_NOT_FOUND",
-        "message": "No registered customer matches that name and last-4 digits. Ask the customer to confirm their name (company or contact person) and the last 4 digits of their phone number.",
-    }
-
-
 @mcp.tool()
 def requestRepair(
     productCategory: str,
     productsubCategory: str,
     description: str,
     brand: str,
-    callerName: str,
-    callerPhoneTail: str,
+    callerName: str = "",
+    callerPhoneTail: str = "",
     productModel: str = "",
     serialNumber: str = "",
 ) -> str:
     """Create a new industrial-robot repair work order.
 
-    Identity is re-verified on EVERY call: ask for callerName + callerPhoneTail
-    each time; never reuse values from a previous work order.
-
     productCategory must be 仓储机器人 / 巡检机器人 / 协作机械臂 / 服务机器人, and
     productsubCategory a component of it (e.g. 仓储机器人: 导航传感器/电池/驱动电机/
     通信模块), else INVALID_CATEGORY / INVALID_SUB_CATEGORY.
 
-    Returns {woNumber, created, status, scheduledAt, message}. Identity errors:
-    INVALID_NAME / INVALID_SMS_TOKEN / CUSTOMER_NOT_FOUND.
+    Returns {woNumber, created, status, scheduledAt, message}.
 
     Args:
         productCategory: 仓储机器人, 巡检机器人, 协作机械臂, or 服务机器人.
         productsubCategory: Faulty component of productCategory.
         description: AI summary plus dialog transcript.
         brand: Product brand / manufacturer.
-        callerName: Company or contact name. Ask each call; never reuse.
-        callerPhoneTail: Last 4 phone digits. Ask each call; never reuse.
+        callerName: Caller name. Optional (accepted but not verified).
+        callerPhoneTail: Last 4 phone digits. Optional (accepted but not verified).
         productModel: Robot model, e.g. WR-500. Optional.
         serialNumber: Unit serial number. Optional.
     """
-    customer_phone, err = _authenticate_caller(callerName, callerPhoneTail)
-    if err:
-        return json.dumps(err)
     err = _validate_category_pair(productCategory, productsubCategory)
     if err:
         return json.dumps(err)
@@ -394,74 +310,52 @@ def requestRepair(
         "serialNumber": serialNumber,
         "description": description,
         "brand": brand,
-        "customerId": customer_phone,
     })
     result = _normalize_with_llm(result, RequestResponse, "requestRepair")
     return json.dumps(result)
 
 
 @mcp.tool()
-def trackRepair(woNumber: str, callerName: str, callerPhoneTail: str) -> str:
+def trackRepair(woNumber: str, callerName: str = "", callerPhoneTail: str = "") -> str:
     """Query the status of an existing repair work order by its work-order number.
-
-    Identity is re-verified on EVERY call: ask the customer for callerName +
-    callerPhoneTail each time and never reuse values from a previous work order.
-    A customer may only see their OWN company's work orders — a work order owned
-    by a different customer (or one that does not exist) returns HTTP 404.
 
     Returns {woNumber, status, statusDescription, scheduledAt, technicianName,
     technicianPhone, address, lastUpdatedAt, remarks}; empty strings mean
-    "unknown" — do not invent values. Errors: INVALID_WO_NUMBER (bad format),
-    INVALID_NAME / INVALID_SMS_TOKEN / CUSTOMER_NOT_FOUND (identity).
+    "unknown" — do not invent values. Error: INVALID_WO_NUMBER (bad format).
+    A work order that does not exist returns HTTP 404.
 
     Args:
         woNumber: Work-order number, a WO-YYYY-NNNN string (e.g. WO-2026-0001).
-        callerName: Customer's company name OR contact person's name. Ask every call; never reuse.
-        callerPhoneTail: Last 4 digits of the customer's phone number. Ask every call; never reuse.
+        callerName: Caller name. Optional (accepted but not verified).
+        callerPhoneTail: Last 4 phone digits. Optional (accepted but not verified).
     """
     err = _validate_wo_number(woNumber)
     if err:
         return json.dumps(err)
-    customer_phone, err = _authenticate_caller(callerName, callerPhoneTail)
-    if err:
-        return json.dumps(err)
-    result = _call_api("/repair/track", {
-        "woNumber": woNumber.strip(),
-        "customerId": customer_phone,
-    })
+    result = _call_api("/repair/track", {"woNumber": woNumber.strip()})
     result = _normalize_with_llm(result, TrackResponse, "trackRepair")
     return json.dumps(result)
 
 
 @mcp.tool()
-def cancelRepair(woNumber: str, callerName: str, callerPhoneTail: str) -> str:
+def cancelRepair(woNumber: str, callerName: str = "", callerPhoneTail: str = "") -> str:
     """Cancel an existing repair work order by its work-order number.
 
     Cancellation is destructive: obtain explicit customer confirmation first.
-    Identity is re-verified on EVERY call: ask the customer for callerName +
-    callerPhoneTail each time and never reuse values from a previous work order.
-    A customer may only cancel their OWN company's work orders — a work order
-    owned by a different customer (or one that does not exist) returns HTTP 404.
 
     Returns {woNumber, cancelled, status, message}. Already cancelled/completed
-    orders return HTTP 409. Errors: INVALID_WO_NUMBER (bad format),
-    INVALID_NAME / INVALID_SMS_TOKEN / CUSTOMER_NOT_FOUND (identity).
+    orders return HTTP 409. Error: INVALID_WO_NUMBER (bad format). A work order
+    that does not exist returns HTTP 404.
 
     Args:
         woNumber: Work-order number, a WO-YYYY-NNNN string (e.g. WO-2026-0001).
-        callerName: Customer's company name OR contact person's name. Ask every call; never reuse.
-        callerPhoneTail: Last 4 digits of the customer's phone number. Ask every call; never reuse.
+        callerName: Caller name. Optional (accepted but not verified).
+        callerPhoneTail: Last 4 phone digits. Optional (accepted but not verified).
     """
     err = _validate_wo_number(woNumber)
     if err:
         return json.dumps(err)
-    customer_phone, err = _authenticate_caller(callerName, callerPhoneTail)
-    if err:
-        return json.dumps(err)
-    result = _call_api("/repair/cancel", {
-        "woNumber": woNumber.strip(),
-        "customerId": customer_phone,
-    })
+    result = _call_api("/repair/cancel", {"woNumber": woNumber.strip()})
     result = _normalize_with_llm(result, CancelResponse, "cancelRepair")
     return json.dumps(result)
 
@@ -475,29 +369,25 @@ UPDATE_STATUS_ENUM = ("pending", "scheduled", "in_progress", "completed")
 @mcp.tool()
 def updateRepair(
     woNumber: str,
-    callerName: str,
-    callerPhoneTail: str,
+    callerName: str = "",
+    callerPhoneTail: str = "",
     description: str = "",
     priority: str = "",
     status: str = "",
 ) -> str:
     """Update a repair work order's fault description, priority, and/or status.
 
-    Identity is re-verified on EVERY call: ask for callerName + callerPhoneTail
-    each time; never reuse values from a previous work order. A customer may only
-    update their OWN company's orders (else HTTP 404).
-
     Provide at least one of description / priority / status. priority: P0/P1/P2/P3.
     status: pending/scheduled/in_progress/completed (to CANCEL use cancelRepair).
     Returns {woNumber, updated, status, priority, description, message}.
     Already cancelled/completed orders return HTTP 409. Errors: INVALID_WO_NUMBER,
-    INVALID_PRIORITY, INVALID_STATUS, NOTHING_TO_UPDATE, INVALID_NAME /
-    INVALID_SMS_TOKEN / CUSTOMER_NOT_FOUND.
+    INVALID_PRIORITY, INVALID_STATUS, NOTHING_TO_UPDATE. A work order that does
+    not exist returns HTTP 404.
 
     Args:
         woNumber: Work-order number, a WO-YYYY-NNNN string (e.g. WO-2026-0001).
-        callerName: Customer's company OR contact name. Ask every call; never reuse.
-        callerPhoneTail: Last 4 phone digits. Ask every call; never reuse.
+        callerName: Caller name. Optional (accepted but not verified).
+        callerPhoneTail: Last 4 phone digits. Optional (accepted but not verified).
         description: New fault description. Optional.
         priority: New priority P0/P1/P2/P3 (P0=urgent/紧急, P1=high/高, P2=medium/中, P3=low/低). Optional.
         status: New status pending/scheduled/in_progress/completed. Optional.
@@ -525,10 +415,7 @@ def updateRepair(
             "message": f"status must be one of: {', '.join(UPDATE_STATUS_ENUM)} (to cancel, use cancelRepair).",
             "allowed": list(UPDATE_STATUS_ENUM),
         })
-    customer_phone, err = _authenticate_caller(callerName, callerPhoneTail)
-    if err:
-        return json.dumps(err)
-    payload = {"woNumber": woNumber.strip(), "customerId": customer_phone}
+    payload = {"woNumber": woNumber.strip()}
     if desc:
         payload["description"] = desc
     if prio:
