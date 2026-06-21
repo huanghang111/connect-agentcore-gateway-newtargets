@@ -33,6 +33,7 @@ chmod +x deploy.sh cleanup.sh test-api.sh
 | `trackRepair` | `woNumber` (必填); `callerName`, `callerPhoneTail` (可选) | 查询工单状态 | woNumber 必须为 WO-YYYY-NNNN（INVALID_WO_NUMBER）。**无身份/归属校验**，任意调用方可查任意工单；工单不存在 → `404` |
 | `cancelRepair` | `woNumber` (必填); `callerName`, `callerPhoneTail` (可选) | 取消工单 | 同上；任意调用方可取消任意工单；工单不存在 → `404`；幂等：已 cancelled / completed 返 `409` |
 | `updateRepair` | `woNumber` (必填); `description`, `priority`, `status` (至少传一个); `callerName`, `callerPhoneTail` (可选) | 修改工单的故障描述/优先级/状态 | 同上；任意调用方可修改任意工单；工单不存在 → `404`；`priority`∈`P0/P1/P2/P3`（P0 紧急/P1 高/P2 中/P3 低）；`status`∈`pending/scheduled/in_progress/completed`（取消走 cancelRepair）；NOTHING_TO_UPDATE / INVALID_PRIORITY / INVALID_STATUS；已 cancelled/completed 返 `409` |
+| `listRepairs` | 全部可选: `customerName`(公司/联系人模糊), `openOnly`(只看未关闭), `status`, `priority`, `productCategory` | 模糊/聚合查询工单（"华创智联有哪些未关闭工单?"、"有多少未关闭、有紧急的吗?"） | 表内 Scan + 多维过滤；返回 `{count, urgentCount(P0数), byPriority, byStatus, tickets[]}`；INVALID_PRIORITY / INVALID_STATUS |
 | `faqSearch` | `query` | FAQ 关键字检索 | — |
 
 > **身份模型**：身份核验已**完全停用**。没有核身工具、没有客户注册表、没有 token / 缓存，也不做工单归属校验。`requestRepair` / `trackRepair` / `cancelRepair` / `updateRepair` 仍接受 `callerName`（口述姓名）与 `callerPhoneTail`（手机号后 4 位）两个参数，但它们仅为向后兼容保留，**既不校验也不使用**，因此都是**可选**的。任意调用方都可以创建 / 查询 / 修改 / 取消**任意**工单；`404` 现在只表示「工单不存在」，绝不再表示「归属于他人」。
@@ -47,6 +48,7 @@ chmod +x deploy.sh cleanup.sh test-api.sh
 | `POST /repair/track` | 查询工单状态 |
 | `POST /repair/cancel` | 取消工单 |
 | `POST /repair/update` | 修改工单的故障描述/优先级/状态 |
+| `POST /repair/list` | 模糊/聚合查询工单（按客户/状态/优先级/品类过滤 + 计数） |
 | `POST /faq/simple` | FAQ 关键字检索（无需 Bedrock KB） |
 
 ## 鉴权
@@ -186,7 +188,7 @@ midea/
 ├── connect-api-openapi.yaml   # OpenAPI 规范
 └── mcp-agent/                 # MCP Server Agent 源码（被 deploy.sh 打包后送进 CodeBuild）
     ├── README.md              # MCP Server 详细文档（工具签名 / docstring / 错误码 / 归一化）
-    ├── mcp_server.py          # FastMCP server (5 tools)
+    ├── mcp_server.py          # FastMCP server (6 tools)
     ├── Dockerfile             # ARM64 容器
     ├── requirements.txt
     └── buildspec.yml

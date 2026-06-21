@@ -1,6 +1,6 @@
 # Connect Repair MCP Server
 
-把 Repair Service 工具封装成 MCP Server，部署到 AgentCore Runtime，通过 AgentCore Gateway 暴露给 Amazon Connect AI Agent。共 **5 个工具**：四个 repair 业务工具（`requestRepair` / `trackRepair` / `cancelRepair` / `updateRepair`）和一个 FAQ 检索工具（`faqSearch`）。**身份核验已完全停用** —— 四个 repair 工具仍接受 `callerName` + `callerPhoneTail` 两个参数（向后兼容），但既不校验也不使用，因此都是可选的；任意调用方均可创建 / 查询 / 修改 / 取消任意工单。
+把 Repair Service 工具封装成 MCP Server，部署到 AgentCore Runtime，通过 AgentCore Gateway 暴露给 Amazon Connect AI Agent。共 **6 个工具**：五个 repair 业务工具（`requestRepair` / `trackRepair` / `cancelRepair` / `updateRepair` / `listRepairs`）和一个 FAQ 检索工具（`faqSearch`）。**身份核验已完全停用** —— repair 工具仍接受 `callerName` + `callerPhoneTail` 两个参数（向后兼容），但既不校验也不使用，因此都是可选的；任意调用方均可创建 / 查询 / 修改 / 取消 / 列举任意工单。
 
 ## 架构
 
@@ -16,6 +16,7 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 | `trackRepair` | 查询工单状态（无身份/归属校验，任意调用方可查任意工单） | `woNumber`(WO-YYYY-NNNN) 必填；`callerName`, `callerPhoneTail` 可选(不校验) |
 | `cancelRepair` | 取消工单（任意调用方可取消任意工单） | `woNumber`(WO-YYYY-NNNN) 必填；`callerName`, `callerPhoneTail` 可选(不校验) |
 | `updateRepair` | 修改工单的故障描述/优先级/状态（任意调用方可改任意工单） | `woNumber` 必填；`description`/`priority`(P0 紧急/P1 高/P2 中/P3 低)/`status`(pending/scheduled/in_progress/completed) 至少传一个；`callerName`, `callerPhoneTail` 可选(不校验) |
+| `listRepairs` | 模糊/聚合查询工单（按客户/状态/优先级/品类过滤 + 计数） | 全部可选：`customerName`(公司/联系人模糊子串), `openOnly`(只看 pending/scheduled/in_progress), `status`, `priority`, `productCategory` |
 | `faqSearch` | FAQ 知识库自然语言检索（产品使用 / 故障排查 / 保修 / 维修） | `query`(任意自然语言问题) 必填 |
 
 > **设计原则**：所有 tool 的使用方式都写在各自的 docstring 顶部，LLM 通过 `toolConfigurationList` 拿到 description 即可正确使用。**身份核验已完全停用**，Connect AI Agent 的 Orchestration Prompt 不需要任何身份相关配置。
@@ -88,6 +89,18 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 | 后端响应（200） | `{"message":"Repair ticket updated","ticketNumber":"...","status":"...","priority":"...","description":"...","updatedAt":"..."}`；不存在 → `404`；状态已是 `cancelled`/`completed` → `409` |
 | MCP 归一化出参（`UpdateResponse`） | `{woNumber, updated(bool), status, priority, description, message}` |
 
+#### 5. `listRepairs` — 模糊/聚合查询
+
+| 项 | 内容 |
+|----|------|
+| MCP 入参（全部可选） | `customerName`(公司/联系人模糊子串，忽略大小写), `openOnly`(true=只看 pending/scheduled/in_progress), `status`, `priority`, `productCategory` |
+| MCP 本地校验 | `INVALID_PRIORITY` / `INVALID_STATUS`（status 过滤可含 `cancelled`） |
+| 后端 endpoint | `POST {REPAIR_API_URL}/repair/list`，header `X-API-Key: <REPAIR_API_KEY>` |
+| 后端 body | `{customerName?, openOnly?, status?, priority?, productCategory?}`（只带传了的字段；全空=列全部） |
+| 后端实现 | DynamoDB `Scan` 全表（表很小）+ 内存按 AND 过滤；按 priority/woNumber 排序 |
+| 后端响应（200） | `{message, count, urgentCount(=P0 数), byPriority{}, byStatus{}, tickets:[{ticketNumber,status,priority,productCategory,productsubCategory,productModel,customerName,description,updatedAt}]}` |
+| MCP 出参 | 同后端响应原样返回（**不过归一化**；聚合字段已是固定 schema，供 LLM 答"多少个 / 有无紧急"） |
+
 #### 错误码速查（MCP 本地拦截，不会打到后端）
 
 | 错误码 | 触发位置 |
@@ -96,8 +109,8 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 | `INVALID_SUB_CATEGORY` | `requestRepair`（部件不属于该品类） |
 | `INVALID_WO_NUMBER` | `trackRepair` / `cancelRepair` / `updateRepair` |
 | `NOTHING_TO_UPDATE` | `updateRepair`（description/priority/status 一个都没传） |
-| `INVALID_PRIORITY` | `updateRepair`（priority 不在 P0/P1/P2/P3 内） |
-| `INVALID_STATUS` | `updateRepair`（status 不在 pending/scheduled/in_progress/completed 内；取消请用 cancelRepair） |
+| `INVALID_PRIORITY` | `updateRepair` / `listRepairs`（priority 不在 P0/P1/P2/P3 内） |
+| `INVALID_STATUS` | `updateRepair`（不在 pending/scheduled/in_progress/completed） / `listRepairs`（不在含 cancelled 的 5 个状态内） |
 | `HTTP 404`（不存在） | `trackRepair` / `cancelRepair` / `updateRepair`：工单不存在（已无归属校验） |
 | `HTTP 400/404/409/500` | 后端透传，归一化时直接跳过（错误路径保持确定） |
 
@@ -259,7 +272,7 @@ python mcp_server.py
 
 | 文件 | 作用 |
 |------|------|
-| `mcp_server.py` | MCP Server 实现（FastMCP + 5 个 tool：4 repair + 1 FAQ；身份核验已停用） |
+| `mcp_server.py` | MCP Server 实现（FastMCP + 6 个 tool：5 repair + 1 FAQ；身份核验已停用） |
 | `Dockerfile` | ARM64 容器（Python 3.11，非 root 用户） |
 | `requirements.txt` | Python 依赖 |
 | `buildspec.yml` | CodeBuild 构建脚本 |

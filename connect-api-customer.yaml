@@ -881,6 +881,143 @@ Resources:
               }
           };
 
+  ListRepairsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt RepairLambdaExecutionRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref RepairLambdaLogGroup
+        LogFormat: JSON
+      Environment:
+        Variables:
+          REPAIR_TICKETS_TABLE_NAME: !Ref RepairTicketsTable
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, ScanCommand } = require('@aws-sdk/lib-dynamodb');
+
+          const client = new DynamoDBClient({});
+          const docClient = DynamoDBDocumentClient.from(client);
+
+          const OPEN_STATUSES = ['pending', 'scheduled', 'in_progress'];
+
+          const resp = (statusCode, obj) => ({
+              statusCode,
+              headers: {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+              },
+              body: JSON.stringify(obj),
+          });
+
+          // Scan the whole (small) table, paginating defensively.
+          async function scanAll() {
+              const items = [];
+              let ExclusiveStartKey;
+              do {
+                  const out = await docClient.send(new ScanCommand({
+                      TableName: process.env.REPAIR_TICKETS_TABLE_NAME,
+                      ExclusiveStartKey,
+                  }));
+                  (out.Items || []).forEach((i) => items.push(i));
+                  ExclusiveStartKey = out.LastEvaluatedKey;
+              } while (ExclusiveStartKey);
+              return items;
+          }
+
+          exports.handler = async (event) => {
+              const requestId = event.requestContext?.requestId || 'unknown';
+              console.log(JSON.stringify({
+                  level: 'INFO',
+                  message: 'List repairs request received',
+                  requestId,
+                  event: event
+              }));
+
+              try {
+                  const body = JSON.parse(event.body || '{}');
+                  const { customerName, status, priority, productCategory, openOnly } = body;
+
+                  // Normalize filters (all optional). String match is
+                  // case-insensitive substring for customerName, exact for the
+                  // enum-like fields.
+                  const cn = (customerName || '').trim().toLowerCase();
+                  const st = (status || '').trim();
+                  const pr = (priority || '').trim();
+                  const pc = (productCategory || '').trim();
+                  const openFlag = openOnly === true || openOnly === 'true';
+
+                  let items = await scanAll();
+
+                  items = items.filter((t) => {
+                      if (cn && !String(t.customerName || '').toLowerCase().includes(cn)) return false;
+                      if (st && t.status !== st) return false;
+                      if (openFlag && !OPEN_STATUSES.includes(t.status)) return false;
+                      if (pr && t.priority !== pr) return false;
+                      if (pc && t.productCategory !== pc) return false;
+                      return true;
+                  });
+
+                  // Sort by priority (P0 first) then work-order number for a
+                  // stable, sensible order.
+                  items.sort((a, b) => {
+                      const pa = String(a.priority || 'P9');
+                      const pb = String(b.priority || 'P9');
+                      if (pa !== pb) return pa < pb ? -1 : 1;
+                      return String(a.ticketNumber).localeCompare(String(b.ticketNumber));
+                  });
+
+                  const tickets = items.map((t) => ({
+                      ticketNumber: t.ticketNumber,
+                      status: t.status ?? null,
+                      priority: t.priority ?? null,
+                      productCategory: t.productCategory ?? null,
+                      productsubCategory: t.productsubCategory ?? null,
+                      productModel: t.productModel ?? null,
+                      customerName: t.customerName ?? null,
+                      description: t.description ?? null,
+                      updatedAt: t.updatedAt ?? null,
+                  }));
+
+                  // Aggregates so the caller can answer "how many / any urgent".
+                  const byPriority = {};
+                  const byStatus = {};
+                  tickets.forEach((t) => {
+                      if (t.priority) byPriority[t.priority] = (byPriority[t.priority] || 0) + 1;
+                      if (t.status) byStatus[t.status] = (byStatus[t.status] || 0) + 1;
+                  });
+
+                  console.log(JSON.stringify({
+                      level: 'INFO',
+                      message: 'List repairs completed',
+                      requestId,
+                      count: tickets.length,
+                  }));
+
+                  return resp(200, {
+                      message: 'Repair tickets listed',
+                      count: tickets.length,
+                      urgentCount: byPriority['P0'] || 0,
+                      byPriority,
+                      byStatus,
+                      tickets,
+                  });
+              } catch (error) {
+                  console.log(JSON.stringify({
+                      level: 'ERROR',
+                      message: 'Error listing repair tickets',
+                      requestId,
+                      error: error.message,
+                      stack: error.stack
+                  }));
+                  return resp(500, { error: 'Internal server error', message: error.message });
+              }
+          };
+
   CancelRepairFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -1419,6 +1556,14 @@ Resources:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HotelApi}/*/*'
 
+  ListRepairsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ListRepairsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HotelApi}/*/*'
+
   FaqSimplePermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -1541,6 +1686,26 @@ Resources:
                 type: 'aws_proxy'
                 httpMethod: 'POST'
                 uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UpdateRepairFunction.Arn}/invocations'
+          /repair/list:
+            post:
+              operationId: 'listRepairs'
+              security:
+                - api_key: []
+              requestBody:
+                required: false
+                content:
+                  application/json:
+                    schema:
+                      $ref: '#/components/schemas/ListRepairsRequest'
+              responses:
+                '401':
+                  description: 'Unauthorized - API key required'
+                '200':
+                  description: '200 response'
+              x-amazon-apigateway-integration:
+                type: 'aws_proxy'
+                httpMethod: 'POST'
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ListRepairsFunction.Arn}/invocations'
           /faq/simple:
             post:
               operationId: 'faqSimple'
@@ -1624,6 +1789,21 @@ Resources:
                 status:
                   type: 'string'
                   enum: ['pending', 'scheduled', 'in_progress', 'completed']
+            ListRepairsRequest:
+              type: 'object'
+              properties:
+                customerName:
+                  type: 'string'
+                openOnly:
+                  type: 'boolean'
+                status:
+                  type: 'string'
+                  enum: ['pending', 'scheduled', 'in_progress', 'completed', 'cancelled']
+                priority:
+                  type: 'string'
+                  enum: ['P0', 'P1', 'P2', 'P3']
+                productCategory:
+                  type: 'string'
           securitySchemes:
             api_key:
               type: 'apiKey'
@@ -1696,4 +1876,5 @@ Outputs:
       Track Repair:   https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/repair/track
       Cancel Repair:  https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/repair/cancel
       Update Repair:  https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/repair/update
+      List Repairs:   https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/repair/list
       FAQ Simple:     https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/faq/simple

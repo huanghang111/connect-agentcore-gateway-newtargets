@@ -247,6 +247,38 @@ else
 fi
 echo ""
 
+# 测试14: 模糊查询 - 华创智联的未关闭工单 (至少含预置 WO-0001/WO-0002)
+echo -e "${YELLOW}测试 14: 模糊查询 - 华创智联未关闭工单${NC}"
+RESPONSE=$(curl -s -X POST "$API_URL/repair/list" \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  --data-raw '{"customerName":"华创智联","openOnly":true}')
+
+if echo "$RESPONSE" | grep -q '"customerName":"华创智联-张伟"' && echo "$RESPONSE" | grep -q '"count"'; then
+    echo -e "${GREEN}✓ 模糊查询正确（命中华创智联未关闭工单）${NC}"
+else
+    echo -e "${RED}✗ 模糊查询异常${NC}"
+    echo "$RESPONSE"
+fi
+echo ""
+
+# 测试15: 聚合查询 - 全部未关闭工单 + 紧急计数 (结构校验: count/urgentCount/byPriority)
+echo -e "${YELLOW}测试 15: 聚合查询 - 全部未关闭 + 紧急计数${NC}"
+RESPONSE=$(curl -s -X POST "$API_URL/repair/list" \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  --data-raw '{"openOnly":true}')
+
+if echo "$RESPONSE" | grep -q '"count"' && echo "$RESPONSE" | grep -q '"urgentCount"' && echo "$RESPONSE" | grep -q '"byPriority"'; then
+    COUNT=$(echo "$RESPONSE" | grep -o '"count":[0-9]*' | head -1 | cut -d: -f2)
+    URGENT=$(echo "$RESPONSE" | grep -o '"urgentCount":[0-9]*' | cut -d: -f2)
+    echo -e "${GREEN}✓ 聚合查询正确（未关闭 ${COUNT} 张，紧急 ${URGENT} 张）${NC}"
+else
+    echo -e "${RED}✗ 聚合查询异常${NC}"
+    echo "$RESPONSE"
+fi
+echo ""
+
 # 还原 WO-2026-0003 到预置状态
 curl -s -X POST "$API_URL/repair/update" \
   -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" \

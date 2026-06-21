@@ -385,6 +385,90 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 
+  /repair/list:
+    post:
+      operationId: listRepairs
+      summary: List / count repair work orders (fuzzy search)
+      description: |
+        List and count repair work orders matching optional filters, for
+        questions like "how many open work orders does 华创智联 have?" or "are
+        there any urgent (P0) repairs?". All filters are optional and combined
+        with AND. Identity verification is disabled. Returns the matching
+        tickets plus aggregate counts (total, urgent/P0 count, by-priority,
+        by-status) so the caller can answer "how many" / "any urgent".
+      tags:
+        - Repair Service
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                customerName:
+                  type: string
+                  description: Case-insensitive substring of the ticket customerName ("公司-联系人"). Optional.
+                  example: '华创智联'
+                openOnly:
+                  type: boolean
+                  description: 'true → only open work orders (status pending/scheduled/in_progress; excludes completed/cancelled).'
+                  example: true
+                status:
+                  type: string
+                  description: Exact status filter. Optional.
+                  enum: ['pending', 'scheduled', 'in_progress', 'completed', 'cancelled']
+                priority:
+                  type: string
+                  description: Exact priority filter (P0=urgent). Optional.
+                  enum: ['P0', 'P1', 'P2', 'P3']
+                productCategory:
+                  type: string
+                  description: Exact robot category. Optional.
+                  example: '仓储机器人'
+      responses:
+        '200':
+          description: Matching work orders and aggregate counts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                    example: 2
+                  urgentCount:
+                    type: integer
+                    description: Number of matching P0 (urgent) work orders
+                    example: 0
+                  byPriority:
+                    type: object
+                    additionalProperties:
+                      type: integer
+                    example: {'P1': 1, 'P2': 1}
+                  byStatus:
+                    type: object
+                    additionalProperties:
+                      type: integer
+                    example: {'pending': 1, 'in_progress': 1}
+                  tickets:
+                    type: array
+                    items:
+                      type: object
+        '401':
+          description: Unauthorized - API key required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
   /faq/simple:
     post:
       operationId: faqSimple

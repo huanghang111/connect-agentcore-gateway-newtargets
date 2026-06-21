@@ -427,6 +427,64 @@ def updateRepair(
     return json.dumps(result)
 
 
+# Status values accepted as a listRepairs FILTER (includes cancelled, unlike
+# the updateRepair status enum). "open" work orders = pending/scheduled/in_progress.
+LIST_STATUS_ENUM = ("pending", "scheduled", "in_progress", "completed", "cancelled")
+
+
+@mcp.tool()
+def listRepairs(
+    customerName: str = "",
+    openOnly: bool = False,
+    status: str = "",
+    priority: str = "",
+    productCategory: str = "",
+) -> str:
+    """List / count repair work orders matching optional filters (fuzzy search).
+
+    Use for questions like "华创智联有哪些未关闭工单?" or "有多少未关闭工单，有紧急的吗?".
+    All filters optional, combined with AND. Returns {count, urgentCount (P0 数),
+    byPriority{}, byStatus{}, tickets[]} — use count/urgentCount/byPriority to
+    answer "多少个" 和 "有无紧急(P0)". Errors: INVALID_PRIORITY, INVALID_STATUS.
+
+    Args:
+        customerName: 公司/联系人 子串(忽略大小写)，如 "华创智联" 匹配 华创智联-张伟. Optional.
+        openOnly: true=只看未关闭(pending/scheduled/in_progress，排除 completed/cancelled). Optional.
+        status: 精确状态 pending/scheduled/in_progress/completed/cancelled. Optional.
+        priority: 精确优先级 P0/P1/P2/P3 (P0=紧急). Optional.
+        productCategory: 精确品类 仓储机器人/巡检机器人/协作机械臂/服务机器人. Optional.
+    """
+    prio = (priority or "").strip()
+    stat = (status or "").strip()
+    if prio and prio not in UPDATE_PRIORITY_ENUM:
+        return json.dumps({
+            "error": "INVALID_PRIORITY",
+            "message": f"priority must be one of: {', '.join(UPDATE_PRIORITY_ENUM)}.",
+            "allowed": list(UPDATE_PRIORITY_ENUM),
+        })
+    if stat and stat not in LIST_STATUS_ENUM:
+        return json.dumps({
+            "error": "INVALID_STATUS",
+            "message": f"status must be one of: {', '.join(LIST_STATUS_ENUM)}.",
+            "allowed": list(LIST_STATUS_ENUM),
+        })
+    payload = {}
+    name = (customerName or "").strip()
+    cat = (productCategory or "").strip()
+    if name:
+        payload["customerName"] = name
+    if openOnly:
+        payload["openOnly"] = True
+    if stat:
+        payload["status"] = stat
+    if prio:
+        payload["priority"] = prio
+    if cat:
+        payload["productCategory"] = cat
+    result = _call_api("/repair/list", payload)
+    return json.dumps(result, ensure_ascii=False)
+
+
 @mcp.tool()
 def faqSearch(query: str) -> str:
     """Search the FAQ knowledge base using natural language queries. Returns relevant FAQ entries about product usage, troubleshooting, warranty, and repair services.
