@@ -176,6 +176,22 @@ def _ensure_gateway(control, iam) -> tuple[str, str]:
     gw_id = resp["gatewayId"]
     print(f"  ✓ Gateway created: {gw_id}")
 
+    # Wait for the new Gateway to leave the CREATING state — UpdateGateway
+    # rejects the call otherwise ("can't be performed ... when it is in
+    # Creating state").
+    print("  Waiting for Gateway READY before updating audience...")
+    for i in range(30):
+        gw_status = control.get_gateway(gatewayIdentifier=gw_id).get("status", "")
+        if gw_status == "READY":
+            break
+        if "FAILED" in gw_status:
+            print(f"  ✗ Gateway failed: {gw_status}")
+            sys.exit(1)
+        time.sleep(5)
+    else:
+        print("  ✗ Timeout waiting for Gateway READY")
+        sys.exit(1)
+
     # Step 2: rewrite allowedAudience to the Gateway's own ID.
     final_aud = [gw_id]
     extra_aud = [
