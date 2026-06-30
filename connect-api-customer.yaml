@@ -496,6 +496,11 @@ Resources:
                       brand
                   } = body;
 
+                  // Caller identity. The MCP server forwards the resolved
+                  // customerId (== the caller's verified phone) so that
+                  // /repair/list can find this ticket via the PhoneIndex GSI.
+                  const phone = body.phone || body.customerId || null;
+
                   // Validate required fields (productModel and serialNumber are optional)
                   const requiredFields = {
                       productCategory,
@@ -546,6 +551,13 @@ Resources:
                       createdAt: new Date().toISOString(),
                       updatedAt: new Date().toISOString()
                   };
+
+                  // Only set `phone` when present — the PhoneIndex GSI hash key
+                  // must not be an empty string. Tickets without a phone simply
+                  // won't appear in /repair/list (acceptable).
+                  if (phone) {
+                      repairTicket.phone = phone;
+                  }
 
                   const params = {
                       TableName: process.env.REPAIR_TICKETS_TABLE_NAME,
@@ -977,6 +989,49 @@ Resources:
                   'question': 'Where can I find my product serial number?',
                   'answer': 'Serial number locations: Air Conditioner: Inside front panel or on side of unit. Refrigerator: Inside fresh food compartment on side wall or ceiling. Washing Machine: Inside door rim or on back panel. Format: Usually starts with letters followed by numbers (e.g., SN123456789). Take a photo for future reference.',
                   'keywords': ['serial number', 'model number', 'identification', 'locate', 'find']
+              },
+              # ---- 中文 FAQ（关键字为中文子串匹配；含洗衣机异味的两种情形，用于多条澄清场景）----
+              {
+                  'id': 'faq-011',
+                  'category': 'Washing Machine',
+                  'question': '洗衣机本身有异味怎么办？',
+                  'answer': '洗衣机内筒长期潮湿容易滋生霉菌产生异味，处理方法：1）每月用「筒自洁/桶清洁」程序跑一次高温空筒，可加入专用洗衣机清洁剂或2杯白醋；2）清理洗衣机门封圈（胶圈）夹缝里的污垢和毛絮；3）取出并清洗洗涤剂盒；4）每次洗完后让舱门和洗涤剂盒保持敞开通风，避免积水发霉。',
+                  'keywords': ['洗衣机', '异味', '臭味', '霉味', '本身', '内筒', '发霉', '清洁', '味道']
+              },
+              {
+                  'id': 'faq-012',
+                  'category': 'Washing Machine',
+                  'question': '洗完衣服后衣物有异味怎么办？',
+                  'answer': '如果是洗后衣物本身有异味：1）不要洗完长时间不晾，潮湿衣物闷在筒内会有味，洗完尽快取出晾晒；2）减少洗涤剂/柔顺剂用量，残留过多会发酸发臭；3）定期跑筒自洁去除筒内霉菌源；4）洗涤时水温过低可适当提高水温；5）必要时使用带除菌功能的洗涤程序。',
+                  'keywords': ['洗衣机', '异味', '臭味', '衣服', '衣物', '洗完', '洗后', '味道', '酸味']
+              },
+              {
+                  'id': 'faq-013',
+                  'category': 'Air Conditioner',
+                  'question': '空调如何重置/复位？',
+                  'answer': '空调重置步骤：1）用遥控器或面板关闭空调；2）拔掉电源插头；3）等待3到5分钟；4）重新插上电源；5）开机即完成内部电路重置。若仍异常，请预约维修。',
+                  'keywords': ['空调', '重置', '复位', '重启', '恢复', '死机']
+              },
+              {
+                  'id': 'faq-014',
+                  'category': 'Air Conditioner',
+                  'question': '空调不制冷是什么原因？',
+                  'answer': '空调不制冷常见原因：1）滤网太脏，清洗或更换滤网；2）出风口被遮挡，保持气流畅通；3）温度设置过高，调低设定温度；4）制冷剂不足，需联系维修加注；5）室外机故障，检查室外机是否运转。',
+                  'keywords': ['空调', '不制冷', '不凉', '不冷', '制冷', '温度', '冷气']
+              },
+              {
+                  'id': 'faq-015',
+                  'category': 'Refrigerator',
+                  'question': '冰箱噪音大/有异响怎么办？',
+                  'answer': '冰箱噪音常见原因：1）压缩机运转的嗡嗡声属正常；2）制冰/进水时的咕噜声属正常；3）风扇被冰块或杂物碰到，检查是否结冰或有松动物品；4）地面不平，调平冰箱脚；5）背板或螺丝松动，紧固即可。若噪音异常持续，请预约维修。',
+                  'keywords': ['冰箱', '噪音', '响声', '异响', '声音', '嗡嗡', '吵']
+              },
+              {
+                  'id': 'faq-016',
+                  'category': 'General',
+                  'question': '如何预约维修服务？',
+                  'answer': '预约维修：1）提供产品类别、品牌、所在省市区和故障描述；2）系统会生成一个10位工单号；3）维修工程师会在24-48小时内与您联系；4）可随时凭工单号查询维修进度。',
+                  'keywords': ['预约', '维修', '报修', '上门', '工程师', '服务', '保修']
               }
           ]
 
@@ -1113,6 +1168,113 @@ Resources:
                       })
                   }
 
+  ListRepairsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !GetAtt RepairLambdaExecutionRole.Arn
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref RepairLambdaLogGroup
+        LogFormat: JSON
+      Environment:
+        Variables:
+          REPAIR_TICKETS_TABLE_NAME: !Ref RepairTicketsTable
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, QueryCommand } = require('@aws-sdk/lib-dynamodb');
+
+          const client = new DynamoDBClient({});
+          const docClient = DynamoDBDocumentClient.from(client);
+
+          const MAX_ORDERS = 5;
+
+          const resp = (statusCode, obj) => ({
+              statusCode,
+              headers: {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+              },
+              body: JSON.stringify(obj),
+          });
+
+          exports.handler = async (event) => {
+              const requestId = event.requestContext?.requestId || 'unknown';
+              console.log(JSON.stringify({
+                  level: 'INFO',
+                  message: 'List repairs request received',
+                  requestId,
+                  event: event
+              }));
+
+              try {
+                  const body = JSON.parse(event.body || '{}');
+                  // The MCP server forwards the resolved customerId as `phone`.
+                  const phone = (body.phone || body.customerId || '').trim();
+
+                  if (!phone) {
+                      return resp(400, {
+                          error: 'phone is required to list a customer\'s work orders',
+                      });
+                  }
+
+                  // Query the PhoneIndex GSI for all tickets owned by this phone.
+                  const out = await docClient.send(new QueryCommand({
+                      TableName: process.env.REPAIR_TICKETS_TABLE_NAME,
+                      IndexName: 'PhoneIndex',
+                      KeyConditionExpression: '#p = :phone',
+                      ExpressionAttributeNames: { '#p': 'phone' },
+                      ExpressionAttributeValues: { ':phone': phone },
+                  }));
+
+                  let items = out.Items || [];
+
+                  // Newest first by createdAt (ISO 8601 sorts lexicographically).
+                  items.sort((a, b) =>
+                      String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+
+                  const orders = items.slice(0, MAX_ORDERS).map((t) => ({
+                      woNumber: t.ticketNumber,
+                      status: t.status ?? null,
+                      productCategory: t.productCategory ?? null,
+                      productsubCategory: t.productsubCategory ?? null,
+                      brand: t.brand ?? null,
+                      description: t.description ?? null,
+                      createdAt: t.createdAt ?? null,
+                      updatedAt: t.updatedAt ?? null,
+                  }));
+
+                  console.log(JSON.stringify({
+                      level: 'INFO',
+                      message: 'List repairs completed',
+                      requestId,
+                      total: items.length,
+                      returned: orders.length
+                  }));
+
+                  return resp(200, {
+                      orders,
+                      count: orders.length,
+                      total: items.length,
+                  });
+              } catch (error) {
+                  console.log(JSON.stringify({
+                      level: 'ERROR',
+                      message: 'Error listing repairs',
+                      requestId,
+                      error: error.message,
+                      stack: error.stack
+                  }));
+                  return resp(500, {
+                      error: 'Internal server error',
+                      message: error.message,
+                  });
+              }
+          };
+
   # ========================================
   # LAMBDA PERMISSIONS
   # ========================================
@@ -1146,6 +1308,14 @@ Resources:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref FaqSimpleFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HotelApi}/*/*'
+
+  ListRepairsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ListRepairsFunction
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HotelApi}/*/*'
@@ -1265,6 +1435,28 @@ Resources:
                 type: 'aws_proxy'
                 httpMethod: 'POST'
                 uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FaqSimpleFunction.Arn}/invocations'
+          /repair/list:
+            post:
+              operationId: 'listRepairs'
+              security:
+                - api_key: []
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      $ref: '#/components/schemas/ListRepairsRequest'
+              responses:
+                '401':
+                  description: 'Unauthorized - API key required'
+                '400':
+                  description: '400 response'
+                '200':
+                  description: '200 response'
+              x-amazon-apigateway-integration:
+                type: 'aws_proxy'
+                httpMethod: 'POST'
+                uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ListRepairsFunction.Arn}/invocations'
         components:
           schemas:
             RepairRequest:
@@ -1312,6 +1504,13 @@ Resources:
                 woNumber:
                   type: 'string'
                   pattern: '^\d{10}$'
+            ListRepairsRequest:
+              type: 'object'
+              required:
+                - phone
+              properties:
+                phone:
+                  type: 'string'
           securitySchemes:
             api_key:
               type: 'apiKey'
@@ -1327,7 +1526,15 @@ Resources:
       Enabled: true
       GenerateDistinctId: true
 
-  ApiDeployment:
+  # IMPORTANT — AWS::ApiGateway::Deployment has a fixed logical ID, so CloudFormation
+  # creates it ONCE and does NOT re-deploy when the RestApi Body changes (e.g. adding
+  # a route). A stack UPDATE that adds an endpoint will leave the new route returning
+  # "Missing Authentication Token" on the stage until a fresh deployment is made.
+  # The canonical fix is to BUMP THE LOGICAL ID SUFFIX (ApiDeploymentV2 -> V3 -> ...)
+  # whenever you change any path/method in the Body below. That forces CloudFormation
+  # to create a new Deployment capturing the current API surface. (Fresh create-stack
+  # is unaffected — it always captures the full Body.)
+  ApiDeploymentV2:
     Type: AWS::ApiGateway::Deployment
     DependsOn: ApiGatewayAccount
     Properties:
@@ -1337,7 +1544,7 @@ Resources:
     Type: AWS::ApiGateway::Stage
     Properties:
       RestApiId: !Ref HotelApi
-      DeploymentId: !Ref ApiDeployment
+      DeploymentId: !Ref ApiDeploymentV2
       StageName: dev
       TracingEnabled: true
       AccessLogSetting:
@@ -1383,4 +1590,5 @@ Outputs:
       Request Repair: https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/repair/request
       Track Repair:   https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/repair/track
       Cancel Repair:  https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/repair/cancel
+      List Repairs:   https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/repair/list
       FAQ Simple:     https://${HotelApi}.execute-api.${AWS::Region}.amazonaws.com/dev/faq/simple

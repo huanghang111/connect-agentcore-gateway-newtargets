@@ -22,22 +22,26 @@ echo "API URL: $API_URL"
 echo "API Key: ${API_KEY:0:10}..."
 echo ""
 
+# 测试用手机号（= MCP 层解析出的 customerId，后端作为 phone 持久化，供 listRepairs 检索）
+TEST_PHONE="13800138000"
+
 # 测试1: 创建维修工单
 echo -e "${YELLOW}测试 1: 创建维修工单${NC}"
 RESPONSE=$(curl -s -X POST "$API_URL/repair/request" \
   -H "X-API-Key: $API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{
-    "productCategory": "Refrigerator",
-    "productsubCategory": "French Door",
-    "productModel": "MF200W90BE",
-    "serialNumber": "SN20231015ABC123",
-    "brand": "AnyCompany",
-    "province": "NY",
-    "city": "New York",
-    "district": "Manhattan",
-    "description": "Refrigerator not cooling properly, temperature not going down. Customer already tried unplugging for 10 minutes."
-  }')
+  -d "{
+    \"productCategory\": \"Refrigerator\",
+    \"productsubCategory\": \"French Door\",
+    \"productModel\": \"MF200W90BE\",
+    \"serialNumber\": \"SN20231015ABC123\",
+    \"brand\": \"AnyCompany\",
+    \"province\": \"NY\",
+    \"city\": \"New York\",
+    \"district\": \"Manhattan\",
+    \"phone\": \"$TEST_PHONE\",
+    \"description\": \"Refrigerator not cooling properly, temperature not going down. Customer already tried unplugging for 10 minutes.\"
+  }")
 
 if echo "$RESPONSE" | grep -q "ticketNumber"; then
     TICKET_NUMBER=$(echo "$RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin)['ticketNumber'], end='')")
@@ -152,6 +156,39 @@ if echo "$RESPONSE" | grep -q "10-digit"; then
     echo -e "${GREEN}✓ 错误处理正确${NC}"
 else
     echo -e "${RED}✗ 错误处理异常${NC}"
+    echo "$RESPONSE"
+fi
+echo ""
+
+# 测试 7b: 工单列表 - 按手机号查到刚创建的工单
+echo -e "${YELLOW}测试 7b: 工单列表（按手机号）${NC}"
+RESPONSE=$(curl -s -X POST "$API_URL/repair/list" \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "{\"phone\":\"$TEST_PHONE\"}")
+
+if echo "$RESPONSE" | grep -q "$TICKET_NUMBER"; then
+    LIST_COUNT=$(echo "$RESPONSE" | grep -o '"count":[0-9]*' | cut -d':' -f2)
+    echo -e "${GREEN}✓ 工单列表查询成功${NC}"
+    echo "  该手机号名下返回 $LIST_COUNT 张工单，包含刚创建的 $TICKET_NUMBER"
+else
+    echo -e "${RED}✗ 工单列表未包含刚创建的工单${NC}"
+    echo "$RESPONSE"
+    exit 1
+fi
+echo ""
+
+# 测试 7c: 工单列表 - 未知手机号返回空
+echo -e "${YELLOW}测试 7c: 工单列表（未知手机号 → 空）${NC}"
+RESPONSE=$(curl -s -X POST "$API_URL/repair/list" \
+  -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"phone":"19900000000"}')
+
+if echo "$RESPONSE" | grep -q '"count":0'; then
+    echo -e "${GREEN}✓ 未知手机号正确返回 0 张工单${NC}"
+else
+    echo -e "${RED}✗ 未知手机号列表异常${NC}"
     echo "$RESPONSE"
 fi
 echo ""

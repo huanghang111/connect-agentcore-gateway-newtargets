@@ -13,6 +13,21 @@
 # Logs
 *.log
 
+# Local config (never commit)
+.env
+.remember
+docs/
+# Python
+.venv/
+__pycache__/
+*.pyc
+
 # Temporary files
 *.tmp
 *~
+.omni/
+.claude/
+.github/
+.cursor/
+.kiro/
+.agents/

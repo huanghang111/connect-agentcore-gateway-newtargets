@@ -1,6 +1,8 @@
 # Connect Repair MCP Server
 
-把 Repair Service 工具封装成 MCP Server，部署到 AgentCore Runtime，通过 AgentCore Gateway 暴露给 Amazon Connect AI Agent。包含两个轻量身份核验工具（`verifyCustomer` + fallback `verifyCustomerByPhoneAndName`）、三个 repair 业务工具和一个 FAQ 检索工具。
+把 Repair Service 工具封装成 MCP Server，部署到 AgentCore Runtime，通过 AgentCore Gateway 暴露给 Amazon Connect AI Agent。包含两个轻量身份核验工具（`verifyCustomer` + fallback `verifyCustomerByPhoneAndName`）、四个 repair 业务工具（`requestRepair` / `trackRepair` / `cancelRepair` / `listRepairs`）和一个 FAQ 检索工具。
+
+**Agent 能力（服务端 SOP）**：`trackRepair` / `listRepairs` / `faqSearch` 不再只回传原始 JSON，而是在 MCP server 内部调用 Bedrock（Claude Haiku），按 `skills/` 目录下的 **SOP 文件**（话术模板 + 决策规则）生成一句可直接播报的中文 `reply`，并附带结构化 `data`。这样把"理解输入、改造输出"放在服务端完成，尽量少依赖 Connect 侧的 LLM。每个 SOP 是一个独立 `.md` 文件，改话术 = 改文件 + 重新部署，无需改 Python。Bedrock 不可用时自动降级为确定性字符串拼接，工具永不因此报错。
 
 ## 架构
 
@@ -14,10 +16,11 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 |------|------|----------|
 | `verifyCustomer` | 主核身（流程 1，每通电话必跑）：让客户口述手机号后 4 位（`smsToken`），由 LLM 从 Connect AI Agent 系统上下文的 `<customer_info>` 块里读出 `userNumber`（需要在 Orchestration Prompt 模板里写一行 `- userNumber: {{$.Custom.userNumber}}`，并在 Contact Flow 里通过 `Set contact attributes` 把这次通话的 userNumber 写进 `Custom.userNumber`）一并传给本工具。MCP 校验 `userNumber` 末 4 位 == `smsToken` 一致后**签发一个 HMAC token** 当作 `customerId` 返回（底层真实 customerId 直接复用 `userNumber`） | `smsToken`(4 位数字) 必填；`userNumber`(LLM 从 customer_info 里取) |
 | `verifyCustomerByPhoneAndName` | Fallback 核身（流程 2）：用**完整手机号 + 姓名**查到客户后签发 token；仅在 `verifyCustomer` 返回 `CUSTOMER_NOT_FOUND` 后调用（stub：手机号末 4 位为 `0000` 时返回 `CUSTOMER_NOT_FOUND`，其他底层 customerId 为 `"PHN" + 末 4 位`） | `phoneNumber`(纯数字 6–15 位)、`fullName` 必填 |
-| `requestRepair` | 创建维修工单 | `productCategory`, `productsubCategory`, `province`, `city`, `district`, `description`, `brand`, `customerId` 必填；`productModel`, `serialNumber` 可选 |
-| `trackRepair` | 查询工单状态 | `woNumber`(10 位数字)、`customerId`，工具内强制校验 |
+| `requestRepair` | 创建维修工单（并把核身得到的 customerId 作为 `phone` 持久化，供 `listRepairs` 按手机号检索） | `productCategory`, `productsubCategory`, `province`, `city`, `district`, `description`, `brand`, `customerId` 必填；`productModel`, `serialNumber` 可选 |
+| `trackRepair` | 查询工单详情，按 `skills/repair_detail.md` 生成播报话术。返回 `{reply, data}` | `woNumber`(10 位数字)、`customerId`，工具内强制校验 |
 | `cancelRepair` | 取消工单 | `woNumber`(10 位数字)、`customerId`，工具内强制校验 |
-| `faqSearch` | FAQ 知识库自然语言检索（产品使用 / 故障排查 / 保修 / 维修） | `query`(任意自然语言问题) 必填 |
+| `listRepairs` | 查询**当前来电客户名下**最近的工单列表（最多 5 张），按 `skills/list_repairs.md` 生成列表话术。结果由 `customerId` 解析出的手机号限定，调用者只能看到自己名下的工单。返回 `{reply, data}` | `customerId`，工具内强制校验 |
+| `faqSearch` | FAQ 知识库自然语言检索（产品使用 / 故障排查 / 保修 / 维修），按 `skills/faq.md` 由 agent 判断"直接作答 or 多条澄清"。返回 `{reply, data}` | `query`(任意自然语言问题) 必填 |
 
 > **设计原则**：所有 tool 的使用方式都写在各自的 docstring 顶部，LLM 通过 `toolConfigurationList` 拿到 description 即可正确使用，**Connect AI Agent 的 Orchestration Prompt 只需要做一处身份相关改动**（在 `<customer_info>` 块里加一行 `- userNumber: {{$.Custom.userNumber}}`，并在 Contact Flow 里把这通电话的 userNumber 写进 `Custom.userNumber` 属性）；其余所有约束（包括"必须先核身"）都内置在 MCP server 的工具签名 + 服务端校验里。
 >
@@ -170,6 +173,21 @@ Connect AI Agent → AgentCore Gateway (mcpServer target) → AgentCore Runtime 
 | `IDENTITY_TOKEN_TTL_S` | `3600` | 身份 token 有效期（秒），过期返回 `IDENTITY_EXPIRED` 强制重新核身 |
 
 部署脚本已经给 Runtime execution role 加了 `bedrock:InvokeModel` 权限（针对 foundation-model + inference-profile 资源），所以重新跑一次 `./deploy.sh` 即可生效；如要换模型，改 `.env` 里的 `NORMALIZE_MODEL_ID` 再重新部署即可。
+
+### SOP 话术生成（`trackRepair` / `listRepairs` / `faqSearch`）
+
+在归一化之上，这三个工具进一步用 **SOP 文件**生成可直接播报的中文 `reply`：
+
+- SOP 文件放在 `mcp-agent/skills/` 下，一个场景一个 `.md`：
+  - `list_repairs.md` —— 工单列表话术（"为您查询最近 N 张工单，分别为…，请问您想查看哪个工单详情呢？"）
+  - `repair_detail.md` —— 工单详情话术（含"联系电话（如有）"的省略规则：工程师电话为空时整段不念）
+  - `faq.md` —— 由 agent 判断"唯一/最相关 → 直接作答" vs "多条相关 → 先澄清"
+- 运行时 `_run_sop_agent(sop_name, data, fallback)` 把对应 `.md` 作为 Strands Agent 的 system prompt，喂入数据后让模型只产出一句 `reply`；结构化 `data` 由服务端自己附加。
+- 返回给 Connect 的统一是 `{"reply": "<可直接播报的中文>", "data": {...}}`。Connect 念 `reply` 即可，`data` 留作将来程序化使用。
+- **Fail-soft**：SOP 文件缺失 / Bedrock 超时限流 / 输出为空时，自动退回**确定性字符串拼接**的 `reply`（用同一套模板），工具永不报错。`NORMALIZE_RESPONSE=0` 时也走这条确定性路径。
+- 改话术 = 改 `skills/*.md` + 重新部署（`deploy.sh` 会把 `skills/` 一起打包进镜像），无需改 Python。
+
+> FAQ 目前是后端 mock 的关键字检索；将来换成 knowledge base 等实现时，只需改后端 `/faq/simple`，`faq.md` 与 agent 层不用动。
 
 ### 可观测性（OTEL → CloudWatch GenAI Observability）
 
@@ -358,7 +376,8 @@ python mcp_server.py
 | 文件 | 作用 |
 |------|------|
 | `.env.example` | 配置模板（复制为 `.env` 后填写） |
-| `mcp_server.py` | MCP Server 实现（FastMCP + 6 个 tool：2 核验 + 3 repair + 1 FAQ） |
+| `mcp_server.py` | MCP Server 实现（FastMCP + 7 个 tool：2 核验 + 4 repair + 1 FAQ） |
+| `skills/` | SOP 话术文件：`list_repairs.md` / `repair_detail.md` / `faq.md`（部署时打包进镜像） |
 | `Dockerfile` | ARM64 容器（Python 3.11，非 root 用户） |
 | `requirements.txt` | Python 依赖 |
 | `buildspec.yml` | CodeBuild 构建脚本 |

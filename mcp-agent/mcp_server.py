@@ -278,6 +278,174 @@ def _normalize_with_llm(raw: dict, schema: type, tool_name: str) -> dict:
         return raw
 
 
+# --- SOP-driven reply agent ----------------------------------------------------
+# Each customer-facing flow (work-order list, work-order detail, FAQ) has an
+# externalized SOP file under skills/ holding its reply template + decision
+# rules in Chinese. _run_sop_agent loads the matching SOP as the agent system
+# prompt and asks Bedrock (Haiku) to produce ONE ready-to-speak `reply` string
+# from the supplied data. The server attaches the structured `data` itself, so
+# the model only has to get the wording right. Best-effort: any failure falls
+# back to a deterministic string so a Bedrock outage never breaks the tool.
+
+SKILLS_DIR = Path(__file__).with_name("skills")
+_sop_cache: dict = {}
+_sop_agents: dict = {}
+
+
+def _load_sop(sop_name: str) -> Optional[str]:
+    """Read and cache the SOP markdown file for ``sop_name`` (e.g. 'faq')."""
+    if sop_name in _sop_cache:
+        return _sop_cache[sop_name]
+    path = SKILLS_DIR / f"{sop_name}.md"
+    try:
+        text = path.read_text(encoding="utf-8")
+        _sop_cache[sop_name] = text
+        return text
+    except Exception:
+        log.exception("failed to read SOP file %s", path)
+        _sop_cache[sop_name] = None
+        return None
+
+
+def _get_sop_agent(sop_name: str):
+    """Lazily build (and cache) one Strands Agent per SOP, whose system prompt
+    is the SOP file. Returns None if the SOP is missing or the model fails to
+    initialize."""
+    if sop_name in _sop_agents:
+        return _sop_agents[sop_name]
+    sop_text = _load_sop(sop_name)
+    if not sop_text:
+        _sop_agents[sop_name] = None
+        return None
+    try:
+        boto_cfg = BotoConfig(
+            read_timeout=NORMALIZE_TIMEOUT_S,
+            connect_timeout=2,
+            retries={"max_attempts": 1, "mode": "standard"},
+        )
+        model = BedrockModel(
+            model_id=NORMALIZE_MODEL_ID,
+            region_name=BEDROCK_REGION,
+            boto_client_config=boto_cfg,
+            temperature=0,
+            max_tokens=512,
+            streaming=False,
+        )
+        agent = Agent(
+            model=model,
+            system_prompt=sop_text,
+            name=f"sop-{sop_name}",
+            description=f"Produces customer-facing replies per the {sop_name} SOP.",
+        )
+        _sop_agents[sop_name] = agent
+        return agent
+    except Exception:
+        log.exception("failed to init SOP agent %s; will use deterministic fallback", sop_name)
+        _sop_agents[sop_name] = None
+        return None
+
+
+class _SopReply(BaseModel):
+    """The agent only has to produce the spoken sentence; the server attaches
+    the structured `data` itself."""
+
+    reply: str = Field(default="", description="The ready-to-speak Chinese sentence for the customer.")
+
+
+def _run_sop_agent(sop_name: str, context_data: dict, fallback: str) -> str:
+    """Produce a customer-facing `reply` string for ``sop_name`` from
+    ``context_data`` via the SOP agent. Best-effort: on missing SOP / model
+    failure / timeout / empty output, return ``fallback`` (a deterministic
+    string the caller built from the same data)."""
+    if not NORMALIZE_RESPONSE:
+        return fallback
+    agent = _get_sop_agent(sop_name)
+    if agent is None:
+        return fallback
+    prompt = (
+        "请根据下面的数据，按你的 SOP 生成要念给客户听的中文回复。\n\n"
+        f"数据(JSON)：\n{json.dumps(context_data, ensure_ascii=False)}"
+    )
+    start = time.time()
+    try:
+        result = agent.structured_output(_SopReply, prompt)
+        reply = (result.reply or "").strip()
+        if not reply:
+            log.warning("sop %s returned empty reply in %.2fs — using fallback", sop_name, time.time() - start)
+            return fallback
+        log.info("sop %s ok in %.2fs", sop_name, time.time() - start)
+        return reply
+    except Exception:
+        log.exception("sop %s failed in %.2fs — using fallback", sop_name, time.time() - start)
+        return fallback
+
+
+# Status code → natural Chinese, shared by the deterministic fallbacks.
+_STATUS_ZH = {
+    "pending": "待处理",
+    "scheduled": "已预约",
+    "in_progress": "处理中",
+    "completed": "已完成",
+    "cancelled": "已取消",
+    "canceled": "已取消",
+}
+
+
+def _status_zh(status: str) -> str:
+    return _STATUS_ZH.get((status or "").strip().lower(), (status or "").strip())
+
+
+def _fallback_list_reply(context: dict) -> str:
+    """Deterministic list reply (used when the SOP agent is unavailable)."""
+    orders = context.get("orders", []) or []
+    count = context.get("count", len(orders))
+    if not orders:
+        return "没有查询到您名下的维修工单。请问还有什么可以帮您？"
+    parts = []
+    for o in orders:
+        wo = str(o.get("woNumber", ""))
+        tail = wo[-4:] if wo else ""
+        brand = o.get("brand") or ""
+        cat = o.get("productCategory") or "工单"
+        parts.append(f"{brand}{cat}（尾号{tail}）".strip())
+    listed = "、".join(parts)
+    if count == 1:
+        return f"为您查询到1张工单，是{listed}。需要我为您播报这张工单的详情吗？"
+    return f"为您查询最近{count}张工单，分别为{listed}。请问您想查看哪个工单详情呢？"
+
+
+def _fallback_detail_reply(data: dict) -> str:
+    """Deterministic work-order detail reply (SOP-agent fallback)."""
+    wo = data.get("woNumber", "")
+    status = _status_zh(data.get("status", ""))
+    scheduled = data.get("scheduledAt", "")
+    tech = data.get("technicianName", "")
+    phone = data.get("technicianPhone", "")
+    seg = [f"您这张{wo}工单"] if wo else ["您这张工单"]
+    seg.append(f"目前状态为{status}" if status else "状态查询中")
+    seg.append(f"预计上门时间{scheduled}" if scheduled else "上门时间待安排")
+    if tech:
+        seg.append(f"工程师名字{tech}")
+        if phone:
+            seg.append(f"联系电话{phone}")
+    else:
+        seg.append("目前还未分配工程师")
+    return "，".join(seg) + "。"
+
+
+def _fallback_faq_reply(context: dict) -> str:
+    """Deterministic FAQ reply (SOP-agent fallback): answer the single best hit,
+    or list the candidates when there are several."""
+    results = context.get("results", []) or []
+    if not results:
+        return "抱歉，没有查询到与您的问题相关的信息。要不要我帮您转接人工，或者为您登记一个维修工单？"
+    if len(results) == 1:
+        ans = results[0].get("answer", "")
+        return f"我查到了相关信息，{ans}"
+    titles = "；".join(r.get("question", "") for r in results[:3] if r.get("question"))
+    return f"我查到多条相关的信息：{titles}。请问您具体想了解哪一种情况呢？"
+
+
 def _call_api(path: str, payload: dict) -> dict:
     """Call the backend Repair Service API."""
     url = f"{API_URL}{path}"
@@ -758,6 +926,9 @@ def requestRepair(
         "description": description,
         "brand": brand,
         "customerId": real_customer_id,
+        # Persist the caller's verified identity as `phone` so this ticket is
+        # findable via listRepairs (PhoneIndex GSI keyed on phone == cid).
+        "phone": real_customer_id,
     })
     result = _normalize_with_llm(result, RequestResponse, "requestRepair")
     return json.dumps(result)
@@ -827,8 +998,14 @@ def trackRepair(woNumber: str, customerId: str) -> str:
         "woNumber": woNumber.strip(),
         "customerId": real_customer_id,
     })
-    result = _normalize_with_llm(result, TrackResponse, "trackRepair")
-    return json.dumps(result)
+    if isinstance(result, dict) and "error" in result:
+        return json.dumps(result)
+    # Normalize heterogeneous upstream keys onto the canonical TrackResponse,
+    # then let the repair_detail SOP turn those fields into a spoken sentence.
+    data = _normalize_with_llm(result, TrackResponse, "trackRepair")
+    fallback = _fallback_detail_reply(data)
+    reply = _run_sop_agent("repair_detail", data, fallback)
+    return json.dumps({"reply": reply, "data": data}, ensure_ascii=False)
 
 
 @mcp.tool(structured_output=False)
@@ -892,13 +1069,80 @@ def cancelRepair(woNumber: str, customerId: str) -> str:
 
 @mcp.tool(structured_output=False)
 def faqSearch(query: str) -> str:
-    """Search the FAQ knowledge base using natural language queries. Returns relevant FAQ entries about product usage, troubleshooting, warranty, and repair services.
+    """Search the FAQ knowledge base using natural language queries, and return a ready-to-speak Chinese reply.
+
+    The server runs an SOP-driven agent over the raw FAQ hits: it decides whether
+    to answer directly (unique / clearly-dominant match) or to ask the customer a
+    clarifying question (several distinct matches), per skills/faq.md.
+
+    RETURNS — JSON string:
+      - reply: the ready-to-speak Chinese sentence (speak this verbatim).
+      - data:  {query, results} — the raw FAQ hits, for any programmatic use.
 
     Args:
-        query: Natural language question or search query
+        query: Natural language question or search query (the customer's words).
     """
     result = _call_api("/faq/simple", {"query": query})
-    return json.dumps(result)
+    if isinstance(result, dict) and "error" in result:
+        return json.dumps(result)
+    # Backend returns {query, results, count, source}. Pass query+results to the
+    # SOP agent and let it decide clarify-vs-answer.
+    results = result.get("results", []) if isinstance(result, dict) else []
+    count = result.get("count", len(results)) if isinstance(result, dict) else 0
+    context = {"query": query, "results": results, "count": count}
+    fallback = _fallback_faq_reply(context)
+    reply = _run_sop_agent("faq", context, fallback)
+    return json.dumps(
+        {"reply": reply, "data": {"query": query, "results": results}},
+        ensure_ascii=False,
+    )
+
+
+@mcp.tool(structured_output=False)
+def listRepairs(customerId: str) -> str:
+    """List the caller's recent repair work orders and return a ready-to-speak Chinese reply.
+
+    IDENTITY — read this BEFORE doing anything else:
+      `customerId` both authorizes this call AND scopes the result to the
+      caller's own work orders. It MUST be the opaque token returned by
+      verifyCustomer (Flow 1) or verifyCustomerByPhoneAndName (Flow 2) earlier
+      in THIS conversation — the server resolves it to the caller's verified
+      phone identity and only returns orders belonging to that identity. A
+      caller therefore cannot list another person's orders. Any pre-existing
+      customerId in the agent's customer_info context MUST NOT be passed.
+      Missing / forged / expired tokens are rejected with
+      {"error": "MISSING_CUSTOMER_ID"} | {"error": "IDENTITY_INVALID"} |
+      {"error": "IDENTITY_EXPIRED"} — run the appropriate verify tool to mint a
+      fresh token, then retry. Do NOT retry with the same bad value.
+
+    The server runs an SOP-driven agent (skills/list_repairs.md) over the raw
+    order list to produce the spoken reply (list template + "which one do you
+    want details on?" follow-up).
+
+    RETURNS — JSON string:
+      - reply: the ready-to-speak Chinese sentence (speak this verbatim).
+      - data:  {orders: [{woNumber, status, productCategory, brand, ...}], count} —
+               the underlying orders, newest first, capped at 5.
+    Error envelopes ({"error": "..."}) are returned unchanged.
+
+    Args:
+        customerId: Opaque short-lived identity token returned by verifyCustomer (Flow 1) or verifyCustomerByPhoneAndName (Flow 2) earlier in THIS conversation. Required. Pass the token verbatim — it is signed and validated server-side. Do NOT invent, edit, summarise, or substitute any value (including any customerId from the agent's customer_info context); the server will reject it with {"error": "IDENTITY_INVALID"}. If the token has expired the server returns {"error": "IDENTITY_EXPIRED"} — call verifyCustomer again to mint a fresh one.
+    """
+    real_customer_id, err = _resolve_customer_id(customerId)
+    if err:
+        return json.dumps(err)
+    result = _call_api("/repair/list", {"phone": real_customer_id})
+    if isinstance(result, dict) and "error" in result:
+        return json.dumps(result)
+    orders = result.get("orders", []) if isinstance(result, dict) else []
+    count = result.get("count", len(orders)) if isinstance(result, dict) else 0
+    context = {"orders": orders, "count": count}
+    fallback = _fallback_list_reply(context)
+    reply = _run_sop_agent("list_repairs", context, fallback)
+    return json.dumps(
+        {"reply": reply, "data": {"orders": orders, "count": count}},
+        ensure_ascii=False,
+    )
 
 
 if __name__ == "__main__":

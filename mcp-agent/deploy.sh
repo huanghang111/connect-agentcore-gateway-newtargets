@@ -135,7 +135,10 @@ if ! aws s3 ls s3://${S3_BUCKET} --region ${REGION} 2>/dev/null >/dev/null; then
     aws s3 mb s3://${S3_BUCKET} --region ${REGION} >/dev/null
 fi
 
+rm -f /tmp/mcp-agent-source.zip
 zip -j /tmp/mcp-agent-source.zip mcp_server.py china_regions_pinyin.json Dockerfile requirements.txt buildspec.yml .dockerignore >/dev/null
+# SOP skill files must keep their `skills/` directory, so add them WITHOUT -j.
+zip -r /tmp/mcp-agent-source.zip skills -i 'skills/*.md' >/dev/null
 aws s3 cp /tmp/mcp-agent-source.zip s3://${S3_BUCKET}/source.zip --region ${REGION} >/dev/null
 rm -f /tmp/mcp-agent-source.zip
 echo -e "${GREEN}✓ Source uploaded${NC}"
