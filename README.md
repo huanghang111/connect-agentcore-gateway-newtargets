@@ -82,13 +82,20 @@ export API_KEY="..."
 
 ### 第 2 步：部署 MCP Agent
 
+> ⚠️ **运行 `./deploy.sh` 前必须先填好 `.env`**，否则脚本会直接报错退出。
+> 大多数"无法部署"的反馈都是因为这一步没填或填错。
+
 ```bash
 cd midea/mcp-agent
 cp .env.example .env
-# 必填: REGION, REPAIR_API_URL, REPAIR_API_KEY
-# 可选: ACCOUNT_ID（留空时自动从 STS 解析；CloudShell 推荐留空）
-# 留空: GATEWAY_ID（让脚本自动创建一个 AgentCore Gateway）
-# 必填(自动创建场景): GATEWAY_JWT_DISCOVERY_URL（Connect 实例 OIDC discovery URL）
+# 编辑 .env，填入下面 3 组【必填】值（详见 .env.example 顶部）：
+#   1) REGION                    —— 与第 1 步相同的 region
+#   2) REPAIR_API_URL / REPAIR_API_KEY
+#                                —— 从第 1 步的 deployment-info.log 复制
+#   3) GATEWAY_JWT_DISCOVERY_URL —— Connect 实例 OIDC discovery URL：
+#      https://<实例域名>.my.connect.aws/.well-known/openid-configuration
+# 其余变量保持默认即可（ACCOUNT_ID 自动 STS 解析、GATEWAY_ID 留空自动建 Gateway、
+# IDENTITY_TOKEN_SECRET 留空首次自动生成）。
 chmod +x deploy.sh cleanup.sh
 ./deploy.sh
 ```

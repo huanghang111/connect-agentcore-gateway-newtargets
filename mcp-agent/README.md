@@ -222,35 +222,34 @@ MCP server 通过 **AWS Distro for OpenTelemetry (ADOT)** 把 trace / metric / l
 
 ## 配置
 
-把 `.env.example` 复制为 `.env`，填写你的配置：
+> ⚠️ **必须先把 `.env` 填好再运行 `./deploy.sh`。** 缺少任一【必填】项，脚本都会立即报错退出——
+> 这是绝大多数"无法部署"反馈的根因。
 
 ```bash
 cp .env.example .env
+# 然后编辑 .env（`.env` 已在 .gitignore 中，不会被提交）
 ```
 
-`.env` 已在 `.gitignore` 中，不会被提交到 Git。
+### 必填项（3 组）
 
-必填项：
+| 变量 | 从哪里拿 |
+|------|----------|
+| `REGION` | 与第 1 步 Backend API 相同的 region，如 `us-east-1` |
+| `REPAIR_API_URL` | 第 1 步的 `deployment-info.log` |
+| `REPAIR_API_KEY` | 第 1 步的 `deployment-info.log` |
+| `GATEWAY_JWT_DISCOVERY_URL` | Connect 实例 OIDC discovery URL：`https://<实例域名>.my.connect.aws/.well-known/openid-configuration`（`GATEWAY_ID` 留空、自动创建 Gateway 时必填） |
 
-| 变量 | 说明 |
-|------|------|
-| `REGION` | AWS Region，如 `us-east-1` |
-| `ACCOUNT_ID` | AWS 账号 ID |
-| `AGENT_NAME` | Runtime / 资源名（用短横线，如 `connect-repair-mcp-server`） |
-| `ECR_REPO_NAME` | ECR 仓库名 |
-| `TARGET_NAME` | Gateway target 名 |
-| `REPAIR_API_URL` | 后端 API 地址 |
-| `REPAIR_API_KEY` | 后端 API Key |
-
-Gateway 相关（任选其一种模式）：
+### 可选项（一般保持默认）
 
 | 变量 | 说明 |
 |------|------|
-| `GATEWAY_ID` | **复用现有 Gateway**：填入 ID。同时必须填 `GATEWAY_SERVICE_ROLE`（角色名，非 ARN） |
-| `GATEWAY_SERVICE_ROLE` | 现有 Gateway 的 IAM Role **名称** |
-| `GATEWAY_JWT_DISCOVERY_URL` | **自动创建 Gateway**：`GATEWAY_ID` 留空时必填，填 IDP（如 Connect 实例）的 OIDC discovery URL |
-| `GATEWAY_JWT_ALLOWED_AUDIENCE` | 可选；自动创建场景下脚本会**自动**把新 Gateway 的 ID 加到 audience 列表里，这里填的值仅作叠加 |
-| `GATEWAY_JWT_ALLOWED_CLIENTS` | 可选；JWT 允许的 client ID 列表（逗号分隔） |
+| `ACCOUNT_ID` | 留空时脚本自动 `aws sts get-caller-identity` 解析（CloudShell 推荐留空） |
+| `AGENT_NAME` / `ECR_REPO_NAME` / `TARGET_NAME` | 资源命名，保持默认即可 |
+| `GATEWAY_ID` | **复用现有 Gateway** 时填入 ID；同时必须填 `GATEWAY_SERVICE_ROLE`（角色名，非 ARN）。留空 = 自动创建 |
+| `GATEWAY_SERVICE_ROLE` | 现有 Gateway 的 IAM Role **名称**（仅复用模式需要） |
+| `GATEWAY_JWT_ALLOWED_AUDIENCE` | 自动创建场景下脚本会自动把新 Gateway 的 ID 加到 audience，这里填的仅作叠加 |
+| `GATEWAY_JWT_ALLOWED_CLIENTS` | JWT 允许的 client ID 列表（逗号分隔） |
+| `IDENTITY_TOKEN_SECRET` | 留空即可；首次部署脚本自动 `openssl rand -hex 32` 生成并写回 `.env`，后续复用 |
 
 自动创建模式下，脚本会:
 1. 创建 `${AGENT_NAME}-gw` Gateway：`protocolType=MCP`，`authorizerType=CUSTOM_JWT`
