@@ -230,25 +230,34 @@ fi
 # Step 7: Delete IAM Roles
 echo -e "${YELLOW}Step 7: Delete IAM Roles${NC}"
 
-# Execution role
-if aws iam get-role --role-name ${EXECUTION_ROLE_NAME} 2>/dev/null >/dev/null; then
-    aws iam delete-role-policy --role-name ${EXECUTION_ROLE_NAME} --policy-name ecr-and-logs 2>/dev/null || true
-    aws iam detach-role-policy --role-name ${EXECUTION_ROLE_NAME} \
-        --policy-arn arn:aws:iam::aws:policy/BedrockAgentCoreFullAccess 2>/dev/null || true
-    aws iam delete-role --role-name ${EXECUTION_ROLE_NAME}
-    echo -e "${GREEN}✓ Execution role deleted${NC}"
-else
-    echo "  No execution role found"
-fi
+# Detach every managed policy and delete every inline policy on a role, then
+# delete the role. Enumerating dynamically keeps cleanup in sync with deploy.sh
+# no matter how many inline policies it adds (execution role gets ecr-and-logs,
+# bedrock-invoke-model, otel-observability) — hardcoding names left the role
+# undeletable (DeleteConflict) whenever deploy.sh grew a new policy.
+delete_role_fully() {
+    local role="$1"
+    if ! aws iam get-role --role-name "${role}" 2>/dev/null >/dev/null; then
+        echo "  No ${role} found"
+        return
+    fi
+    for arn in $(aws iam list-attached-role-policies --role-name "${role}" \
+        --query 'AttachedPolicies[].PolicyArn' --output text 2>/dev/null); do
+        aws iam detach-role-policy --role-name "${role}" --policy-arn "${arn}" 2>/dev/null || true
+    done
+    for pol in $(aws iam list-role-policies --role-name "${role}" \
+        --query 'PolicyNames[]' --output text 2>/dev/null); do
+        aws iam delete-role-policy --role-name "${role}" --policy-name "${pol}" 2>/dev/null || true
+    done
+    if aws iam delete-role --role-name "${role}" 2>/dev/null; then
+        echo -e "${GREEN}✓ ${role} deleted${NC}"
+    else
+        echo -e "${RED}  Failed to delete ${role}${NC}"
+    fi
+}
 
-# CodeBuild role
-if aws iam get-role --role-name ${CODEBUILD_ROLE_NAME} 2>/dev/null >/dev/null; then
-    aws iam delete-role-policy --role-name ${CODEBUILD_ROLE_NAME} --policy-name codebuild-policy 2>/dev/null || true
-    aws iam delete-role --role-name ${CODEBUILD_ROLE_NAME}
-    echo -e "${GREEN}✓ CodeBuild role deleted${NC}"
-else
-    echo "  No CodeBuild role found"
-fi
+delete_role_fully "${EXECUTION_ROLE_NAME}"
+delete_role_fully "${CODEBUILD_ROLE_NAME}"
 echo ""
 
 # Cleanup local files
