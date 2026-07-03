@@ -42,6 +42,117 @@ Connect AI Agent (us-east-1)
 - **Outbound (Gateway → AgentCore Runtime)**: GATEWAY_IAM_ROLE
 - **MCP Agent → Backend API**: API Key（注入到 Runtime 环境变量；生产建议改 Secrets Manager）
 
+## 部署身份所需权限
+
+运行两套 `deploy.sh` 的 IAM 身份(user / role)需要下面这些权限。用 `AdministratorAccess` 最省事;若要按最小权限收敛,可直接复制下面的 JSON 创建一个 IAM policy 挂到部署身份上。
+
+> 说明：
+> - 第 1 步 Backend API 通过 **CloudFormation** 间接创建 API Gateway / Lambda / DynamoDB / IAM Role / Logs / S3 / 自定义资源，所以部署身份需要这些服务的写权限 **以及 `iam:PassRole`**（把角色传给 Lambda）。
+> - 第 2 步 MCP Agent 直接调用 ECR / CodeBuild / IAM / S3 / bedrock-agentcore-control。
+> - 下面策略用了 `Resource: "*"` 便于一次跑通；生产环境建议按实际资源 ARN 收敛。
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Step1CloudFormationAndBackendServices",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:CreateStack",
+        "cloudformation:UpdateStack",
+        "cloudformation:DeleteStack",
+        "cloudformation:DescribeStacks",
+        "cloudformation:DescribeStackEvents",
+        "cloudformation:GetTemplateSummary",
+        "apigateway:*",
+        "lambda:*",
+        "dynamodb:*",
+        "logs:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "Step2AgentCoreRuntimeAndGateway",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock-agentcore:CreateAgentRuntime",
+        "bedrock-agentcore:UpdateAgentRuntime",
+        "bedrock-agentcore:GetAgentRuntime",
+        "bedrock-agentcore:ListAgentRuntimes",
+        "bedrock-agentcore:DeleteAgentRuntime",
+        "bedrock-agentcore:CreateGateway",
+        "bedrock-agentcore:UpdateGateway",
+        "bedrock-agentcore:GetGateway",
+        "bedrock-agentcore:ListGateways",
+        "bedrock-agentcore:DeleteGateway",
+        "bedrock-agentcore:CreateGatewayTarget",
+        "bedrock-agentcore:GetGatewayTarget",
+        "bedrock-agentcore:ListGatewayTargets",
+        "bedrock-agentcore:DeleteGatewayTarget",
+        "bedrock-agentcore:SynchronizeGatewayTargets"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "Step2BuildImage",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:CreateRepository",
+        "ecr:DescribeRepositories",
+        "ecr:DeleteRepository",
+        "ecr:GetAuthorizationToken",
+        "codebuild:CreateProject",
+        "codebuild:DeleteProject",
+        "codebuild:BatchGetProjects",
+        "codebuild:StartBuild",
+        "codebuild:BatchGetBuilds"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "S3ForTemplatesAndSource",
+      "Effect": "Allow",
+      "Action": [
+        "s3:CreateBucket",
+        "s3:DeleteBucket",
+        "s3:ListBucket",
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:GetObjectVersion",
+        "s3:DeleteObject"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "IamForRolesCreatedByScriptsAndCfn",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:GetRole",
+        "iam:PassRole",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:ListAttachedRolePolicies"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "Sts",
+      "Effect": "Allow",
+      "Action": "sts:GetCallerIdentity",
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+> Runtime 执行角色、Gateway service role、CodeBuild 角色都是脚本**自动创建**的（分别授予 `BedrockAgentCoreFullAccess`、`bedrock:InvokeModel`、X-Ray/日志、`InvokeAgentRuntime` 等）——这些是被创建角色的权限，**不是**部署身份需要的，上表已涵盖创建它们所需的 `iam:*` 动作。
+
 ## Fresh Deployment
 
 > 推荐在 **AWS CloudShell** 中执行;脚本会自动通过 `aws sts get-caller-identity`
