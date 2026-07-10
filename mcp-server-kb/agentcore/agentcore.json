@@ -1,0 +1,86 @@
+{
+  "$schema": "https://schema.agentcore.aws.dev/v1/agentcore.json",
+  "name": "connectkb",
+  "version": 1,
+  "managedBy": "CDK",
+  "tags": {
+    "agentcore:created-by": "agentcore-cli",
+    "agentcore:project-name": "connectkb"
+  },
+  "runtimes": [
+    {
+      "name": "kbserver",
+      "build": "Container",
+      "entrypoint": "main.py",
+      "codeLocation": "app/kbserver/",
+      "runtimeVersion": "PYTHON_3_14",
+      "envVars": [
+        {
+          "name": "KNOWLEDGE_BASE_NAME",
+          "value": "connectkb-kb"
+        },
+        {
+          "name": "PRETICKET_TABLE",
+          "value": "connectkb-pretickets"
+        },
+        {
+          "name": "KB_TOP_K",
+          "value": "5"
+        },
+        {
+          "name": "KB_ANSWER_MODEL_ID",
+          "value": "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+        }
+      ],
+      "networkMode": "PUBLIC",
+      "instrumentation": {
+        "enableOtel": true
+      },
+      "protocol": "MCP",
+      "additionalPolicies": [
+        "kb-ddb-policy.json"
+      ]
+    }
+  ],
+  "memories": [],
+  "knowledgeBases": [
+    {
+      "type": "AgentCoreKnowledgeBase",
+      "name": "connectkb-kb",
+      "dataSources": [
+        {
+          "type": "S3",
+          "uri": "s3://replace-me-kb-docs-bucket"
+        }
+      ]
+    }
+  ],
+  "credentials": [],
+  "evaluators": [],
+  "onlineEvalConfigs": [],
+  "agentCoreGateways": [
+    {
+      "name": "connectkb-gw",
+      "protocolType": "None",
+      "description": "Gateway for connectkb-gw",
+      "targets": [
+        {
+          "name": "kbserver-target",
+          "targetType": "httpRuntime",
+          "httpRuntime": {
+            "runtime": "kbserver"
+          }
+        }
+      ],
+      "authorizerType": "NONE",
+      "enableSemanticSearch": true,
+      "exceptionLevel": "NONE"
+    }
+  ],
+  "policyEngines": [],
+  "configBundles": [],
+  "abTests": [],
+  "harnesses": [],
+  "datasets": [],
+  "payments": []
+}

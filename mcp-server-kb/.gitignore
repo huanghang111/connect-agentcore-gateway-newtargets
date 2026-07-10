@@ -1,0 +1,16 @@
+# deploy.sh config (may hold OIDC URLs / client ids) — never commit
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# CDK build artifacts
+agentcore/cdk/node_modules/
+agentcore/cdk/cdk.out/
+agentcore/cdk/dist/
+
+# AgentCore CLI local state (secrets); deployed-state.json is committed by design
+agentcore/.env.local
+agentcore/.cache/

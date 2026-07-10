@@ -1,0 +1,36 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "KnowledgeBaseResolveByName",
+      "Effect": "Allow",
+      "Action": ["bedrock:ListKnowledgeBases"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "KnowledgeBaseRetrieve",
+      "Effect": "Allow",
+      "Action": ["bedrock:Retrieve"],
+      "Resource": "arn:aws:bedrock:*:*:knowledge-base/*"
+    },
+    {
+      "Sid": "AnswerSynthesisInvokeModel",
+      "Effect": "Allow",
+      "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+      "Resource": [
+        "arn:aws:bedrock:*::foundation-model/*",
+        "arn:aws:bedrock:*:*:inference-profile/*",
+        "arn:aws:bedrock:*:*:application-inference-profile/*"
+      ]
+    },
+    {
+      "Sid": "PreTicketTable",
+      "Effect": "Allow",
+      "Action": ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:Query"],
+      "Resource": [
+        "arn:aws:dynamodb:*:*:table/connectkb-pretickets",
+        "arn:aws:dynamodb:*:*:table/connectkb-pretickets/index/*"
+      ]
+    }
+  ]
+}
